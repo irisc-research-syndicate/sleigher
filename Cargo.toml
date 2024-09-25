@@ -1,0 +1,9 @@
+[package]
+name = "sleigher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1.0.89", features = ["backtrace"] }
+clap = { version = "4.5.18", features = ["derive"] }
+sleigh-rs = { git = "ssh://git@github.com/irisc-research-syndicate/sleigh-rs.git", version = "0.1.5" }
