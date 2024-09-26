@@ -1,8 +1,8 @@
 use sleigh_rs::{display::DisplayElement, table::{Constructor, VariantId}};
 
-use crate::{SleighBitConstraints, SleighPattern, SleighSleigh, Wrapper};
+use crate::{SleighBitConstraints, SleighPattern, SleighSleigh, WithCtx};
 
-pub type SleighConstructor<'a> = Wrapper<'a, SleighSleigh<'a>, Constructor>;
+pub type SleighConstructor<'a> = WithCtx<'a, SleighSleigh<'a>, Constructor>;
 
 impl<'a> SleighConstructor<'a> {
     pub fn variant(&self, variant_id: VariantId) -> (SleighBitConstraints<'a>, SleighBitConstraints<'a>) {
@@ -17,7 +17,7 @@ impl<'a> SleighConstructor<'a> {
     }
 
     pub fn pattern(&self) -> SleighPattern {
-        self.wrap(&self.inner.pattern)
+        self.same_ctx(&self.inner.pattern)
     }
 }
 

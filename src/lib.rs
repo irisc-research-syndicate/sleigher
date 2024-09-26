@@ -14,41 +14,41 @@ pub use bitconstraint::SleighBitConstraints;
 pub use token::{SleighToken, SleighDecodedTokenField, SleighTokenField};
 
 #[derive(Clone, Copy)]
-pub struct Wrapper<'a, Ctx, T: ?Sized> {
+pub struct WithCtx<'a, Ctx, T: ?Sized> {
     pub ctx: &'a Ctx,
     pub inner: &'a T
 }
 
-impl<'a, Ctx, T: ?Sized> Wrapper<'a, Ctx, T> {
+impl<'a, Ctx, T: ?Sized> WithCtx<'a, Ctx, T> {
     pub fn new(ctx: &'a Ctx, inner: &'a T) -> Self {
-        Wrapper {
+        WithCtx {
             ctx,
             inner,
         }
     }
 
-    pub fn wrap<N>(&self, inner: &'a N) -> Wrapper<'a, Ctx, N> {
-        Wrapper {
+    pub fn same_ctx<N>(&self, inner: &'a N) -> WithCtx<'a, Ctx, N> {
+        WithCtx {
             ctx: self.ctx,
             inner,
         }
     }
 
-    pub fn subs<N>(&'a self, inner: &'a N) -> Wrapper<'a, Self, N> {
-        Wrapper {
+    pub fn self_ctx<N>(&'a self, inner: &'a N) -> WithCtx<'a, Self, N> {
+        WithCtx {
             ctx: self,
             inner
         }
     }
 }
 
-impl<'a, T: ?Sized> From<&'a T> for Wrapper<'a, (), T> {
+impl<'a, T: ?Sized> From<&'a T> for WithCtx<'a, (), T> {
     fn from(value: &'a T) -> Self {
-        Wrapper::new(&(), value)
+        WithCtx::new(&(), value)
     }
 }
 
-impl<'a, Ctx, T: std::fmt::Debug + ?Sized> std::fmt::Debug for Wrapper<'a, Ctx, T> {
+impl<'a, Ctx, T: std::fmt::Debug + ?Sized> std::fmt::Debug for WithCtx<'a, Ctx, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(self.inner, f) // TODO: add context type name std::any::type_name
     }

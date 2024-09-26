@@ -1,8 +1,8 @@
 use sleigh_rs::{token::{Token, TokenField}, Endian};
 
-use crate::{SleighSleigh, Wrapper};
+use crate::{SleighSleigh, WithCtx};
 
-pub type SleighTokenField<'a> = Wrapper<'a, SleighSleigh<'a>, TokenField>;
+pub type SleighTokenField<'a> = WithCtx<'a, SleighSleigh<'a>, TokenField>;
 pub struct SleighDecodedTokenField<'a> {
     pub token_field: SleighTokenField<'a>,
     pub value: usize,
@@ -27,7 +27,7 @@ impl<'a> std::fmt::Display for SleighDecodedTokenField<'a> {
 
 impl<'a> SleighTokenField<'a> {
     pub fn token(&self) -> SleighToken<'a> {
-        self.wrap(self.ctx.inner.token(self.inner.token))
+        self.same_ctx(self.ctx.inner.token(self.inner.token))
     }
 
     pub fn decode(&self, data: &[u8]) -> SleighDecodedTokenField {
@@ -39,7 +39,7 @@ impl<'a> SleighTokenField<'a> {
     }
 }
 
-pub type SleighToken<'a> = Wrapper<'a, SleighSleigh<'a>, Token>;
+pub type SleighToken<'a> = WithCtx<'a, SleighSleigh<'a>, Token>;
 
 impl<'a> SleighToken<'a> {
     pub fn decode(&self, data: &[u8]) -> usize {

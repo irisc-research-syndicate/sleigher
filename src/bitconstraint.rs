@@ -1,9 +1,9 @@
 use sleigh_rs::pattern::BitConstraint;
 
-use crate::Wrapper;
+use crate::WithCtx;
 
 
-pub type SleighBitConstraints<'a> = Wrapper<'a, (), [BitConstraint]>;
+pub type SleighBitConstraints<'a> = WithCtx<'a, (), [BitConstraint]>;
 
 fn get_bit(data: &[u8], idx: usize) -> Option<bool> {
     if idx > data.len() * 8 {

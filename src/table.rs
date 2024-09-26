@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use sleigh_rs::{disassembly::VariableId, display::DisplayElement, table::{ConstructorId, Matcher, Table, VariantId}};
 use anyhow::{Context, Result};
 
-use crate::{SleighBitConstraints, SleighConstructor, SleighSleigh, Wrapper};
+use crate::{SleighBitConstraints, SleighConstructor, SleighSleigh, WithCtx};
 
-pub type SleighTable<'a> = Wrapper<'a, SleighSleigh<'a>, Table>;
+pub type SleighTable<'a> = WithCtx<'a, SleighSleigh<'a>, Table>;
 
 impl<'a> SleighTable<'a> {
     pub fn disassemble(&self, data: &[u8]) -> Result<SleighDisassembledTable<'a>> {
@@ -27,15 +27,15 @@ impl<'a> SleighTable<'a> {
     }
 
     pub fn matcher_order(&'a self) -> impl Iterator<Item = SleighMatcher<'a>> {
-        self.inner.matcher_order().iter().map(|matcher| self.subs(matcher))
+        self.inner.matcher_order().iter().map(|matcher| self.self_ctx(matcher))
     }
 
     pub fn constructors(&'a self) -> impl Iterator<Item = SleighConstructor<'a>> {
-        self.inner.constructors().iter().map(|constructor| self.wrap(constructor))
+        self.inner.constructors().iter().map(|constructor| self.same_ctx(constructor))
     }
 
     pub fn constructor(&self, id: ConstructorId) -> SleighConstructor<'a> {
-        self.wrap(self.inner.constructor(id))
+        self.same_ctx(self.inner.constructor(id))
     }
 
     pub fn find_match(&self, data: &[u8]) -> Option<(VariantId, SleighConstructor<'a>)> {
@@ -53,7 +53,7 @@ impl<'a> SleighTable<'a> {
     }
 }
 
-pub type SleighMatcher<'a> = Wrapper<'a, SleighTable<'a>, Matcher>;
+pub type SleighMatcher<'a> = WithCtx<'a, SleighTable<'a>, Matcher>;
 
 impl<'a> SleighMatcher<'a> {
     pub fn constructor(&self) -> SleighConstructor<'a> {

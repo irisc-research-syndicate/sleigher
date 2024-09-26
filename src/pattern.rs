@@ -3,10 +3,10 @@ use anyhow::{anyhow, bail, ensure, Result};
 
 use sleigh_rs::{disassembly::{Assertation, VariableId}, pattern::{Block, Pattern}, Number, TokenFieldId};
 
-use crate::{SleighSleigh, SleighTokenField, Wrapper};
+use crate::{SleighSleigh, SleighTokenField, WithCtx};
 
 
-pub type SleighPattern<'a> = Wrapper<'a, SleighSleigh<'a>, Pattern>;
+pub type SleighPattern<'a> = WithCtx<'a, SleighSleigh<'a>, Pattern>;
 
 fn number_to_i64(n: Number) -> i64 {
     match n {
@@ -17,11 +17,11 @@ fn number_to_i64(n: Number) -> i64 {
 
 impl<'a> SleighPattern<'a> {
     pub fn blocks(&self) -> impl Iterator<Item = SleighBlock> {
-        self.inner.blocks().iter().map(|block| self.subs(block))
+        self.inner.blocks().iter().map(|block| self.self_ctx(block))
     }
 
     pub fn token_field(&self, id: TokenFieldId) -> SleighTokenField<'a> {
-        self.wrap(self.ctx.inner.token_field(id))
+        self.same_ctx(self.ctx.inner.token_field(id))
     }
 
     pub fn evaluate(&self, data: &[u8]) -> Result<HashMap<VariableId, i64>> {
@@ -90,11 +90,11 @@ impl<'a> SleighPattern<'a> {
     }
 }
 
-pub type SleighBlock<'a> = Wrapper<'a, SleighPattern<'a>, Block>;
-pub type SleighAssertion<'a> = Wrapper<'a, SleighBlock<'a>, Assertation>;
+pub type SleighBlock<'a> = WithCtx<'a, SleighPattern<'a>, Block>;
+pub type SleighAssertion<'a> = WithCtx<'a, SleighBlock<'a>, Assertation>;
 
 impl<'a> SleighBlock<'a> {
     pub fn pre_disassembly(&self) -> impl Iterator<Item = SleighAssertion> {
-        self.inner.pre_disassembler().iter().map(|assertion| self.subs(assertion))
+        self.inner.pre_disassembler().iter().map(|assertion| self.self_ctx(assertion))
     }
 }
