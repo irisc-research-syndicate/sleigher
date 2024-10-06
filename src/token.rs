@@ -1,4 +1,4 @@
-use sleigh_rs::{token::{Token, TokenField}, Endian};
+use sleigh_rs::{token::{Token, TokenField}, Endian, FieldBits};
 
 use crate::{SleighSleigh, WithCtx};
 
@@ -26,6 +26,22 @@ impl<'a> std::fmt::Display for SleighDecodedTokenField<'a> {
 }
 
 impl<'a> SleighTokenField<'a> {
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    pub fn bits(&self) -> &FieldBits {
+        &self.inner.bits
+    }
+
+    pub fn raw_value_is_signed(&self) -> bool {
+        self.inner.raw_value_is_signed()
+    }
+
+    pub fn execution_value_is_signed(&self) -> bool {
+        self.inner.execution_value_is_signed(self.ctx.inner)
+    }
+
     pub fn token(&self) -> SleighToken<'a> {
         self.same_ctx(self.ctx.inner.token(self.inner.token))
     }
@@ -36,6 +52,12 @@ impl<'a> SleighTokenField<'a> {
             token_field: self.clone(),
             value: value
         }
+    }
+}
+
+impl<'a> std::fmt::Display for SleighTokenField<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}..{}", self.bits().start(), self.bits().end().get()))
     }
 }
 

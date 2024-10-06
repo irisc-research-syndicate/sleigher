@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{bail, Result};
 
-use sleigh_rs::{disassembly::{Assertation, VariableId}, pattern::{Block, Pattern}, Number, TokenFieldId};
+use sleigh_rs::{disassembly::{Assertation, Expr, ReadScope, VariableId}, pattern::{Block, Pattern}, Number, TokenFieldId};
 
-use crate::{SleighSleigh, SleighTokenField, WithCtx};
+use crate::{with_context, SleighConstructor, SleighContext, SleighSleigh, SleighTokenField, WithCtx};
 
-
-pub type SleighPattern<'a> = WithCtx<'a, SleighSleigh<'a>, Pattern>;
+with_context!(SleighPattern, SleighConstructor<'a>, Pattern, PatternContext, pattern); // todo: ctx to Constructor
 
 fn number_to_i64(n: Number) -> i64 {
     match n {
@@ -15,13 +14,69 @@ fn number_to_i64(n: Number) -> i64 {
     }
 }
 
+with_context!(SleighReadScope, SleighSleigh<'a>, ReadScope, ReadScopeContext, readscope);
+
+impl<'a> SleighReadScope<'a> {
+    pub fn evaluate(&self, data: &[u8]) -> Result<i64> {
+        Ok(match self.inner {
+            sleigh_rs::disassembly::ReadScope::Integer(number) => number_to_i64(*number),
+            sleigh_rs::disassembly::ReadScope::TokenField(token_field_id) => {
+                self.ctx.token_field(*token_field_id).decode(data).value as i64
+            },
+            sleigh_rs::disassembly::ReadScope::InstStart(_) => 0i64,
+            sleigh_rs::disassembly::ReadScope::InstNext(_) => 0i64,
+            //sleigh_rs::disassembly::ReadScope::Context(context_id) => todo!(),
+            //sleigh_rs::disassembly::ReadScope::Local(variable_id) => todo!(),
+            _ => bail!("Unknown ReadScope while evaluating ReadScope: {:?}", self),
+        })
+    }
+}
+
+type SleighExpr<'a> = WithCtx<'a, SleighSleigh<'a>, Expr>;
+
+impl<'a> SleighExpr<'a> {
+    pub fn evaluate(&self, data: &[u8]) -> Result<i64> {
+        match self.inner {
+            Expr::Value(expr_element) => {
+                match expr_element {
+                    sleigh_rs::disassembly::ExprElement::Value { value, location: _ } => {
+                        self.same_ctx(value).evaluate(data)
+                    },
+                    sleigh_rs::disassembly::ExprElement::Op(_span, op_unary, expr) => {
+                        let a = self.same_ctx(expr.as_ref()).evaluate(data)?;
+                        Ok(match op_unary {
+                            sleigh_rs::disassembly::OpUnary::Negation => !a,
+                            sleigh_rs::disassembly::OpUnary::Negative => -a,
+                        })
+                    },
+                }
+            },
+            Expr::Op(_span, op, a, b) => {
+                let a = self.same_ctx(a.as_ref()).evaluate(data)?;
+                let b = self.same_ctx(b.as_ref()).evaluate(data)?;
+                Ok(match op {
+                    sleigh_rs::disassembly::Op::Add => a + b,
+                    sleigh_rs::disassembly::Op::Sub => a - b,
+                    sleigh_rs::disassembly::Op::Mul => a * b,
+                    sleigh_rs::disassembly::Op::Div => a / b,
+                    sleigh_rs::disassembly::Op::And => a & b,
+                    sleigh_rs::disassembly::Op::Or => a | b,
+                    sleigh_rs::disassembly::Op::Xor => a ^ b,
+                    sleigh_rs::disassembly::Op::Asr => a >> b,
+                    sleigh_rs::disassembly::Op::Lsl => a << b,
+                })
+            },
+        }
+    }
+}
+
 impl<'a> SleighPattern<'a> {
     pub fn blocks(&self) -> impl Iterator<Item = SleighBlock> {
         self.inner.blocks().iter().map(|block| self.self_ctx(block))
     }
 
-    pub fn token_field(&self, id: TokenFieldId) -> SleighTokenField<'a> {
-        self.same_ctx(self.ctx.inner.token_field(id))
+    pub fn token_field(&self, id: TokenFieldId) -> SleighTokenField {
+        self.sleigh().token_field(id)
     }
 
     pub fn evaluate(&self, data: &[u8]) -> Result<HashMap<VariableId, i64>> {
@@ -32,51 +87,7 @@ impl<'a> SleighPattern<'a> {
                 match assertion.inner {
                     Assertation::GlobalSet(_global_set) => todo!(),
                     Assertation::Assignment(assignment) => {
-                        let mut stack: Vec<i64> = vec![];
-                        for expr in assignment.right.elements() {
-                            let value = match expr {
-                                sleigh_rs::disassembly::ExprElement::Value { value, location: _ } => {
-                                    match value {
-                                        sleigh_rs::disassembly::ReadScope::Integer(number) => number_to_i64(*number),
-                                        sleigh_rs::disassembly::ReadScope::TokenField(token_field_id) => {
-                                            self.token_field(*token_field_id).decode(data).value as i64
-                                        },
-                                        sleigh_rs::disassembly::ReadScope::InstStart(_) => 0i64,
-                                        sleigh_rs::disassembly::ReadScope::InstNext(_) => 0i64,
-                                        //sleigh_rs::disassembly::ReadScope::Context(context_id) => todo!(),
-                                        //sleigh_rs::disassembly::ReadScope::Local(variable_id) => todo!(),
-                                        
-                                        _ => bail!("Unknown ReadScope while evaluating Assertion: {:?}", value),
-                                    }
-                                },
-                                sleigh_rs::disassembly::ExprElement::Op(op) => {
-                                    let a = stack.pop().ok_or(anyhow!("Stack underrun: {:?}", op))?;
-                                    let b = stack.pop().ok_or(anyhow!("Stack underrun: {:?}", op))?;
-                                    match op {
-                                        sleigh_rs::disassembly::Op::Add => a + b,
-                                        sleigh_rs::disassembly::Op::Sub => a - b, // ??
-                                        sleigh_rs::disassembly::Op::Mul => a * b,
-                                        sleigh_rs::disassembly::Op::Div => a / b, // ??
-                                        sleigh_rs::disassembly::Op::And => a & b,
-                                        sleigh_rs::disassembly::Op::Or => a | b,
-                                        sleigh_rs::disassembly::Op::Xor => a ^ b,
-                                        sleigh_rs::disassembly::Op::Asr => todo!(),
-                                        sleigh_rs::disassembly::Op::Lsl => todo!(),
-                                    }
-                                },
-                                sleigh_rs::disassembly::ExprElement::OpUnary(op) => {
-                                    let a = stack.pop().ok_or(anyhow!("Stack underrun: {:?}", op))?;
-                                    match op {
-                                        sleigh_rs::disassembly::OpUnary::Negation => !a,
-                                        sleigh_rs::disassembly::OpUnary::Negative => -a,
-                                    }
-                                },
-                            };
-                            stack.push(value);
-                        }
-                        ensure!(stack.len() != 0, "Stack empty after evaluation");
-                        ensure!(stack.len() == 1, "Stack has more than one element after evaluation");
-                        let value = stack.pop().unwrap();
+                        let value = self.sleigh().self_ctx(&assignment.right).evaluate(data)?;
                         match assignment.left {
                             sleigh_rs::disassembly::WriteScope::Context(_context_id) => todo!(),
                             sleigh_rs::disassembly::WriteScope::Local(variable_id) => variables.insert(variable_id, value),
@@ -85,13 +96,12 @@ impl<'a> SleighPattern<'a> {
                 }
             }
         }
-
         Ok(variables)
     }
 }
 
-pub type SleighBlock<'a> = WithCtx<'a, SleighPattern<'a>, Block>;
-pub type SleighAssertion<'a> = WithCtx<'a, SleighBlock<'a>, Assertation>;
+with_context!(SleighBlock, SleighPattern<'a>, Block, BlockContext, block);
+with_context!(SleighAssertion, SleighBlock<'a>, Assertation, AssertionContext, assertion);
 
 impl<'a> SleighBlock<'a> {
     pub fn pre_disassembly(&self) -> impl Iterator<Item = SleighAssertion> {

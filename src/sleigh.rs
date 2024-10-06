@@ -1,9 +1,8 @@
 use sleigh_rs::{Sleigh, TableId, TokenFieldId};
-use anyhow::Result;
 
-use crate::{SleighDisassembledTable, SleighTable, SleighTokenField, WithCtx};
+use crate::{WithCtx, with_context, SleighTable, SleighTokenField};
 
-pub type SleighSleigh<'a> = WithCtx<'a, (), Sleigh>;
+with_context!(SleighSleigh, (), Sleigh, SleighContext, sleigh);
 
 impl<'a> SleighSleigh<'a> {
     pub fn tables(&self) -> impl Iterator<Item = SleighTable> {
@@ -18,11 +17,12 @@ impl<'a> SleighSleigh<'a> {
         self.table(self.inner.instruction_table())
     }
 
+    pub fn token_fields(&self) -> impl Iterator<Item = SleighTokenField> {
+        self.inner.token_fields().iter().map(|token_field| self.self_ctx(token_field))
+    }
+
     pub fn token_field(&self, id: TokenFieldId) -> SleighTokenField {
         self.self_ctx(self.inner.token_field(id))
     }
 
-    pub fn disassemble_instruction(&'a self, data: &[u8]) -> Result<SleighDisassembledTable<'a>> {
-        self.instruction_table().disassemble(data)
-    }
 }

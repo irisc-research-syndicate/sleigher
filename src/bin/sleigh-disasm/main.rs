@@ -20,7 +20,8 @@ fn main() -> Result<()> {
         0x94, 0xff, 0xf3, 0x86,
     ];
     for instr in instrs.chunks(4) {
-        let instruction = sleigh.disassemble_instruction(&instr).unwrap();
+        let instruction_table = sleigh.instruction_table();
+        let instruction = instruction_table.disassemble(&instr).unwrap();
         println!("{}", instruction);
     }
 

@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use sleigh_rs::{disassembly::VariableId, display::DisplayElement, table::{ConstructorId, Matcher, Table, VariantId}};
 use anyhow::{Context, Result};
 
-use crate::{SleighBitConstraints, SleighConstructor, SleighSleigh, WithCtx};
+use crate::{with_context, SleighBitConstraints, SleighConstructor, SleighContext, SleighSleigh, WithCtx};
 
-pub type SleighTable<'a> = WithCtx<'a, SleighSleigh<'a>, Table>;
+with_context!(SleighTable, SleighSleigh<'a>, Table, TableContext, table);
+//pub type SleighTable<'a> = WithCtx<'a, SleighSleigh<'a>, Table>;
 
 impl<'a> SleighTable<'a> {
-    pub fn disassemble(&self, data: &[u8]) -> Result<SleighDisassembledTable<'a>> {
+    pub fn disassemble(&self, data: &[u8]) -> Result<SleighDisassembledTable> {
         let (variant_id, constructor) = self
             .find_match(data)
             .context("Unable to find matching constructor")?;
@@ -18,27 +19,26 @@ impl<'a> SleighTable<'a> {
             .context("Could not evaluate pattern")?;
 
         Ok(SleighDisassembledTable {
-            sleigh: self.ctx.clone(),
-            variant_id,
             constructor,
+            variant_id,
             data: data.to_vec(),
             variables: variables,
         })
     }
 
-    pub fn matcher_order(&'a self) -> impl Iterator<Item = SleighMatcher<'a>> {
+    pub fn matcher_order(&self) -> impl Iterator<Item = SleighMatcher> {
         self.inner.matcher_order().iter().map(|matcher| self.self_ctx(matcher))
     }
 
-    pub fn constructors(&'a self) -> impl Iterator<Item = SleighConstructor<'a>> {
-        self.inner.constructors().iter().map(|constructor| self.same_ctx(constructor))
+    pub fn constructors(&self) -> impl Iterator<Item = SleighConstructor> {
+        self.inner.constructors().iter().map(|constructor| self.self_ctx(constructor))
     }
 
-    pub fn constructor(&self, id: ConstructorId) -> SleighConstructor<'a> {
-        self.same_ctx(self.inner.constructor(id))
+    pub fn constructor(&self, id: ConstructorId) -> SleighConstructor {
+        self.self_ctx(self.inner.constructor(id))
     }
 
-    pub fn find_match(&self, data: &[u8]) -> Option<(VariantId, SleighConstructor<'a>)> {
+    pub fn find_match(&self, data: &[u8]) -> Option<(VariantId, SleighConstructor)> {
         for matcher in self.matcher_order() {
             let constructor = self.constructor(matcher.inner.constructor);
             if matcher.matches(data) {
@@ -71,7 +71,6 @@ impl<'a> SleighMatcher<'a> {
 
 #[derive(Debug)]
 pub struct SleighDisassembledTable<'a> {
-    pub sleigh: SleighSleigh<'a>,
     pub constructor: SleighConstructor<'a>,
     pub variant_id: VariantId,
     pub data: Vec<u8>,
@@ -87,17 +86,17 @@ impl<'a> std::fmt::Display for SleighDisassembledTable<'a> {
                 DisplayElement::Varnode(_varnode_id) => "VARNODE".to_string(),
                 DisplayElement::Context(_context_id) => "CONTEXT".to_string(),
                 DisplayElement::TokenField(token_field_id) => {
-                    let token_field = self.sleigh.token_field(*token_field_id);
+                    let token_field = self.constructor.sleigh().token_field(*token_field_id);
                     let token_field_value = token_field.decode(&self.data);
                     format!("{}", token_field_value)
                 },
                 DisplayElement::InstStart(_inst_start) => "INST_START".to_string(),
                 DisplayElement::InstNext(_inst_next) => "INST_NEXT".to_string(),
                 DisplayElement::Table(table_id) => {
-                    format!("{}", self.sleigh.table(*table_id).disassemble(&self.data).unwrap())
+                    format!("{}", self.constructor.sleigh().table(*table_id).disassemble(&self.data).unwrap())
                 },
                 DisplayElement::Disassembly(variable_id) => {
-                    self.variables.get(variable_id).map_or("UNKNOWN_DISASSEMBLY_VARIABLE".to_string(), |val| format!("{}", val))
+                    self.variables.get(&variable_id).map_or("UNKNOWN_DISASSEMBLY_VARIABLE".to_string(), |val| format!("{}", val))
                 },
                 DisplayElement::Literal(lit) => lit.to_string(),
                 DisplayElement::Space => " ".to_string(),
