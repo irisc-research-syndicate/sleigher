@@ -285,6 +285,12 @@ impl TableExecutor {
             },
         }
 
+        self.write_var(var, value);
+
+        Ok(())
+    }
+
+    fn write_var(&self, var: Var, value: Value) {
         match var {
             Var::Ref(referance) => {
                 self.write_space(referance, &self.get_value(value).to_be_bytes());
