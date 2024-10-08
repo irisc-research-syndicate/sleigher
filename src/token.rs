@@ -3,6 +3,8 @@ use sleigh_rs::{token::{Token, TokenField}, Endian, FieldBits};
 use crate::{SleighSleigh, WithCtx};
 
 pub type SleighTokenField<'a> = WithCtx<'a, SleighSleigh<'a>, TokenField>;
+
+#[derive(Debug)]
 pub struct SleighDecodedTokenField<'a> {
     pub token_field: SleighTokenField<'a>,
     pub value: usize,
@@ -48,6 +50,11 @@ impl<'a> SleighTokenField<'a> {
 
     pub fn decode(&self, data: &[u8]) -> SleighDecodedTokenField {
         let value = (self.token().decode(data) >> self.inner.bits.start()) & ((1 << self.inner.bits.len().get()) - 1);
+        let value = if self.raw_value_is_signed() && (value & (1 << (self.inner.bits.len().get() - 1))) != 0 {
+            -((1 << self.inner.bits.len().get()) - value as isize) as usize
+        } else {
+            value
+        };
         SleighDecodedTokenField {
             token_field: self.clone(),
             value: value
