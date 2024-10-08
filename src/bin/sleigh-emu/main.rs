@@ -386,7 +386,14 @@ impl TableExecutor {
             sleigh_rs::execution::Binary::And => left & right,
             sleigh_rs::execution::Binary::Xor => left ^ right,
             sleigh_rs::execution::Binary::Or => left | right,
-            unknown_op => bail!("{:?} not implemented", unknown_op),
+            sleigh_rs::execution::Binary::BitAnd => left & right,
+            sleigh_rs::execution::Binary::BitOr => left | right,
+            sleigh_rs::execution::Binary::BitXor => left ^ right,
+            sleigh_rs::execution::Binary::Lsl => left << right,
+            sleigh_rs::execution::Binary::Lsr => left >> right,
+            sleigh_rs::execution::Binary::SigLess => ((left as i64) < (right as i64)) as u64,
+            sleigh_rs::execution::Binary::Eq => (left == right) as u64,
+            unknown_op => bail!("ExprBinaryOp {:?} not implemented", unknown_op),
         }))
     }
 }
