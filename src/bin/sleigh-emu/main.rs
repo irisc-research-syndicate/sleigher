@@ -165,66 +165,98 @@ impl TableExecutor {
 
     pub fn execute_statement(&mut self, stmt: SleighStatement) -> Result<Option<BlockId>> {
         match stmt.inner {
-            Statement::Delayslot(_) => todo!(),
             Statement::Export(export) => self.execute_export(stmt.self_ctx(export))?,
-            Statement::CpuBranch(cpu_branch) => todo!(),
+            Statement::CpuBranch(cpu_branch) => self.execute_cpubranch(stmt.self_ctx(cpu_branch))?,
             Statement::LocalGoto(local_goto) => {
-                let mut taken = true;
-                if let Some(cond_expr) = &local_goto.cond {
-                    taken = self.evaluate_expr(stmt.self_ctx(cond_expr))? == Value::Int(1);
-                }
-                if taken {
-                    return Ok(Some(local_goto.dst.clone()));
-                }
+                return self.execute_localgoto(stmt.self_ctx(local_goto));
             },
-            Statement::UserCall(user_call) => todo!(),
             Statement::Build(build) => self.execute_build(stmt.self_ctx(build))?,
-            Statement::Declare(variable_id) => todo!(),
             Statement::Assignment(assignment) => self.execute_assignment(stmt.self_ctx(assignment))?,
             Statement::MemWrite(mem_write) => self.execute_memwrite(stmt.self_ctx(mem_write))?,
+            stmt => bail!("Statement {:?} not implemented", stmt),
         };
         return Ok(None);
+    }
+
+    fn execute_localgoto(&mut self, local_goto: SleighLocalGoto) -> Result<Option<BlockId>> {
+        if let Some(cond_expr) = &local_goto.inner.cond {
+            if self.evaluate_expr(local_goto.same_ctx(cond_expr))? == Value::Int(1) {
+                log::debug!("LocalGoto {:?} taken conditionally", &local_goto.inner.dst);
+                return Ok(Some(local_goto.inner.dst.clone()));
+            }
+        } else {
+            log::debug!("LocalGoto {:?} taken unconditionally", &local_goto.inner.dst);
+            return Ok(Some(local_goto.inner.dst.clone()));
+        }
+        log::debug!("LocalGoto {:?} not taken", &local_goto.inner.dst);
+        Ok(None)
+    }
+
+    fn execute_cpubranch(&mut self, cpu_branch: SleighCpuBranch) -> Result<()> {
+        let dst = self.evaluate_expr(cpu_branch.same_ctx(&cpu_branch.inner.dst))?.to_u64();
+        if let Some(cond_expr) = &cpu_branch.inner.cond {
+            if self.evaluate_expr(cpu_branch.same_ctx(cond_expr))? == Value::Int(1) {
+                log::debug!("CpuBranch {:#018x} taken conditionally", dst);
+                self.instruction.state.0.borrow_mut().pc = dst;
+                return Ok(());
+            }
+        } else {
+            log::debug!("CpuBranch {:#018x} taken unconditionally", dst);
+            self.instruction.state.0.borrow_mut().pc = dst;
+            return Ok(());
+        };
+        log::debug!("CpuBranch {:#018x} not taken", dst);
+        Ok(())
     }
 
     fn execute_memwrite(&mut self, mem_write: SleighMemWrite) -> Result<()> {
         let addr = self.get_value(self.evaluate_expr(mem_write.same_ctx(&mem_write.inner.addr))?);
         let data = self.get_value(self.evaluate_expr(mem_write.same_ctx(&mem_write.inner.right))?);
-        log::debug!("MemWrite: {:#018x} <- {:#018x} {:?}", addr, data, mem_write.inner.mem);
-        self.write_space(mem_write.inner.mem.space, Address(addr), &data.to_be_bytes());
+        let referance = Ref(mem_write.inner.mem.space, mem_write.inner.mem.len_bytes.get() as usize / 8, Address(addr));
+        log::debug!("MemWrite: {} <- {:02x?}", referance, data);
+        self.write_space(referance, &data.to_be_bytes());
         Ok(())
     }
 
     fn execute_export(&mut self, export: SleighExport) -> Result<()> {
         let export_value = match export.inner {
-            sleigh_rs::execution::Export::Const { len_bits, location, export: export_const} => match export_const {
-                sleigh_rs::execution::ExportConst::DisVar(variable_id) => {
-                    let table = TableContext::table(&export);
-                    let disassembled_table = table.disassemble(&self.instruction.current_instruction)?;
-                    let disvar = disassembled_table.variables.get(variable_id).context("Could not find disassembly var")?;
-                    Value::Int(*disvar as u64)
-                },
-                sleigh_rs::execution::ExportConst::TokenField(token_field_id) => todo!(),
-                sleigh_rs::execution::ExportConst::Context(context_id) => todo!(),
-                sleigh_rs::execution::ExportConst::InstructionStart => todo!(),
-                sleigh_rs::execution::ExportConst::Table(table_id) => todo!(),
-                sleigh_rs::execution::ExportConst::ExeVar(variable_id) => todo!(),
+            sleigh_rs::execution::Export::Const { len_bits, location, export: export_const} => {
+                self.evaluate_export_const(export.statement().self_ctx(export_const))?
             },
             sleigh_rs::execution::Export::Value(expr) => self.evaluate_expr(export.statement().self_ctx(expr))?,
             sleigh_rs::execution::Export::Reference { addr, memory } => {
                 let address = self.get_value(self.evaluate_expr(export.statement().self_ctx(addr))?);
-                Value::Ref(memory.space, Address(address))
+                Value::Ref(Ref(memory.space, memory.len_bytes.get() as usize / 8, Address(address)))
             },
         };
+        log::debug!("Export {:?} from table {}", export_value, export.table().name());
         self.export = Some(export_value);
         Ok(())
+    }
+
+    fn evaluate_export_const(&self, export_const: SleighExportConst) -> Result<Value> {
+        Ok(match export_const.inner {
+            sleigh_rs::execution::ExportConst::DisVar(variable_id) => {
+                let table = export_const.table();
+                let disassembled_table = table.disassemble(self.instruction.state.0.borrow().pc, &self.instruction.current_instruction)?;
+                let disvar = disassembled_table.variables.get(variable_id).context("Could not find disassembly var")?;
+                Value::Int(*disvar as u64)
+            },
+            export_const => bail!("ExportConst {:?} unimplemented", export_const),
+            //sleigh_rs::execution::ExportConst::TokenField(token_field_id) => todo!(),
+            //sleigh_rs::execution::ExportConst::Context(context_id) => todo!(),
+            //sleigh_rs::execution::ExportConst::InstructionStart => todo!(),
+            //sleigh_rs::execution::ExportConst::Table(table_id) => todo!(),
+            //sleigh_rs::execution::ExportConst::ExeVar(variable_id) => todo!(),
+        })
     }
 
     fn get_value(&self, value: Value) -> u64 {
         match value {
             Value::Int(x) => x,
-            Value::Ref(space_id, address) => {
+            Value::Ref(referance) => {
                 let mut data = [0u8; 8];
-                self.read_space(space_id, address, &mut data);
+                self.read_space(referance, &mut data);
                 u64::from_be_bytes(data)
             },
         }
