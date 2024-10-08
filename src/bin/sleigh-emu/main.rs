@@ -13,37 +13,6 @@ use sleigher::*;
 use sleigher::execution::*;
 use table::TableContext;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
-pub struct Address(u64);
-
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum Value {
-    Int(u64),
-    Ref(SpaceId, Address),
-}
-
-impl Value {
-    pub fn to_var(&self) -> Var {
-        match self {
-            Value::Int(address) => Var::Ref(SpaceId(0), Address(*address)), // fixme: Default memory space is 0???
-            Value::Ref(space_id, address) => Var::Ref(*space_id, *address),
-        }
-    }
-
-    pub fn to_u64(&self) -> u64 {
-        match self {
-            Value::Int(x) => *x,
-            Value::Ref(space_id, address) => address.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum Var {
-    Ref(SpaceId, Address),
-    Local(VariableId),
-}
 
 #[derive(Debug)]
 pub struct Space(HashMap<Address, u8>);
@@ -78,27 +47,21 @@ impl Default for Space {
 
 #[derive(Debug)]
 pub struct StateInner {
-    spaces: RefCell<HashMap<SpaceId, Space>>,
+    pc: u64,
+    spaces: HashMap<SpaceId, Space>,
     context: (),
 }
 
 #[derive(Debug, Clone)]
-pub struct State(Rc<StateInner>);
-
-impl std::ops::Deref for State {
-    type Target = StateInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
+pub struct State(Rc<RefCell<StateInner>>);
 
 impl State {
     pub fn new() -> Self {
-        State(Rc::new(StateInner {
-            spaces: RefCell::new(HashMap::new()),
+        State(Rc::new(RefCell::new(StateInner {
+            pc: 0,
+            spaces: HashMap::new(),
             context: (),
-        }))
+        })))
     }
 
     pub fn new_instruction(self, instruction_bytes: Vec<u8>) -> InstructionExecutor {
@@ -107,6 +70,26 @@ impl State {
             table_exports: RefCell::new(HashMap::new()),
             current_instruction: instruction_bytes
         }))
+    }
+
+    pub fn write_ref(&self, referance: Ref, data: &[u8]) {
+        log::debug!("Writing {} <- {:02x?}", referance, data);
+        assert!(data.len() >= referance.1);
+        let data = &data[data.len()-referance.1..];
+        let mut inner_state = self.0.borrow_mut();
+        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Space::new());
+        space.write_bytes(referance.2, data);
+    }
+
+    pub fn read_ref(&self, referance: Ref, data: &mut [u8]) {
+        let len = data.len();
+        assert!(len >= referance.1);
+        for byte in &mut *data { *byte = 0; }
+        let data = &mut data[len-referance.1..];
+        let mut inner_state = self.0.borrow_mut();
+        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Space::new());
+        space.read_bytes(referance.2, data);
+        log::debug!("Reading {} -> {:02x?}", referance, data);
     }
 }
 
@@ -271,8 +254,8 @@ impl TableExecutor {
         }
 
         match var {
-            Var::Ref(space_id, address) => {
-                self.write_space(space_id, address, &value.to_u64().to_be_bytes());
+            Var::Ref(referance) => {
+                self.write_space(referance, &self.get_value(value).to_be_bytes());
             },
             Var::Local(variable_id) => {
                 self.locals.0.borrow_mut().insert(variable_id, value);
@@ -282,18 +265,12 @@ impl TableExecutor {
         Ok(())
     }
 
-    fn write_space(&self, space_id: SpaceId, address: Address, data: &[u8]) {
-        log::debug!("Writing {}:{:018x?} <- {:02x?}", space_id.0, address, data);
-        let mut spaces = self.instruction.state.spaces.borrow_mut();
-        let space = spaces.entry(space_id).or_insert_with(|| Space::new());
-        space.write_bytes(address, data);
+    fn write_space(&self, referance: Ref, data: &[u8]) {
+        self.instruction.state.write_ref(referance, data);
     }
 
-    fn read_space(&self, space_id: SpaceId, address: Address, data: &mut [u8]) {
-        let mut spaces = self.instruction.state.spaces.borrow_mut();
-        let space = spaces.entry(space_id).or_insert_with(|| Space::new());
-        space.read_bytes(address, data);
-        log::debug!("Reading {}:{:018x?} -> {:02x?}", space_id.0, address, data);
+    fn read_space(&self, referance: Ref, data: &mut [u8]) {
+        self.instruction.state.read_ref(referance, data);
     }
 
     fn write_value(&self, write_value: SleighWriteValue) -> Result<Var> {
