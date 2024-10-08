@@ -298,9 +298,7 @@ impl TableExecutor {
             Var::Local(variable_id) => {
                 self.locals.0.borrow_mut().insert(variable_id, value);
             },
-        }
-
-        Ok(())
+        };
     }
 
     fn write_space(&self, referance: Ref, data: &[u8]) {
@@ -314,11 +312,8 @@ impl TableExecutor {
     fn write_value(&self, write_value: SleighWriteValue) -> Result<Var> {
         Ok(match write_value.inner {
             WriteValue::Varnode(write_varnode) => {
-                let varnode = write_value.sleigh().inner.varnode(write_varnode.id);
-                let space = write_value.sleigh().inner.space(varnode.space);
-                log::debug!("Varnode size: {}", varnode.len_bytes.get());
-                log::debug!("Space word size: {}", space.wordsize);
-                Var::Ref(varnode.space, Address(varnode.address))
+                let varnode = write_value.sleigh().varnode(write_varnode.id);
+                Var::Ref(varnode.referance())
             },
             WriteValue::Bitrange(write_bitrange) => todo!(),
             WriteValue::TokenField(write_token_field) => todo!(),
