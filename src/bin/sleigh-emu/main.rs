@@ -457,33 +457,111 @@ fn main() -> Result<()> {
         0x6c, 0x20, 0x7b, 0x96,
         0x6c, 0x20, 0x83, 0x92,
         0x6c, 0x20, 0x8b, 0x8e,
-        //0x6c, 0x20, 0x93, 0x8a,
-        //0x6c, 0x20, 0x9b, 0x86,
-        //0x6c, 0x20, 0xa3, 0x82,
-        //0x6c, 0x20, 0xab, 0x7e,
-        //0x6c, 0x20, 0xb3, 0x7a,
-        //0x6c, 0x20, 0xbb, 0x76,
+        0x6c, 0x20, 0x93, 0x8a,
+        0x6c, 0x20, 0x9b, 0x86,
+        0x6c, 0x20, 0xa3, 0x82,
+        0x6c, 0x20, 0xab, 0x7e,
+        0x6c, 0x20, 0xb3, 0x7a,
+        0x6c, 0x20, 0xbb, 0x76,
+        0xfc, 0x97, 0x20, 0x08,
+        0x02, 0xf6, 0x01, 0x00,
+        0x02, 0xf4, 0x00, 0x80,
+        0x66, 0xe7, 0x01, 0x52,
+        0x66, 0xe4, 0x00, 0x82,
+        0x24, 0x05, 0x20, 0x00,
+        0x20, 0xa5, 0x00, 0x04,
+        0xfc, 0x85, 0x28, 0x0b,
+        0xa0, 0x00, 0x00, 0x0d,
+        0x00, 0x12, 0x00, 0x00,
+        0xac, 0x9d, 0x00, 0x29,
+        0x38, 0x84, 0x04, 0x94,
+        0x6e, 0x80, 0x20, 0x02,
+        0xfc, 0xe4, 0x38, 0x08,
+        0xfe, 0xc5, 0xb0, 0x08,
+        0xfe, 0x86, 0xa0, 0x08,
+        0x94, 0xff, 0xfd, 0xdf,
+        0x66, 0x84, 0x00, 0x02,
+        0x38, 0x84, 0x04, 0x94,
+        0x6e, 0x80, 0x20, 0x02,
+        0x95, 0x00, 0x00, 0x1f,
+        0x6c, 0x20, 0x9b, 0x86,
     ];
 
-    let state = State(Rc::new(StateInner {
-        spaces: Default::default(),
-        context: (),
-    }));
+    const START_ADDRESS: u64 = 0x008af5f8u64;
 
+    let state = State::new();
+    state.0.borrow_mut().pc = 0x008af5f8u64;
 
-    for instr in instrs.chunks(4) {
+    state.write_ref(Ref(SpaceId(0), instrs.len(), Address(START_ADDRESS)), &instrs);
+
+    let regs = vec![
+        ("r1", 0xffffffffffffff00u64),
+        ("r3", 0x0303030303030303u64),
+        ("r4", 0x0404040404040404u64),
+        ("r5", 0x0505050505050505u64),
+        ("r6", 0x0606060606060606u64),
+        ("r7", 0x0707070707070707u64),
+        ("r15", 0x1515151515151515u64),
+        ("r16", 0x1616161616161616u64),
+        ("r17", 0x1717171717171717u64),
+        ("r18", 0x1818181818181818u64),
+        ("r19", 0x1919191919191919u64),
+        ("r20", 0x2020202020202020u64),
+        ("r21", 0x2121212121212121u64),
+        ("r22", 0x2222222222222222u64),
+        ("r23", 0x2323232323232323u64),
+    ];
+
+    log::debug!("=== Initializing registers ===");
+    for (reg_name, reg_value) in regs {
+        let varnode = sleigh.varnode_by_name(reg_name).unwrap();
+        state.write_ref(varnode.referance(), &reg_value.to_be_bytes());
+    }
+
+    for _ in 0..24 {
+        let pc = state.0.borrow().pc;
+        log::debug!("========== PC {:#018x} ==========", pc);
+
+        let mut instr = [0u8; 4];
+        state.read_ref(Ref(SpaceId(0), 4, Address(pc)), &mut instr);
+
         let table = sleigh.instruction_table();
-        let instruction = table.disassemble(&instr).unwrap();
-        log::debug!("INSTRUCTION: {:02x?} {}", instr, instruction);
+        let instruction = table.disassemble(pc, &instr).unwrap();
+        log::debug!("=== INSTRUCTION {} ===", instruction);
 
         let instr_exec = InstructionExecutor(Rc::new(InstructionExecutorInner {
             state: state.clone(),
             table_exports: RefCell::new(Default::default()),
             current_instruction: instr.to_vec()
         }));
+
         instr_exec.execute_table(sleigh.instruction_table())?;
+        state.0.borrow_mut().pc += 4;
     }
-    println!("{:02x?}", state);
+
+    for (space_id, space) in &state.0.borrow().spaces {
+        let mut addresses = space.0.keys().collect::<Vec<_>>();
+        addresses.sort();
+        let mut last_address = None;
+        let mut current_bytes = vec![];
+        let mut start_address = None;
+        for address in addresses {
+            let byte = space.0.get(address).unwrap().clone();
+            if last_address == Some(address.0.wrapping_sub(1)) && current_bytes.len() < 8 {
+                current_bytes.push(byte);
+            } else {
+                if let Some(start_address) = start_address {
+                    println!("{}:{}:{} -> {:02x?}", space_id.0, start_address, current_bytes.len(), current_bytes)
+                }
+                start_address = Some(address.clone());
+                current_bytes = vec![byte];
+            }
+            last_address = Some(address.0)
+        }
+        if let Some(start_address) = start_address {
+            println!("{}:{}:{} -> {:02x?}", space_id.0, start_address, current_bytes.len(), current_bytes)
+        }
+    }
 
     Ok(())
 }
