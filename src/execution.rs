@@ -1,6 +1,6 @@
-use sleigh_rs::execution::{Assignment, Block, BlockId, Build, Execution, Export, Expr, ExprBinaryOp, ExprElement, ExprValue, MemWrite, Statement, WriteValue};
+use sleigh_rs::{execution::{Assignment, Block, BlockId, Build, CpuBranch, Execution, Export, ExportConst, Expr, ExprBinaryOp, ExprElement, ExprUnaryOp, ExprValue, LocalGoto, MemWrite, Statement, VariableId, WriteValue}, varnode::Varnode, SpaceId};
 
-use crate::{with_context, SleighConstructor, SleighContext, SleighTable, WithCtx};
+use crate::{with_context, SleighConstructor, SleighContext, SleighSleigh, SleighTable, WithCtx};
 
 with_context!(SleighExecution, SleighConstructor<'a>, Execution, ExecutionContext, execution);
 with_context!(SleighBlock, SleighExecution<'a>, Block, BlockContext, block);
@@ -12,8 +12,13 @@ with_context!(SleighExpr, SleighStatement<'a>, Expr, ExprContext, expr);
 with_context!(SleighExprElement, SleighExpr<'a>, ExprElement, ExprElementContext, expr_elem);
 with_context!(SleighExprValue, SleighExpr<'a>, ExprValue, ExprValueContext, expr_value);
 with_context!(SleighExprBinaryOp, SleighExpr<'a>, ExprBinaryOp, ExprBinaryOpContext, expr_binop);
+with_context!(SleighExprUnaryOp, SleighExpr<'a>, ExprUnaryOp, ExprUnaryOpContext, expr_unaryop);
 with_context!(SleighExport, SleighStatement<'a>, Export, ExportContext, export);
+with_context!(SleighExportConst, SleighStatement<'a>, ExportConst, ExportConstContext, export_const);
 with_context!(SleighMemWrite, SleighStatement<'a>, MemWrite, MemWriteContext, mem_write);
+with_context!(SleighCpuBranch, SleighStatement<'a>, CpuBranch, CpuBranchContext, cpu_branch);
+with_context!(SleighLocalGoto, SleighStatement<'a>, LocalGoto, LocalGotoContext, local_goto);
+
 
 impl<'a> SleighAssignment<'a> {
     pub fn right(&self) -> SleighExpr {
