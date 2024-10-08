@@ -1,8 +1,9 @@
-use sleigh_rs::{Sleigh, TableId, TokenFieldId};
+use sleigh_rs::{varnode::Varnode, Sleigh, TableId, TokenFieldId, VarnodeId};
 
 use crate::{WithCtx, with_context, SleighTable, SleighTokenField};
 
 with_context!(SleighSleigh, (), Sleigh, SleighContext, sleigh);
+with_context!(SleighVarnode, SleighSleigh<'a>, Varnode, VarnodeContext, varnode);
 
 impl<'a> SleighSleigh<'a> {
     pub fn tables(&self) -> impl Iterator<Item = SleighTable> {
@@ -25,4 +26,25 @@ impl<'a> SleighSleigh<'a> {
         self.self_ctx(self.inner.token_field(id))
     }
 
+    pub fn varnode(&self, id: VarnodeId) -> SleighVarnode {
+        self.self_ctx(self.inner.varnode(id))
+    }
+
+    pub fn varnodes(&self) -> impl Iterator<Item = SleighVarnode> {
+        self.inner.varnodes().iter().map(|varnode| self.self_ctx(varnode))
+    }
+
+    pub fn varnode_by_name(&self, name: &str) -> Option<SleighVarnode> {
+        self.varnodes().find(|varnode| varnode.name() == name)
+    }
+}
+
+impl<'a> SleighVarnode<'a> {
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    pub fn referance(&self) -> crate::execution::Ref {
+        crate::execution::Ref(self.inner.space, self.inner.len_bytes.get() as usize, crate::execution::Address(self.inner.address))
+    }
 }
