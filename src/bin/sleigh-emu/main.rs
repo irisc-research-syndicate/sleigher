@@ -343,48 +343,70 @@ impl TableExecutor {
     fn evaluate_expr_elem(&self, elem: SleighExprElement) -> Result<Value> {
         match elem.inner {
             sleigh_rs::execution::ExprElement::Value(expr_value) => self.evaluate_expr_value(elem.same_ctx(expr_value)),
-            sleigh_rs::execution::ExprElement::UserCall(user_call) => todo!(),
-            sleigh_rs::execution::ExprElement::Reference(reference) => todo!(),
-            sleigh_rs::execution::ExprElement::Op(expr_unary_op) => todo!(),
-            sleigh_rs::execution::ExprElement::New(expr_new) => todo!(),
-            sleigh_rs::execution::ExprElement::CPool(expr_cpool) => todo!(),
+            sleigh_rs::execution::ExprElement::Op(expr_unary_op) => self.evaluare_expr_unary_op(elem.same_ctx(expr_unary_op)),
+            expr_elem => bail!(format!("ExprElement {:?} not implemented", expr_elem)),
         }
     }
 
+    fn evaluare_expr_unary_op(&self, expr_unary_op: SleighExprUnaryOp) -> Result<Value> {
+        let value = self.evaluate_expr(expr_unary_op.statement().self_ctx(&expr_unary_op.inner.input))?;
+        Ok(match &expr_unary_op.inner.op {
+            sleigh_rs::execution::Unary::Dereference(memory_location) => {
+                //log::debug!("Dereferance {:?} {:?}", memory_location, value);
+                let referance = Ref(memory_location.space, memory_location.len_bytes.get() as usize / 8, Address(self.get_value(value)));
+                let mut data = [0u8; 8];
+                self.read_space(referance, &mut data);
+                Value::Int(u64::from_be_bytes(data))
+            },
+            sleigh_rs::execution::Unary::Zext => value,
+            sleigh_rs::execution::Unary::TakeLsb(non_zero) => value,
+            op => bail!(format!("Unimplemented ExprUnaryOp {:?}", op)),
+        })
+    }
+
     fn evaluate_expr_value(&self, expr_value: SleighExprValue) -> Result<Value> {
-        match  expr_value.inner {
-            ExprValue::Int(expr_number) => todo!(),
+        Ok(match expr_value.inner {
+            ExprValue::Int(expr_number) => {
+                match expr_number.number {
+                    sleigh_rs::Number::Positive(x) => Value::Int(x),
+                    sleigh_rs::Number::Negative(x) => Value::Int((-(x as i64)) as u64),
+                }
+            },
             ExprValue::TokenField(expr_token_field) => {
                 let token_field = expr_value.sleigh().token_field(expr_token_field.id);
                 //log::debug!("Eval TokenField Expr: {:?}", token_field);
                 let decoded_token_field = token_field.decode(&self.instruction.current_instruction);
-                Ok(match token_field.inner.attach {
+                match token_field.inner.attach {
                     sleigh_rs::token::TokenFieldAttach::NoAttach(value_fmt) => {
                         Value::Int(decoded_token_field.value as u64)
                     },
                     sleigh_rs::token::TokenFieldAttach::Varnode(attach_varnode_id) => {
                         let attach_varnode = expr_value.sleigh().inner.attach_varnode(attach_varnode_id);
                         let varnode_id = attach_varnode.find_value(decoded_token_field.value).unwrap();
-                        let varnode = expr_value.sleigh().inner.varnode(varnode_id);
-                        //log::debug!("{:?}", varnode);
-                        Value::Ref(varnode.space, Address(varnode.address))
+                        let varnode = expr_value.sleigh().varnode(varnode_id);
+                        Value::Ref(varnode.referance())
                     }
                     sleigh_rs::token::TokenFieldAttach::Literal(attach_literal_id) => todo!(),
                     sleigh_rs::token::TokenFieldAttach::Number(print_base, attach_number_id) => todo!(),
-                })
+                }
             },
-            ExprValue::InstStart(expr_inst_start) => todo!(),
-            ExprValue::InstNext(expr_inst_next) => todo!(),
-            ExprValue::Varnode(expr_varnode) => todo!(),
-            ExprValue::Context(expr_context) => todo!(),
-            ExprValue::Bitrange(expr_bitrange) => todo!(),
+            //ExprValue::InstStart(expr_inst_start) => todo!(),
+            //ExprValue::InstNext(expr_inst_next) => todo!(),
+            //ExprValue::Varnode(expr_varnode) => todo!(),
+            //ExprValue::Context(expr_context) => todo!(),
+            //ExprValue::Bitrange(expr_bitrange) => todo!(),
             ExprValue::Table(expr_table) => {
                 let table = expr_value.sleigh().table(expr_table.id);
-                self.instruction.execute_table(table)?.context("Table as no export")
+                self.instruction.execute_table(table)?.context("Table as no export")?
             },
-            ExprValue::DisVar(expr_dis_var) => todo!(),
-            ExprValue::ExeVar(expr_exe_var) => todo!(),
-        }
+            ExprValue::DisVar(expr_dis_var) => {
+                let disassembled_table = expr_value.table().disassemble(self.instruction.state.0.borrow().pc, &self.instruction.current_instruction)?;
+                let value = disassembled_table.variables.get(&expr_dis_var.id).context(format!("Could not find Disassembly Variable {:?}", expr_dis_var.id))?;
+                Value::Int(*value as u64)
+            },
+            //ExprValue::ExeVar(expr_exe_var) => todo!(),
+            expr_value => bail!("ExprValue {:?} not implemented", expr_value),
+        })
     }
 
     fn evaluate_expr_binop(&self, expr_binop: SleighExprBinaryOp) -> Result<Value> {
