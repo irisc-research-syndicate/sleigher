@@ -9,16 +9,17 @@ with_context!(SleighTable, SleighSleigh<'a>, Table, TableContext, table);
 //pub type SleighTable<'a> = WithCtx<'a, SleighSleigh<'a>, Table>;
 
 impl<'a> SleighTable<'a> {
-    pub fn disassemble(&self, data: &[u8]) -> Result<SleighDisassembledTable> {
+    pub fn disassemble(&self, pc: u64, data: &[u8]) -> Result<SleighDisassembledTable> {
         let (variant_id, constructor) = self
             .find_match(data)
             .context("Unable to find matching constructor")?;
         let variables = constructor
             .pattern()
-            .evaluate(data)
+            .evaluate(pc, data)
             .context("Could not evaluate pattern")?;
 
         Ok(SleighDisassembledTable {
+            pc,
             constructor,
             variant_id,
             data: data.to_vec(),
@@ -71,6 +72,7 @@ impl<'a> SleighMatcher<'a> {
 
 #[derive(Debug)]
 pub struct SleighDisassembledTable<'a> {
+    pub pc: u64,
     pub constructor: SleighConstructor<'a>,
     pub variant_id: VariantId,
     pub data: Vec<u8>,
@@ -93,7 +95,7 @@ impl<'a> std::fmt::Display for SleighDisassembledTable<'a> {
                 DisplayElement::InstStart(_inst_start) => "INST_START".to_string(),
                 DisplayElement::InstNext(_inst_next) => "INST_NEXT".to_string(),
                 DisplayElement::Table(table_id) => {
-                    format!("{}", self.constructor.sleigh().table(*table_id).disassemble(&self.data).unwrap())
+                    format!("{}", self.constructor.sleigh().table(*table_id).disassemble(self.pc, &self.data).unwrap())
                 },
                 DisplayElement::Disassembly(variable_id) => {
                     self.variables.get(&variable_id).map_or("UNKNOWN_DISASSEMBLY_VARIABLE".to_string(), |val| format!("{}", val))

@@ -129,7 +129,7 @@ pub struct TableExecutor {
 
 impl InstructionExecutor {
     pub fn execute_table(&self, table: SleighTable) -> Result<Option<Value>> {
-        let disasm_table = table.disassemble(&self.current_instruction)?;
+        let disasm_table = table.disassemble(self.state.0.borrow().pc, &self.current_instruction)?;
 
         let mut executor = TableExecutor {
             instruction: self.clone(),
