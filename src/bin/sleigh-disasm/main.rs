@@ -1,5 +1,5 @@
 use sleigher::SleighSleigh;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use std::path::PathBuf;
 
 use clap::Parser;
