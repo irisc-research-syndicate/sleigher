@@ -19,7 +19,6 @@ with_context!(SleighMemWrite, SleighStatement<'a>, MemWrite, MemWriteContext, me
 with_context!(SleighCpuBranch, SleighStatement<'a>, CpuBranch, CpuBranchContext, cpu_branch);
 with_context!(SleighLocalGoto, SleighStatement<'a>, LocalGoto, LocalGotoContext, local_goto);
 
-
 impl<'a> SleighAssignment<'a> {
     pub fn right(&self) -> SleighExpr {
         self.same_ctx(&self.inner.right)

@@ -23,6 +23,11 @@ impl<'a> SleighConstructor<'a> {
     pub fn execution(&'a self) -> Option<SleighExecution<'a>> {
         self.inner.execution.as_ref().map(|exec| self.self_ctx(exec))
     }
+
+    pub fn matches(&self, pc: u64, data: &[u8]) -> bool {
+        self.pattern().matches(pc, data)
+    }
+
 }
 
 impl<'a> std::fmt::Display for SleighConstructor<'a> {

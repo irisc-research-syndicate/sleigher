@@ -6,12 +6,12 @@ use anyhow::{Context, Result};
 use crate::{with_context, SleighBitConstraints, SleighConstructor, SleighContext, SleighSleigh, WithCtx};
 
 with_context!(SleighTable, SleighSleigh<'a>, Table, TableContext, table);
-//pub type SleighTable<'a> = WithCtx<'a, SleighSleigh<'a>, Table>;
+with_context!(SleighMatcher, SleighTable<'a>, Matcher, MatcherContext, matcher);
 
 impl<'a> SleighTable<'a> {
     pub fn disassemble(&self, pc: u64, data: &[u8]) -> Result<SleighDisassembledTable> {
         let (variant_id, constructor) = self
-            .find_match(data)
+            .find_match(pc, data)
             .context("Unable to find matching constructor")?;
         let variables = constructor
             .pattern()
@@ -39,11 +39,13 @@ impl<'a> SleighTable<'a> {
         self.self_ctx(self.inner.constructor(id))
     }
 
-    pub fn find_match(&self, data: &[u8]) -> Option<(VariantId, SleighConstructor)> {
+    pub fn find_match(&self, pc: u64, data: &[u8]) -> Option<(VariantId, SleighConstructor)> {
         for matcher in self.matcher_order() {
-            let constructor = self.constructor(matcher.inner.constructor);
             if matcher.matches(data) {
-                return Some((matcher.inner.variant_id, constructor));
+                let constructor = self.constructor(matcher.inner.constructor);
+                if constructor.matches(pc, data) {
+                    return Some((matcher.inner.variant_id, constructor));
+                }
             }
         }
         None
@@ -54,7 +56,6 @@ impl<'a> SleighTable<'a> {
     }
 }
 
-pub type SleighMatcher<'a> = WithCtx<'a, SleighTable<'a>, Matcher>;
 
 impl<'a> SleighMatcher<'a> {
     pub fn constructor(&self) -> SleighConstructor<'a> {

@@ -1,6 +1,5 @@
 use std::{collections::{BTreeMap, HashMap}, fs::File, os::unix::fs::FileExt};
 
-use sleigh_rs::execution::BranchCall;
 use sleigher::execution::Address;
 use anyhow::Result;
 
