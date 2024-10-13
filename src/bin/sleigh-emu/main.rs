@@ -1,54 +1,25 @@
 #![allow(unused_variables)]
-#![allow(unused_imports)]
 #![allow(dead_code)]
 
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, fs::File, path::PathBuf, rc::Rc};
 
 use clap::Parser;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
-use sleigh_rs::{execution::{BlockId, Expr, ExprValue, Statement, VariableId, WriteValue}, varnode::Varnode, SpaceId, TableId};
+mod space;
+
+use sleigh_rs::{execution::{BlockId, Expr, ExprValue, Statement, VariableId, WriteValue}, SpaceId, TableId};
 use sleigher::*;
 use sleigher::execution::*;
 use table::TableContext;
 
-
-#[derive(Debug)]
-pub struct Space(HashMap<Address, u8>);
-
-impl Space {
-    pub fn write_bytes(&mut self, address: Address, bytes: &[u8]) {
-
-        for (offset, byte) in bytes.iter().enumerate() {
-            self.0.insert(Address(address.0 + offset as u64), *byte);
-        }
-    }
-
-    pub fn read_bytes(&mut self, address: Address, bytes: &mut [u8]) {
-        for (offset, byte) in bytes.iter_mut().enumerate() {
-            *byte = *self.0.entry(Address(address.0 + offset as u64)).or_default();
-        }
-
-    }
-}
-
-impl Space {
-    pub fn new() -> Self {
-        Space(HashMap::new())
-    }
-}
-
-impl Default for Space {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+use space::{HashSpace, TraceSpace, FileRegion};
 
 #[derive(Debug)]
 pub struct StateInner {
     pc: u64,
-    spaces: HashMap<SpaceId, Space>,
+    spaces: HashMap<SpaceId, Box<dyn space::MemoryRegion>>,
     context: (),
 }
 
@@ -72,24 +43,26 @@ impl State {
         }))
     }
 
-    pub fn write_ref(&self, referance: Ref, data: &[u8]) {
-        log::debug!("Writing {} <- {:02x?}", referance, data);
+    pub fn write_ref(&self, referance: Ref, data: &[u8]) -> Result<()> {
+        log::trace!("Writing {} <- {:02x?}", referance, data);
         assert!(data.len() >= referance.1);
         let data = &data[data.len()-referance.1..];
         let mut inner_state = self.0.borrow_mut();
-        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Space::new());
-        space.write_bytes(referance.2, data);
+        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Box::new(HashSpace::new()));
+        space.write(referance.2, data)?;
+        Ok(())
     }
 
-    pub fn read_ref(&self, referance: Ref, data: &mut [u8]) {
+    pub fn read_ref(&self, referance: Ref, data: &mut [u8]) -> Result<()> {
         let len = data.len();
         assert!(len >= referance.1);
         for byte in &mut *data { *byte = 0; }
         let data = &mut data[len-referance.1..];
         let mut inner_state = self.0.borrow_mut();
-        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Space::new());
-        space.read_bytes(referance.2, data);
-        log::debug!("Reading {} -> {:02x?}", referance, data);
+        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Box::new(HashSpace::new()));
+        space.read(referance.2, data)?;
+        log::trace!("Reading {} -> {:02x?}", referance, data);
+        Ok(())
     }
 }
 
@@ -165,14 +138,28 @@ impl TableExecutor {
 
     pub fn execute_statement(&mut self, stmt: SleighStatement) -> Result<Option<BlockId>> {
         match stmt.inner {
-            Statement::Export(export) => self.execute_export(stmt.self_ctx(export))?,
-            Statement::CpuBranch(cpu_branch) => self.execute_cpubranch(stmt.self_ctx(cpu_branch))?,
+            Statement::Export(export) => {
+                self.execute_export(stmt.self_ctx(export))?
+            },
+            Statement::CpuBranch(cpu_branch) => {
+                self.execute_cpubranch(stmt.self_ctx(cpu_branch))?
+            },
             Statement::LocalGoto(local_goto) => {
                 return self.execute_localgoto(stmt.self_ctx(local_goto));
             },
-            Statement::Build(build) => self.execute_build(stmt.self_ctx(build))?,
-            Statement::Assignment(assignment) => self.execute_assignment(stmt.self_ctx(assignment))?,
-            Statement::MemWrite(mem_write) => self.execute_memwrite(stmt.self_ctx(mem_write))?,
+            Statement::Build(build) => {
+                self.execute_build(stmt.self_ctx(build))?
+            },
+            Statement::Assignment(assignment) => {
+                self.execute_assignment(stmt.self_ctx(assignment))?
+            },
+            Statement::MemWrite(mem_write) => {
+                self.execute_memwrite(stmt.self_ctx(mem_write))?
+            },
+            Statement::Declare(variable_id) => {
+                log::trace!("Declare({:?})", variable_id);
+                self.write_var(Var::Local(*variable_id), Value::Int(0));
+            },
             stmt => bail!("Statement {:?} not implemented", stmt),
         };
         return Ok(None);
@@ -180,32 +167,38 @@ impl TableExecutor {
 
     fn execute_localgoto(&mut self, local_goto: SleighLocalGoto) -> Result<Option<BlockId>> {
         if let Some(cond_expr) = &local_goto.inner.cond {
-            if self.evaluate_expr(local_goto.same_ctx(cond_expr))? == Value::Int(1) {
-                log::debug!("LocalGoto {:?} taken conditionally", &local_goto.inner.dst);
+            if self.evaluate_expr(local_goto.same_ctx(cond_expr))? == Value::Int(1) {  //FIXME 
+                log::trace!("LocalGoto {:?} taken conditionally", &local_goto.inner.dst);
                 return Ok(Some(local_goto.inner.dst.clone()));
             }
         } else {
-            log::debug!("LocalGoto {:?} taken unconditionally", &local_goto.inner.dst);
+            log::trace!("LocalGoto {:?} taken unconditionally", &local_goto.inner.dst);
             return Ok(Some(local_goto.inner.dst.clone()));
         }
-        log::debug!("LocalGoto {:?} not taken", &local_goto.inner.dst);
+        log::trace!("LocalGoto {:?} not taken", &local_goto.inner.dst);
         Ok(None)
     }
 
     fn execute_cpubranch(&mut self, cpu_branch: SleighCpuBranch) -> Result<()> {
-        let dst = self.evaluate_expr(cpu_branch.same_ctx(&cpu_branch.inner.dst))?.to_u64();
+        let dst_value = self.evaluate_expr(cpu_branch.same_ctx(&cpu_branch.inner.dst))?;
+        let dst = if cpu_branch.inner.direct {
+            dst_value.to_u64()
+        } else {
+            self.get_value(dst_value)
+        };
         if let Some(cond_expr) = &cpu_branch.inner.cond {
-            if self.evaluate_expr(cpu_branch.same_ctx(cond_expr))? == Value::Int(1) {
-                log::debug!("CpuBranch {:#018x} taken conditionally", dst);
-                self.instruction.state.0.borrow_mut().pc = dst;
+            let cond_value = self.evaluate_expr(cpu_branch.same_ctx(cond_expr))?;
+            if self.get_value(cond_value) == 1 {
+                log::trace!("CpuBranch {:#018x} taken conditionally", dst);
+                self.instruction.state.0.borrow_mut().pc = dst.wrapping_sub(4);
                 return Ok(());
             }
         } else {
-            log::debug!("CpuBranch {:#018x} taken unconditionally", dst);
-            self.instruction.state.0.borrow_mut().pc = dst;
+            log::trace!("CpuBranch {:#018x} taken unconditionally", dst);
+            self.instruction.state.0.borrow_mut().pc = dst.wrapping_sub(4);
             return Ok(());
         };
-        log::debug!("CpuBranch {:#018x} not taken", dst);
+        log::trace!("CpuBranch {:#018x} not taken", dst);
         Ok(())
     }
 
@@ -213,7 +206,7 @@ impl TableExecutor {
         let addr = self.get_value(self.evaluate_expr(mem_write.same_ctx(&mem_write.inner.addr))?);
         let data = self.get_value(self.evaluate_expr(mem_write.same_ctx(&mem_write.inner.right))?);
         let referance = Ref(mem_write.inner.mem.space, mem_write.inner.mem.len_bytes.get() as usize / 8, Address(addr));
-        log::debug!("MemWrite: {} <- {:02x?}", referance, data);
+        log::trace!("MemWrite: {} <- {:02x?}", referance, data);
         self.write_space(referance, &data.to_be_bytes());
         Ok(())
     }
@@ -229,7 +222,7 @@ impl TableExecutor {
                 Value::Ref(Ref(memory.space, memory.len_bytes.get() as usize / 8, Address(address)))
             },
         };
-        log::debug!("Export {:?} from table {}", export_value, export.table().name());
+        log::trace!("Export {:?} from table {}", export_value, export.table().name());
         self.export = Some(export_value);
         Ok(())
     }
@@ -263,7 +256,7 @@ impl TableExecutor {
     }
 
     fn execute_build(&self, build: SleighBuild) -> Result<()> {
-        log::debug!("Build: {}", build.table().name());
+        log::trace!("Build: {}", build.table().name());
 
         if let Some(export) = self.instruction.execute_table(build.table())? {
             self.instruction.table_exports.borrow_mut().insert(build.inner.table.id, export);
@@ -276,12 +269,12 @@ impl TableExecutor {
         let value = self.evaluate_expr(assignment.right())?;
         let var = self.write_value(assignment.var())?;
 
-        log::debug!("Assignment: {:?} <- {:?} {:?}", var, value, assignment.inner.op);
+        log::trace!("Assignment: {:?} <- {:?} {:?}", var, value, assignment.inner.op);
 
         match &assignment.inner.op {
             None => (),
             Some(op) => {
-                log::warn!("Special assignment op {:?} not implemented", op);
+                //log::warn!("Special assignment op {:?} not implemented", op);
             },
         }
 
@@ -352,14 +345,15 @@ impl TableExecutor {
         let value = self.evaluate_expr(expr_unary_op.statement().self_ctx(&expr_unary_op.inner.input))?;
         Ok(match &expr_unary_op.inner.op {
             sleigh_rs::execution::Unary::Dereference(memory_location) => {
-                //log::debug!("Dereferance {:?} {:?}", memory_location, value);
                 let referance = Ref(memory_location.space, memory_location.len_bytes.get() as usize / 8, Address(self.get_value(value)));
                 let mut data = [0u8; 8];
                 self.read_space(referance, &mut data);
                 Value::Int(u64::from_be_bytes(data))
             },
             sleigh_rs::execution::Unary::Zext => value,
-            sleigh_rs::execution::Unary::TakeLsb(non_zero) => value,
+            sleigh_rs::execution::Unary::TakeLsb(_) => value,
+            sleigh_rs::execution::Unary::Negation => Value::Int((self.get_value(value) == 0) as u64),
+            sleigh_rs::execution::Unary::BitRange(_) => value,
             op => bail!(format!("Unimplemented ExprUnaryOp {:?}", op)),
         })
     }
@@ -374,7 +368,6 @@ impl TableExecutor {
             },
             ExprValue::TokenField(expr_token_field) => {
                 let token_field = expr_value.sleigh().token_field(expr_token_field.id);
-                //log::debug!("Eval TokenField Expr: {:?}", token_field);
                 let decoded_token_field = token_field.decode(&self.instruction.current_instruction);
                 match token_field.inner.attach {
                     sleigh_rs::token::TokenFieldAttach::NoAttach(value_fmt) => {
@@ -391,8 +384,13 @@ impl TableExecutor {
                 }
             },
             //ExprValue::InstStart(expr_inst_start) => todo!(),
-            //ExprValue::InstNext(expr_inst_next) => todo!(),
-            //ExprValue::Varnode(expr_varnode) => todo!(),
+            ExprValue::InstNext(expr_inst_next) => {
+                Value::Int(self.instruction.state.0.borrow().pc + 4)
+            },
+            ExprValue::Varnode(expr_varnode) => {
+                let varnode = expr_value.sleigh().varnode(expr_varnode.id);
+                Value::Ref(varnode.referance())
+            },
             //ExprValue::Context(expr_context) => todo!(),
             //ExprValue::Bitrange(expr_bitrange) => todo!(),
             ExprValue::Table(expr_table) => {
@@ -404,7 +402,9 @@ impl TableExecutor {
                 let value = disassembled_table.variables.get(&expr_dis_var.id).context(format!("Could not find Disassembly Variable {:?}", expr_dis_var.id))?;
                 Value::Int(*value as u64)
             },
-            //ExprValue::ExeVar(expr_exe_var) => todo!(),
+            ExprValue::ExeVar(expr_exe_var) => {
+                self.locals.0.borrow().get(&expr_exe_var.id).context(format!("Local variable {:?} not Declared", expr_exe_var.id))?.clone()
+            }
             expr_value => bail!("ExprValue {:?} not implemented", expr_value),
         })
     }
@@ -425,6 +425,8 @@ impl TableExecutor {
             sleigh_rs::execution::Binary::Lsr => left >> right,
             sleigh_rs::execution::Binary::SigLess => ((left as i64) < (right as i64)) as u64,
             sleigh_rs::execution::Binary::Eq => (left == right) as u64,
+            sleigh_rs::execution::Binary::Greater => (left > right) as u64,
+            sleigh_rs::execution::Binary::Less => (left < right) as u64,
             unknown_op => bail!("ExprBinaryOp {:?} not implemented", unknown_op),
         }))
     }
@@ -439,95 +441,125 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
-    let binding = sleigh_rs::file_to_sleigh(&args.slaspec).ok().ok_or(anyhow!("Could not open or parse slaspec"))?;
-    let sleigh: SleighSleigh = (&binding).into();
+    let sleigh = match sleigh_rs::file_to_sleigh(&args.slaspec){
+        Ok(sleigh) => sleigh,
+        Err(err) => {
+            println!("Could not open or parse slaspec: {:#?}", err);
+            bail!("Could not open or pasrse slaspec");
+        },
+    };
 
-    let instrs = vec![
-    //    0x4a, 0x04, 0x08, 0x00,
-        0x00, 0x21, 0x03, 0x98,
-        0x00, 0x21, 0x03, 0x98,
-    //    0x11, 0x22, 0x33, 0x44,
-    //    0x94, 0xff, 0xf3, 0x86,
-    //    0x66, 0x84, 0x00, 0x02
-    ];
+    let sleigh: SleighSleigh = (&sleigh).into();
 
-    let instrs = vec![
-        0x6c, 0x20, 0x18, 0x06,
-        0x70, 0x3f, 0x0c, 0x6a,
-        0x6c, 0x20, 0x7b, 0x96,
-        0x6c, 0x20, 0x83, 0x92,
-        0x6c, 0x20, 0x8b, 0x8e,
-        0x6c, 0x20, 0x93, 0x8a,
-        0x6c, 0x20, 0x9b, 0x86,
-        0x6c, 0x20, 0xa3, 0x82,
-        0x6c, 0x20, 0xab, 0x7e,
-        0x6c, 0x20, 0xb3, 0x7a,
-        0x6c, 0x20, 0xbb, 0x76,
-        0xfc, 0x97, 0x20, 0x08,
-        0x02, 0xf6, 0x01, 0x00,
-        0x02, 0xf4, 0x00, 0x80,
-        0x66, 0xe7, 0x01, 0x52,
-        0x66, 0xe4, 0x00, 0x82,
-        0x24, 0x05, 0x20, 0x00,
-        0x20, 0xa5, 0x00, 0x04,
-        0xfc, 0x85, 0x28, 0x0b,
-        0xa0, 0x00, 0x00, 0x0d,
-        0x00, 0x12, 0x00, 0x00,
-        0xac, 0x9d, 0x00, 0x29,
-        0x38, 0x84, 0x04, 0x94,
-        0x6e, 0x80, 0x20, 0x02,
-        0xfc, 0xe4, 0x38, 0x08,
-        0xfe, 0xc5, 0xb0, 0x08,
-        0xfe, 0x86, 0xa0, 0x08,
-        0x94, 0xff, 0xfd, 0xdf,
-        0x66, 0x84, 0x00, 0x02,
-        0x38, 0x84, 0x04, 0x94,
-        0x6e, 0x80, 0x20, 0x02,
-        0x95, 0x00, 0x00, 0x1f,
-        0x6c, 0x20, 0x9b, 0x86,
-    ];
+    const SHA256_FUNC: u64 = 0x007230ccu64;
 
-    const START_ADDRESS: u64 = 0x008af5f8u64;
+    let iron_prep_path = "00007000_0001c494_IRON_PREP_CODE";
+    let iron_prep_file: File = File::open(iron_prep_path).context("Could not load IRON_PREP_CODE")?;
+    let iron_prep_size = iron_prep_file.metadata()?.len();
+    let iron_prep_base = 0x00710000u64;
+    let iron_prep_region = FileRegion(iron_prep_file);
 
     let state = State::new();
-    state.0.borrow_mut().pc = 0x008af5f8u64;
 
-    state.write_ref(Ref(SpaceId(0), instrs.len(), Address(START_ADDRESS)), &instrs);
+    let mut memory = space::MappedSpace::new();
+    memory.add_mapping(Address(iron_prep_base), iron_prep_size, Box::new(iron_prep_region));
+    memory.add_mapping(Address(0xffff0000), 0x10000, Box::new(TraceSpace(HashSpace::new())));
+
+
+    state.0.borrow_mut().spaces.insert(SpaceId(0), Box::new(memory));
+    state.0.borrow_mut().pc = SHA256_FUNC;
 
     let regs = vec![
-        ("r1", 0xffffffffffffff00u64),
-        ("r3", 0x0303030303030303u64),
-        ("r4", 0x0404040404040404u64),
-        ("r5", 0x0505050505050505u64),
-        ("r6", 0x0606060606060606u64),
-        ("r7", 0x0707070707070707u64),
-        ("r15", 0x1515151515151515u64),
-        ("r16", 0x1616161616161616u64),
-        ("r17", 0x1717171717171717u64),
-        ("r18", 0x1818181818181818u64),
-        ("r19", 0x1919191919191919u64),
-        ("r20", 0x2020202020202020u64),
-        ("r21", 0x2121212121212121u64),
-        ("r22", 0x2222222222222222u64),
-        ("r23", 0x2323232323232323u64),
+        ("r1", 0xfffff000u64),
+        ("r4", 0x00710000u64),
+        ("r5", 0x0000003fu64),
+        ("r6", 0xffffff80u64),
     ];
 
-    log::debug!("=== Initializing registers ===");
+    log::info!("=== Initializing registers ===");
     for (reg_name, reg_value) in regs {
         let varnode = sleigh.varnode_by_name(reg_name).unwrap();
-        state.write_ref(varnode.referance(), &reg_value.to_be_bytes());
+        state.write_ref(varnode.referance(), &reg_value.to_be_bytes())?;
     }
 
-    for _ in 0..24 {
+    let read_ref = |referance: Ref| {
+        let mut data = vec![0u8; referance.1];
+        state.read_ref(referance, &mut data).unwrap();
+        data
+    };
+
+    let read_reg_u32 = |name| {
+        let reg_ref = sleigh.varnode_by_name(name).unwrap().referance();
+        u32::from_be_bytes(read_ref(reg_ref).try_into().unwrap())
+    };
+
+    for step in 0..32*1024 {
         let pc = state.0.borrow().pc;
-        log::debug!("========== PC {:#018x} ==========", pc);
+
+        if pc == 0u64 {
+            log::info!("PC = null! Exiting!");
+            break;
+        }
+
+        if pc == 0x00722d8cu64 {
+            log::info!("PC = sha256_transform !");
+            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
+            let m_data = read_ref(m_ref);
+            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
+            log::info!("M = {:08x?}", m_data);
+            //break;
+        }
+
+        if pc == 0x00722cf8u64 {
+            log::info!("PC = sha256_update !");
+            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
+            let m_data = read_ref(m_ref);
+            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
+            log::info!("M = {:08x?}", m_data);
+        }
+
+        if pc == 0x00722fb0u64 {
+            log::info!("PC = sha256_finalize !");
+            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
+            let m_data = read_ref(m_ref);
+            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
+            log::info!("M = {:08x?}", m_data);
+        }
+
+        if pc == 0x00722e18u64 {
+            log::info!("{:08x}: r4l={:08x} r5l={:08x} r6l={:08x}", pc, read_reg_u32("r4l"), read_reg_u32("r5l"), read_reg_u32("r6l"));
+            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
+            let m_data = read_ref(m_ref);
+            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
+            log::info!("M = {:08x?}", m_data);
+        }
+
+        if pc == 0x00722e0cu64 {
+            log::info!("sig0={:08x} sig1={:08x} m[i-7]={:08x} m[i-16] = {:08x}", read_reg_u32("r9l"), read_reg_u32("r10l"), read_reg_u32("r11l"), read_reg_u32("r6l"));
+        }
+
+        if pc == 0x00722e2cu64 {
+            let r4l = read_reg_u32("r4l");
+            let m_ref = Ref(SpaceId(0), 0x100, Address(r4l as u64));
+            let m_data = read_ref(m_ref);
+            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
+            //log::info!("M = {:08x?}", m_data);
+        }
+
+        if pc == 0x00722e7cu64 {
+            let sha256_state: Vec<u32> = ["r21l", "r3l", "r26l", "r23l", "r20l", "r18l", "r19l", "r22l"].iter().map(|reg_name| {
+                read_reg_u32(reg_name)
+            }).collect();
+
+            log::info!("SHA256 STATE: {:08x?}", sha256_state);
+        }
 
         let mut instr = [0u8; 4];
-        state.read_ref(Ref(SpaceId(0), 4, Address(pc)), &mut instr);
+        state.read_ref(Ref(SpaceId(0), 4, Address(pc)), &mut instr)?;
 
         let table = sleigh.instruction_table();
         let instruction = table.disassemble(pc, &instr).unwrap();
-        log::debug!("=== INSTRUCTION {} ===", instruction);
+        log::debug!("=== {:5}: PC {:#018x} INSTRUCTION {} ===", step, pc, instruction);
 
         let instr_exec = InstructionExecutor(Rc::new(InstructionExecutorInner {
             state: state.clone(),
@@ -536,32 +568,30 @@ fn main() -> Result<()> {
         }));
 
         instr_exec.execute_table(sleigh.instruction_table())?;
-        state.0.borrow_mut().pc += 4;
+
+        let pc = state.0.borrow().pc.clone();
+        state.0.borrow_mut().pc = pc.wrapping_add(4);
     }
 
-    for (space_id, space) in &state.0.borrow().spaces {
-        let mut addresses = space.0.keys().collect::<Vec<_>>();
-        addresses.sort();
-        let mut last_address = None;
-        let mut current_bytes = vec![];
-        let mut start_address = None;
-        for address in addresses {
-            let byte = space.0.get(address).unwrap().clone();
-            if last_address == Some(address.0.wrapping_sub(1)) && current_bytes.len() < 8 {
-                current_bytes.push(byte);
-            } else {
-                if let Some(start_address) = start_address {
-                    println!("{}:{}:{} -> {:02x?}", space_id.0, start_address, current_bytes.len(), current_bytes)
-                }
-                start_address = Some(address.clone());
-                current_bytes = vec![byte];
-            }
-            last_address = Some(address.0)
-        }
-        if let Some(start_address) = start_address {
-            println!("{}:{}:{} -> {:02x?}", space_id.0, start_address, current_bytes.len(), current_bytes)
-        }
+
+    let regs: Vec<u64> = (0..32).map(|reg_num| {
+        let reg_name = if reg_num == 0 { "zero".to_string()} else { format!("r{}", reg_num) };
+        let reg_ref = sleigh.varnode_by_name(&reg_name).unwrap().referance();
+        let mut reg_bytes = [0u8; 8];
+        state.read_ref(reg_ref, &mut reg_bytes).unwrap();
+        u64::from_be_bytes(reg_bytes)
+    }).collect();
+
+    log::debug!("=== Dumping Registers ===");
+
+    for (i, line) in regs.chunks(4).enumerate() {
+        println!("r{:02}: {:016x} {:016x} {:016x} {:016x}", i * 4, line[0], line[1], line[2], line[3]);
     }
+
+    let mut hash_bytes = [0u8; 32];
+    state.read_ref(Ref(SpaceId(0), 32, Address(0xffffff80u64)), &mut hash_bytes)?;
+    log::info!("{:02x?}", hash_bytes);
+
 
     Ok(())
 }
