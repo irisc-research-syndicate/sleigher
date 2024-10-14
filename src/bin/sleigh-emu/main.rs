@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 
-use std::{cell::RefCell, collections::HashMap, fs::File, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, fs::File, path::PathBuf, rc::Rc, str::FromStr};
 
 use clap::Parser;
 
@@ -432,9 +432,141 @@ impl TableExecutor {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FileMap {
+    address: u64,
+    path: PathBuf,
+}
+
+fn parse_int(s: &str) -> std::result::Result<u64, std::num::ParseIntError> {
+    if let Some(s) = s.strip_prefix("0x") {
+        u64::from_str_radix(s, 16)
+    } else {
+        u64::from_str_radix(s, 10)
+    }
+}
+
+impl FromStr for FileMap {
+    type Err=anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (address, path) = s.split_once(":").context("File mapping does not contain ':'")?;
+        let address = parse_int(address)?;
+        let path = PathBuf::from_str(path)?;
+        Ok(FileMap { address, path })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RamMap {
+    address: u64,
+    length: u64,
+}
+
+impl FromStr for RamMap {
+    type Err=anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (address, length) = s.split_once(":").context("Ram mapping does not contain ':'")?;
+        let address = parse_int(address)?;
+        let length = parse_int(length)?;
+        Ok(RamMap{ address, length })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RegAssignment {
+    name: String,
+    value: u64,
+}
+
+impl FromStr for RegAssignment {
+    type Err=anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (name, value) = s.split_once("=").context("register assignemnt must contain '='")?;
+        let name = name.to_string();
+        let value = parse_int(value)?;
+        Ok(RegAssignment{ name, value })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Breakpoint {
+    address: u64,
+    name: String, 
+    regs: Vec<String>,
+}
+
+impl FromStr for Breakpoint {
+    type Err=anyhow::Error;
+    
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (address, name_and_regs) = s.split_once(':').context("Breakpoint must be on the form: address:name:reglist")?;
+        let (name, regs) = name_and_regs.split_once(":").context("Breakpoint must be on the form: address:name:reglist")?;
+        let address = parse_int(address)?;
+        let name = name.to_string();
+        let regs = regs.split(',').map(|reg| reg.to_string()).collect::<Vec<String>>();
+
+        Ok(Self { address, name, regs })
+    }
+
+}
+
 #[derive(Debug, Parser)]
 struct Args {
+    #[arg(long)]
     slaspec: PathBuf,
+
+    #[arg(short='f', long="map")]
+    file_mappings: Vec<FileMap>,
+
+    #[arg(short='m', long="ram")]
+    ram_mappings: Vec<RamMap>,
+
+    #[arg(short='e', long="entrypoint", value_parser=parse_int)]
+    entrypoint: u64,
+
+    #[arg(short='r', long="reg")]
+    registers: Vec<RegAssignment>,
+
+    #[arg(short='b', long="breakpoint")]
+    breakpoints: Vec<Breakpoint>,
+
+    #[arg(short='s', long="steps", value_parser=parse_int)]
+    steps: Option<u64>
+}
+
+impl State {
+    fn read_ref_vec(&self, referance: Ref) -> Result<Vec<u8>> {
+        let mut data = vec![0u8; referance.1];
+        self.read_ref(referance, &mut data)?;
+        Ok(data)
+    }
+
+    fn read_ref_u32be(&self, referance: Ref) -> Result<u32> {
+        let mut data = [0u8; 4];
+        self.read_ref(referance, &mut data)?;
+        Ok(u32::from_be_bytes(data))
+    }
+
+    fn read_ref_u32le(&self, referance: Ref) -> Result<u32> {
+        let mut data = [0u8; 4];
+        self.read_ref(referance, &mut data)?;
+        Ok(u32::from_le_bytes(data))
+    }
+
+    fn read_ref_u64be(&self, referance: Ref) -> Result<u64> {
+        let mut data = [0u8; 8];
+        self.read_ref(referance, &mut data)?;
+        Ok(u64::from_be_bytes(data))
+    }
+
+    fn read_ref_u64le(&self, referance: Ref) -> Result<u64> {
+        let mut data = [0u8; 8];
+        self.read_ref(referance, &mut data)?;
+        Ok(u64::from_le_bytes(data))
+    }
 }
 
 fn main() -> Result<()> {
@@ -451,49 +583,33 @@ fn main() -> Result<()> {
 
     let sleigh: SleighSleigh = (&sleigh).into();
 
-    const SHA256_FUNC: u64 = 0x007230ccu64;
-
-    let iron_prep_path = "00007000_0001c494_IRON_PREP_CODE";
-    let iron_prep_file: File = File::open(iron_prep_path).context("Could not load IRON_PREP_CODE")?;
-    let iron_prep_size = iron_prep_file.metadata()?.len();
-    let iron_prep_base = 0x00710000u64;
-    let iron_prep_region = FileRegion(iron_prep_file);
-
-    let state = State::new();
-
     let mut memory = space::MappedSpace::new();
-    memory.add_mapping(Address(iron_prep_base), iron_prep_size, Box::new(iron_prep_region));
-    memory.add_mapping(Address(0xffff0000), 0x10000, Box::new(TraceSpace(HashSpace::new())));
-
-
-    state.0.borrow_mut().spaces.insert(SpaceId(0), Box::new(memory));
-    state.0.borrow_mut().pc = SHA256_FUNC;
-
-    let regs = vec![
-        ("r1", 0xfffff000u64),
-        ("r4", 0x00710000u64),
-        ("r5", 0x0000003fu64),
-        ("r6", 0xffffff80u64),
-    ];
-
-    log::info!("=== Initializing registers ===");
-    for (reg_name, reg_value) in regs {
-        let varnode = sleigh.varnode_by_name(reg_name).unwrap();
-        state.write_ref(varnode.referance(), &reg_value.to_be_bytes())?;
+    for file_map in args.file_mappings {
+        let file = File::open(&file_map.path).context(format!("Could not open file: {:?}", &file_map.path))?;
+        let size = file.metadata()?.len();
+        memory.add_mapping(Address(file_map.address), size, Box::new(FileRegion(file)))
     }
 
-    let read_ref = |referance: Ref| {
-        let mut data = vec![0u8; referance.1];
-        state.read_ref(referance, &mut data).unwrap();
-        data
-    };
+    for ram_map in args.ram_mappings {
+        memory.add_mapping(Address(ram_map.address), ram_map.length, Box::new(HashSpace::new()))
+    }
+
+    let state = State::new();
+    state.0.borrow_mut().spaces.insert(SpaceId(0), Box::new(memory));
+    state.0.borrow_mut().pc = args.entrypoint;
+
+    log::info!("=== Initializing registers ===");
+    for reg in args.registers {
+        let varnode = sleigh.varnode_by_name(&reg.name).unwrap();
+        state.write_ref(varnode.referance(), &reg.value.to_be_bytes())?;
+    }
 
     let read_reg_u32 = |name| {
-        let reg_ref = sleigh.varnode_by_name(name).unwrap().referance();
-        u32::from_be_bytes(read_ref(reg_ref).try_into().unwrap())
+        let varnode = sleigh.varnode_by_name(name).unwrap();
+        state.read_ref_u32be(varnode.referance()).unwrap()
     };
 
-    for step in 0..32*1024 {
+    for step in args.steps.map(|steps| 0..steps).unwrap_or(0..u64::MAX) {
         let pc = state.0.borrow().pc;
 
         if pc == 0u64 {
@@ -501,57 +617,13 @@ fn main() -> Result<()> {
             break;
         }
 
-        if pc == 0x00722d8cu64 {
-            log::info!("PC = sha256_transform !");
-            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
-            let m_data = read_ref(m_ref);
-            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
-            log::info!("M = {:08x?}", m_data);
-            //break;
-        }
-
-        if pc == 0x00722cf8u64 {
-            log::info!("PC = sha256_update !");
-            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
-            let m_data = read_ref(m_ref);
-            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
-            log::info!("M = {:08x?}", m_data);
-        }
-
-        if pc == 0x00722fb0u64 {
-            log::info!("PC = sha256_finalize !");
-            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
-            let m_data = read_ref(m_ref);
-            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
-            log::info!("M = {:08x?}", m_data);
-        }
-
-        if pc == 0x00722e18u64 {
-            log::info!("{:08x}: r4l={:08x} r5l={:08x} r6l={:08x}", pc, read_reg_u32("r4l"), read_reg_u32("r5l"), read_reg_u32("r6l"));
-            let m_ref = Ref(SpaceId(0), 0x100, Address(read_reg_u32("r4l") as u64));
-            let m_data = read_ref(m_ref);
-            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
-            log::info!("M = {:08x?}", m_data);
-        }
-
-        if pc == 0x00722e0cu64 {
-            log::info!("sig0={:08x} sig1={:08x} m[i-7]={:08x} m[i-16] = {:08x}", read_reg_u32("r9l"), read_reg_u32("r10l"), read_reg_u32("r11l"), read_reg_u32("r6l"));
-        }
-
-        if pc == 0x00722e2cu64 {
-            let r4l = read_reg_u32("r4l");
-            let m_ref = Ref(SpaceId(0), 0x100, Address(r4l as u64));
-            let m_data = read_ref(m_ref);
-            let m_data: Vec<u32> = m_data.chunks(4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).collect();
-            //log::info!("M = {:08x?}", m_data);
-        }
-
-        if pc == 0x00722e7cu64 {
-            let sha256_state: Vec<u32> = ["r21l", "r3l", "r26l", "r23l", "r20l", "r18l", "r19l", "r22l"].iter().map(|reg_name| {
-                read_reg_u32(reg_name)
-            }).collect();
-
-            log::info!("SHA256 STATE: {:08x?}", sha256_state);
+        for bp in &args.breakpoints {
+            if bp.address == pc {
+                let regs = bp.regs.iter().map(|reg|
+                    format!("{}={:#010x}", reg, read_reg_u32(&reg))
+                ).collect::<Vec<_>>().join(" ");
+                log::info!("Breakpoint {:#010x}: {} {}", bp.address, bp.name, regs);
+            }
         }
 
         let mut instr = [0u8; 4];
@@ -573,25 +645,9 @@ fn main() -> Result<()> {
         state.0.borrow_mut().pc = pc.wrapping_add(4);
     }
 
-
-    let regs: Vec<u64> = (0..32).map(|reg_num| {
-        let reg_name = if reg_num == 0 { "zero".to_string()} else { format!("r{}", reg_num) };
-        let reg_ref = sleigh.varnode_by_name(&reg_name).unwrap().referance();
-        let mut reg_bytes = [0u8; 8];
-        state.read_ref(reg_ref, &mut reg_bytes).unwrap();
-        u64::from_be_bytes(reg_bytes)
-    }).collect();
-
-    log::debug!("=== Dumping Registers ===");
-
-    for (i, line) in regs.chunks(4).enumerate() {
-        println!("r{:02}: {:016x} {:016x} {:016x} {:016x}", i * 4, line[0], line[1], line[2], line[3]);
-    }
-
     let mut hash_bytes = [0u8; 32];
     state.read_ref(Ref(SpaceId(0), 32, Address(0xffffff80u64)), &mut hash_bytes)?;
     log::info!("{:02x?}", hash_bytes);
-
 
     Ok(())
 }
