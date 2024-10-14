@@ -1,3 +1,0 @@
-[submodule "ghidra-processor"]
-	path = ghidra-processor
-	url = git@github.com:irisc-research-syndicate/ghidra-processor.git
