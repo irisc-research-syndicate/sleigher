@@ -8,13 +8,15 @@ use clap::Parser;
 use anyhow::{bail, Context, Result};
 
 mod space;
+pub mod lift;
 
 use sleigh_rs::{execution::{BlockId, Expr, ExprValue, Statement, VariableId, WriteValue}, SpaceId, TableId};
 use sleigher::*;
 use sleigher::execution::*;
 use table::TableContext;
 
-use space::{HashSpace, TraceSpace, FileRegion};
+use space::{HashSpace, FileRegion};
+use value::{Address, Ref, Value, Var};
 
 #[derive(Debug)]
 pub struct StateInner {

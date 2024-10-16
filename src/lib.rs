@@ -7,6 +7,8 @@ pub mod bitconstraint;
 pub mod token;
 pub mod execution;
 
+pub mod value;
+
 pub use sleigh::{SleighSleigh, SleighContext};
 pub use table::{SleighTable, SleighDisassembledTable};
 pub use constructor::SleighConstructor;

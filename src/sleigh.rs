@@ -1,6 +1,6 @@
 use sleigh_rs::{varnode::Varnode, Sleigh, TableId, TokenFieldId, VarnodeId};
 
-use crate::{WithCtx, with_context, SleighTable, SleighTokenField};
+use crate::{value::{Address, Ref}, with_context, SleighTable, SleighTokenField, WithCtx};
 
 with_context!(SleighSleigh, (), Sleigh, SleighContext, sleigh);
 with_context!(SleighVarnode, SleighSleigh<'a>, Varnode, VarnodeContext, varnode);
@@ -44,7 +44,7 @@ impl<'a> SleighVarnode<'a> {
         self.inner.name()
     }
 
-    pub fn referance(&self) -> crate::execution::Ref {
-        crate::execution::Ref(self.inner.space, self.inner.len_bytes.get() as usize, crate::execution::Address(self.inner.address))
+    pub fn referance(&self) -> Ref {
+        Ref(self.inner.space, self.inner.len_bytes.get() as usize, Address(self.inner.address))
     }
 }
