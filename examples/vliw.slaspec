@@ -1,0 +1,87 @@
+define endian=big;
+define alignment=8;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00000 size=4 [
+    r0 r1 r2 r3 r4 r5 r6 r7
+    r8 r9 r10 r11 r12 r13 r14 r15
+    r16 r17 r18 r19 r20 r21 r22 r23
+    r24 r25 r26 r27 r28 r29 r30 r31
+];
+
+define token bundle (64)
+    fmt=(62, 63)
+    op1_const_zero=(61, 61)
+    op2_const_zero=(60, 60)
+
+    op0=(55, 59)
+    op0_rd=(50, 54)
+    op0_rs=(45, 49)
+
+    op1=(40, 44)
+    op1_rd=(35, 39)
+    op1_rs=(30, 34)
+
+    op2=(25, 29)
+    op2_rd=(20, 24)
+    op2_rs=(15, 19)
+
+    op3=(10, 14)
+    op3_rd=(5, 9)
+    op3_rs=(0, 4)
+
+    fmt1_const=(0, 14) signed
+    fmt2_const=(0, 29) signed
+    fmt3_const=(0, 31) signed
+    fmt3_extra=(32, 44)
+;
+
+attach variables [ op0_rd op0_rs op1_rd op1_rs op2_rd op2_rs op3_rd op3_rs ] [
+    r0 r1 r2 r3 r4 r5 r6 r7
+    r8 r9 r10 r11 r12 r13 r14 r15
+    r16 r17 r18 r19 r20 r21 r22 r23
+    r24 r25 r26 r27 r28 r29 r30 r31
+];
+
+OP_CONST: 0 is fmt=0 { }
+OP_CONST: fmt1_const is fmt=1 & fmt1_const { }
+OP_CONST: fmt2_const is fmt=2 & fmt2_const { }
+OP_CONST: fmt3_const is fmt=3 & fmt3_const { }
+
+OP1_CONST: OP_CONST is op1_const_zero=0 & OP_CONST { }
+OP1_CONST: 0 is op1_const_zero=1 { }
+
+OP2_CONST: OP_CONST is op1_const_zero=0 & OP_CONST { }
+OP2_CONST: 0 is op2_const_zero=1 { }
+
+OP0:"unk."^op0 op0_rd, op0_rs, OP_CONST is op0 & op0_rd & op0_rs & OP_CONST { }
+
+OP1:"unk."^op1 op1_rd, op1_rs, OP1_CONST is op1 & op1_rd & op1_rs & OP1_CONST { }
+
+OP2:"unk."^op2 op2_rd, op2_rs, OP2_CONST is op2 & op2_rd & op2_rs & OP2_CONST { }
+
+OP3:"unk."^op3 op3_rd, op3_rs is op3 & op3_rd & op3_rs { }
+
+:"{" OP0 ";" OP1 ";" OP2 ";" OP3 "}" is fmt=0 & OP0 & OP1 & OP2 & OP3 {
+    build OP0;
+    build OP1;
+    build OP2;
+    build OP3;
+}
+
+:"{" OP0 ";" OP1 ";" OP2 "}" is fmt=1 & OP0 & OP1 & OP2 {
+    build OP0;
+    build OP1;
+    build OP2;
+}
+
+:"{" OP0 ";" OP1 "}" is fmt=2 & OP0 & OP1 {
+    build OP0;
+    build OP1;
+}
+
+:"{" OP0 "}" is fmt=3 & OP0 {
+    build OP0;
+}
