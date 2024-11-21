@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nom::{branch::alt, bytes::complete::tag, character::complete::one_of, combinator::{map_res, recognize}, multi::many1, sequence::{preceded}, IResult};
 
-use sleigh_rs::{token::{self}, Number, Sleigh, TokenFieldId, TokenId, ValueFmt};
+use sleigh_rs::{token::{self}, Endian, Number, Sleigh, TokenFieldId, TokenId, ValueFmt};
 use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::meaning::AttachVarnode;
 use sleigh_rs::display::DisplayElement;
@@ -140,6 +140,25 @@ impl<'asm> Constraints<'asm> {
 
     pub fn build_i64_const(&self, i: i64, sz: u32) -> BV<'asm> {
         BV::from_i64(&self.asm.ctx, i, sz as u32)
+    }
+
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        let model = self.model()?;
+        let mut instruction_bytes = vec![];
+        for token_id in self.token_order.iter() {
+            let token = self.asm.token(*token_id);
+            let token_bv = self.tokens.get(token_id)?;
+            let token_value = model.eval(token_bv, true)?.as_u64()?;
+            let token_length = token.len_bytes().get() as usize;
+
+            log::debug!("{}: {:#010X}", token.name(), token_value);
+
+            instruction_bytes.extend(match token.endian() {
+                Endian::Little => token_value.to_le_bytes()[..token_length].to_vec(),
+                Endian::Big => token_value.to_be_bytes()[token_length..].to_vec(),
+            });
+        }
+        Some(instruction_bytes)
     }
 
 }
