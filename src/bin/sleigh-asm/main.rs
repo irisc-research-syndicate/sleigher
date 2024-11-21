@@ -358,6 +358,11 @@ impl Assembler {
                         token::TokenFieldAttach::Literal(_attach_literal_id) => todo!(),
                         token::TokenFieldAttach::Number(_print_base, _attach_number_id) => todo!(),
                     };
+                    let ivalue = (value as isize) >> token_field_bv.get_size();
+                    if ivalue != 0 && ivalue != -1 {
+                        log::trace!("Immidiate out of range {} {} {}", token_field_bv.get_size(), value, ivalue);
+                        return nom::combinator::fail(s);
+                    }
                     // TODO: check value bits
                     let const_bv = variables.build_u64_const(value as u64, token_field_bv.get_size());
                     variables.eq(token_field_bv._eq(&const_bv));
