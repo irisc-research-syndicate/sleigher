@@ -19,21 +19,21 @@ struct Cli {
     instruction: String,
 }
 
-fn parse_dec(s: &str) -> IResult<&str, usize> {
+fn parse_dec(s: &str) -> IResult<&str, u64> {
     map_res(
         recognize(many1(one_of("0123456789"))),
-        |out: &str| usize::from_str_radix(out, 10)
+        |out: &str| u64::from_str_radix(out, 10)
     )(s)
 }
 
-fn parse_hex(s: &str) -> IResult<&str, usize> {
+fn parse_hex(s: &str) -> IResult<&str, u64> {
     map_res(
         preceded(
         alt((tag("0x"), tag("0X"))),
         recognize(
             many1(one_of("0123456789abcdefABCDEF")))
         ),
-        |out: &str| usize::from_str_radix(out, 16)
+        |out: &str| u64::from_str_radix(out, 16)
     )(s)
 }
 
@@ -61,7 +61,7 @@ impl<'asm> Constraints<'asm> {
     }
 
     pub fn token(&mut self, token_id: TokenId) -> BV<'asm> {
-        let token = self.asm.sleigh.token(token_id);
+        let token = self.asm.token(token_id);
         let bv = self.tokens.entry(token_id).or_insert_with(|| {
             self.token_order.push(token_id);
             BV::fresh_const(&self.asm.ctx, token.name(), 8*(token.len_bytes().get() as u32))
@@ -143,6 +143,7 @@ impl<'asm> Constraints<'asm> {
     }
 
     pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        log::debug!("Generating instruction bytes");
         let model = self.model()?;
         let mut instruction_bytes = vec![];
         for token_id in self.token_order.iter() {
@@ -151,11 +152,11 @@ impl<'asm> Constraints<'asm> {
             let token_value = model.eval(token_bv, true)?.as_u64()?;
             let token_length = token.len_bytes().get() as usize;
 
-            log::debug!("{}: {:#010X}", token.name(), token_value);
+            log::debug!("{}: {:#010X}/{}", token.name(), token_value, token_length);
 
             instruction_bytes.extend(match token.endian() {
                 Endian::Little => token_value.to_le_bytes()[..token_length].to_vec(),
-                Endian::Big => token_value.to_be_bytes()[token_length..].to_vec(),
+                Endian::Big => token_value.to_be_bytes()[8-token_length..].to_vec(),
             });
         }
         Some(instruction_bytes)
@@ -267,7 +268,6 @@ impl Deref for Assembler {
     }
 }
 
-
 impl Assembler {
     pub fn new(sleigh: Sleigh) -> Self {
         Self {
@@ -349,7 +349,7 @@ impl Assembler {
                     let token_field_bv = variables.token_field(*token_field_id, None);
                     let (s, value) = match token_field.attach {
                         token::TokenFieldAttach::NoAttach(value_fmt) => {
-                            self.parse_value_fmt(&value_fmt, s)?
+                            self.parse_value(value_fmt.signed, s)?
                         },
                         token::TokenFieldAttach::Varnode(attach_varnode_id) => {
                             let attach_varnode = self.attach_varnode(attach_varnode_id);
@@ -380,15 +380,7 @@ impl Assembler {
                 DisplayElement::Disassembly(variable_id) => {
                     let variable = constructor.pattern.disassembly_var(*variable_id);
                     log::trace!("DISASSEMBLY: {:?} {:?}", variable.name(), s);
-                    let (s, negate) = if let Some(s) = s.strip_prefix('-') {
-                        (s, true)
-                    } else {
-                        (s, false)
-                    };
-                    let (s, value) = nom::combinator::map(
-                        alt((parse_hex, parse_dec)),
-                         |value| if negate { -(value as isize) as usize } else { value }
-                    )(s)?;
+                    let (s, value) = self.parse_value(true, s)?;
                     let var = variables.variable(*variable_id);
                     let const_bv = variables.build_u64_const(value as u64, var.get_size());
                     variables.eq(var._eq(&const_bv));
@@ -414,8 +406,9 @@ impl Assembler {
         }
     }
 
-    pub fn parse_value_fmt<'a>(&self, value_fmt: &ValueFmt, s: &'a str) -> IResult<&'a str, usize> {
-        let (s, negate) = if value_fmt.signed {
+    pub fn parse_value<'a>(&self, signed: bool, s: &'a str) -> IResult<&'a str, i64> {
+        //TODO: labels?
+        let (s, sign) = if signed {
             if let Some(s) = s.strip_prefix('-') {
                 (s, true)
             } else {
@@ -424,26 +417,23 @@ impl Assembler {
         } else {
             (s, false)
         };
-        let (s, value) = match value_fmt.base {
-            sleigh_rs::PrintBase::Dec => parse_dec(s),
-            sleigh_rs::PrintBase::Hex => parse_hex(s)
-        }?;
-        let value = if negate {
-            -(value as isize) as usize
+        let (s, value) = alt((parse_hex, parse_dec))(s)?;
+        let value = if sign {
+            -(value as i64)
         } else {
-            value
+            value as i64
         };
         Ok((s, value))
     }
 
-    pub fn parse_attach_varnode<'a>(&self, attach_varnode: &AttachVarnode, s: &'a str) -> IResult<&'a str, usize> {
+    pub fn parse_attach_varnode<'a>(&self, attach_varnode: &AttachVarnode, s: &'a str) -> IResult<&'a str, i64> {
         let mut attach_varnodes = attach_varnode.0.iter().map(|(value, id)|
             (*value, self.varnode(*id))
         ).collect::<Vec<_>>();
         attach_varnodes.sort_by(|(_, v1), (_, v2)| v2.name().cmp(v1.name()));
         for (value, varnode) in attach_varnodes.into_iter() {
             if let Some(s) = s.strip_prefix(varnode.name()) {
-                return Ok((s, value))
+                return Ok((s, value as i64))
             }
         }
         nom::combinator::fail(s)
