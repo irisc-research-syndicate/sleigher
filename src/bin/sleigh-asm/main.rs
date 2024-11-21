@@ -229,7 +229,6 @@ impl<'asm> Variables<'asm> {
             Expr::Op(_span, op, expr, expr1) => {
                 let expr_r = self.build_expr_bv(expr, sz);
                 let expr_l = self.build_expr_bv(expr1, sz);
-                //dbg!(&expr_r, expr_r.get_size(), &expr_l, expr_l.get_size(), op);
                 match op {
                     Op::Add => expr_r + expr_l,
                     Op::Sub => expr_r - expr_l,
@@ -293,10 +292,9 @@ impl Assembler {
     }
 
     pub fn assemble_constructor<'a, 'asm>(&'asm self, constructor: &'asm Constructor, variables: Constraints<'asm>, mut s: &'a str) -> IResult<&'a str, Constraints<'asm>> {
-//        dbg!(constructor);
         if let Some(mneumonic) = constructor.display.mneumonic.as_ref() {
             s = nom::bytes::complete::tag(mneumonic.as_str())(s)?.0;
-            dbg!(mneumonic);
+            log::trace!("MNEUMONIC: {}", mneumonic);
         }
 
         let mut variables = Variables::new(variables, constructor);
@@ -347,7 +345,7 @@ impl Assembler {
                 DisplayElement::Context(_context_id) => todo!(),
                 DisplayElement::TokenField(token_field_id) => {
                     let token_field = self.token_field(*token_field_id);
-                    println!("TOKEN_FIELD: {:?} {:?}", token_field.name(), s);
+                    log::trace!("TOKEN_FIELD: {:?} {:?}", token_field.name(), s);
                     let token_field_bv = variables.token_field(*token_field_id, None);
                     let (s, value) = match token_field.attach {
                         token::TokenFieldAttach::NoAttach(value_fmt) => {
@@ -369,14 +367,14 @@ impl Assembler {
                 DisplayElement::InstNext(_inst_next) => todo!(),
                 DisplayElement::Table(table_id) => {
                     let table = self.table(*table_id);
-                    println!("TABLE: {:?}/{:?} {:?}", table.name(), table_id, s);
+                    log::trace!("TABLE: {:?}/{:?} {:?}", table.name(), table_id, s);
                     let (s, table_constraints) = self.assemble_table(table, variables.constraints.clone(), s)?;
                     variables.merge(table_constraints);
                     s
                 },
                 DisplayElement::Disassembly(variable_id) => {
                     let variable = constructor.pattern.disassembly_var(*variable_id);
-                    println!("DISASSEMBLY: {:?} {:?}", variable.name(), s);
+                    log::trace!("DISASSEMBLY: {:?} {:?}", variable.name(), s);
                     let (s, negate) = if let Some(s) = s.strip_prefix('-') {
                         (s, true)
                     } else {
@@ -393,24 +391,20 @@ impl Assembler {
 
                 },
                 DisplayElement::Literal(lit) => {
-                    println!("LITERAL: {:?} {:?}", lit, s);
+                    log::trace!("LITERAL: {:?} {:?}", lit, s);
                     nom::bytes::complete::tag(lit.as_str())(s)?.0
                 },
                 DisplayElement::Space => {
-                    println!("SPACE: {:?}", s);
+                    log::trace!("SPACE: {:?}", s);
                     nom::character::complete::space1(s)?.0
                 },
             };
         }
 
-
         if variables.check() {
             Ok((s, variables.constraints))
         } else {
-            println!("constraint check failed");
-            println!("fields: {:#?}", variables.fields.values());
-            println!("variables: {:#?}", variables.variables.values());
-            println!("eqs: {:#?}", variables.eqs);
+            log::trace!("Constraint check failed, Eqs: {:#?}", variables.eqs);
             nom::combinator::fail(s)
         }
     }
