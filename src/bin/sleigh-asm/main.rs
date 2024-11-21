@@ -459,3 +459,47 @@ pub fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod test {
+    use std::path::Path;
+    use super::*;
+
+    #[test]
+    pub fn test_vliw_assemble() {
+        let sleigh = sleigh_rs::file_to_sleigh(Path::new("examples/vliw.slaspec")).unwrap();
+        let assembler = Assembler::new(sleigh);
+        let tests = vec![
+            ("{ unk.0x0 r1, r2, 0x1234 ; unk.0xa r5, r1, 0x1234 ; unk.0xb r10, r11, 0 }", vec![0x50, 0x04, 0x4a, 0x28, 0x56, 0xa5, 0x92, 0x34], ""),
+            ("{ unk.0 r1, r2, 0x87654321 }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21], "")
+        ];
+        for (input, expected_bytes, expected_rest) in tests {
+            let (rest, constraints) = assembler.assemble_instruction(input).unwrap();
+            let bytes = constraints.to_bytes().unwrap();
+
+            assert_eq!(rest, expected_rest);
+            assert_eq!(bytes, expected_bytes);
+        }
+    }
+
+    #[test]
+    pub fn test_risc_assemble() {
+        let sleigh = sleigh_rs::file_to_sleigh(Path::new("examples/risc.slaspec")).unwrap();
+        let assembler = Assembler::new(sleigh);
+        let tests = vec![
+            ("xor r2, r15, 0xffff", vec![0x2f, 0x90, 0xff, 0xff], ""),
+            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
+            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
+            ("xor r4, r5, 0x23450000", vec![0x2a, 0xa2, 0x23, 0x45], ""),
+            ("and r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x03], ""),
+        ];
+        for (input, expected_bytes, expected_rest) in tests {
+            println!("Assembling: {}", input);
+            let (rest, constraints) = assembler.assemble_instruction(input).unwrap();
+            let bytes = constraints.to_bytes().unwrap();
+
+            assert_eq!(rest, expected_rest);
+            assert_eq!(bytes, expected_bytes);
+        }
+    }
+}
