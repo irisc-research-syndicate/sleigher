@@ -143,8 +143,8 @@ fn main() -> Result<()> {
     }
 
     let mut state = State::new();
-    state.0.borrow_mut().spaces.insert(SpaceId(0), Box::new(memory));
-    state.0.borrow_mut().pc = args.entrypoint;
+    state.spaces.insert(SpaceId(0), Box::new(memory));
+    state.pc = args.entrypoint;
 
     log::info!("=== Initializing registers ===");
     for reg in args.registers {
@@ -160,7 +160,7 @@ fn main() -> Result<()> {
     }
 
     for step in args.steps.map(|steps| 0..steps).unwrap_or(0..u64::MAX) {
-        let pc = cpu.state.borrow().pc;
+        let pc = cpu.state.pc;
 
         if pc == 0u64 {
             log::info!("PC = null! Exiting!");

@@ -32,51 +32,41 @@ impl<'sleigh> Cpu<'sleigh> {
         let mut instruction_bytes= [0u8; 4];
         self.fetch_instruction(&mut instruction_bytes)?;
 
-        let instruction = self.disassembler.disassemble(self.state.borrow().pc, Context, &instruction_bytes)?;
+        let instruction = self.disassembler.disassemble(self.state.pc, Context, &instruction_bytes)?;
         log::debug!("Executing {:#010x}: {}", instruction.inst_start, instruction);
 
         let mut table_executor = TableExecutor::new(&instruction.table);
         let (export, pc) = table_executor.execute(&mut self.state)?;
-        self.state.borrow_mut().pc = pc;
+        self.state.pc = pc;
         Ok(())
     }
 
     pub fn fetch_instruction(&mut self, instruction: &mut [u8]) -> Result<()> {
-        let pc = self.state.borrow().pc.clone();
+        let pc = self.state.pc.clone();
         self.state.read_ref(Ref(self.sleigh.default_space(), instruction.len(), Address(pc)), instruction)
     }
 }
 
 #[derive(Debug)]
-pub struct StateInner {
+pub struct State {
     pub pc: u64,
     pub spaces: HashMap<SpaceId, Box<dyn MemoryRegion>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct State(pub Rc<RefCell<StateInner>>);
-
-impl<'sleigh> std::ops::Deref for State {
-    type Target = Rc<RefCell<StateInner>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
 
 impl State {
     pub fn new() -> Self {
-        State(Rc::new(RefCell::new(StateInner {
+        State {
             pc: 0,
             spaces: HashMap::new(),
-        })))
+        }
     }
 
     pub fn write_ref(&mut self, referance: Ref, data: &[u8]) -> Result<()> {
         log::trace!("Writing {} <- {:02x?}", referance, data);
         assert!(data.len() >= referance.1);
         let data = &data[data.len()-referance.1..];
-        self.borrow_mut().spaces
+        self.spaces
             .entry(referance.0)
             .or_insert_with(|| Box::new(HashSpace::new()))
             .write(referance.2, data)
@@ -87,7 +77,7 @@ impl State {
         assert!(len >= referance.1);
         for byte in &mut *data { *byte = 0; }
         let data = &mut data[len-referance.1..];
-        self.borrow_mut().spaces
+        self.spaces
             .entry(referance.0)
             .or_insert_with(|| Box::new(HashSpace::new()))
             .read(referance.2, data)?;
