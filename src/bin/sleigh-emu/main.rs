@@ -9,7 +9,6 @@ use anyhow::{bail, Context as AnyhowContext, Result};
 
 use sleigh_rs::SpaceId;
 
-use sleigher::disassembler::Disassembler;
 use sleigher::emulator::{Cpu, State};
 use sleigher::value::{Address, Ref};
 use sleigher::space::{FileRegion, HashSpace, MappedSpace};
@@ -150,20 +149,14 @@ fn main() -> Result<()> {
     log::info!("=== Initializing registers ===");
     for reg in args.registers {
         let varnode = sleigh.varnodes().iter().find(|varnode| varnode.name() == reg.name).unwrap();
-        let referance = Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address));
-        state.write_ref(referance, &reg.value.to_be_bytes())?;
+        state.write_ref(varnode.into(), &reg.value.to_be_bytes())?;
     }
 
-    let mut cpu = Cpu {
-        sleigh: &sleigh,
-        disassembler: Disassembler::new(&sleigh),
-        state: state,
-    };
+    let mut cpu = Cpu::new(&sleigh, state);
 
     fn read_reg_u32(cpu: &mut Cpu, name: &str) -> u32 {
         let varnode = cpu.sleigh.varnodes().iter().find(|varnode| varnode.name() == name).unwrap();
-        let referance = Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address));
-        cpu.state.read_ref_u32be(referance).unwrap()
+        cpu.state.read_ref_u32be(varnode.into()).unwrap()
     }
 
     for step in args.steps.map(|steps| 0..steps).unwrap_or(0..u64::MAX) {

@@ -1,7 +1,8 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use anyhow::{bail, Context as _, Result};
-use sleigh_rs::{execution::{self, Assignment, Binary, Block, BlockId, Build, CpuBranch, Export, ExportConst, Expr, ExprElement, ExprValue, LocalGoto, MemWrite, Statement, UserCall, VariableId, WriteValue}, user_function::UserFunction, Sleigh, SpaceId, TableId, TokenFieldId};
+use sleigh_rs::{user_function::UserFunction, Sleigh, SpaceId, TableId, TokenFieldId};
+use sleigh_rs::execution::{Assignment, Binary, Block, BlockId, Build, CpuBranch, Export, ExportConst, Expr, ExprElement, ExprValue, LocalGoto, MemWrite, Statement, UserCall, VariableId, WriteValue};
 use crate::{disassembler::{Context, DisassembledTable, Disassembler}, space::{HashSpace, MemoryRegion}, value::{Address, Ref, Value, Var}};
 
 pub struct Cpu<'sleigh> {
@@ -19,6 +20,14 @@ impl<'sleigh> std::ops::Deref for Cpu<'sleigh> {
 }
 
 impl<'sleigh> Cpu<'sleigh> {
+    pub fn new(sleigh: &'sleigh Sleigh, state: State) -> Self {
+        Self  {
+            sleigh,
+            disassembler: Disassembler::new(sleigh),
+            state,
+        }
+    }
+
     pub fn step(&mut self) -> Result<()> {
         let mut instruction_bytes= [0u8; 4];
         self.fetch_instruction(&mut instruction_bytes)?;

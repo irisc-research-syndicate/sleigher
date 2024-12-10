@@ -1,4 +1,4 @@
-use sleigh_rs::{execution::VariableId, SpaceId};
+use sleigh_rs::{execution::VariableId, varnode::Varnode, SpaceId};
 
 #[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct Address(pub u64);
@@ -27,6 +27,12 @@ impl std::fmt::Display for Ref {
 impl std::fmt::Debug for Ref {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Ref({}:{:?}:{})", self.0.0, self.2, self.1)
+    }
+}
+
+impl std::convert::From<&Varnode> for Ref {
+    fn from(varnode: &Varnode) -> Self {
+        Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address))
     }
 }
 
