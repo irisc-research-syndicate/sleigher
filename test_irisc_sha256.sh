@@ -1,7 +1,7 @@
 #!/bin/sh
 clear;
 export RUST_LOG=${RUST_LOG:-info}
-cargo run --bin sleigh-emu -- \
+cargo run -r --bin sleigh-emu -- \
     --slaspec iRISC.slaspec \
     --map 0x00710000:00007000_0001c494_IRON_PREP_CODE \
     --ram 0xffff0000:0x10000 \
