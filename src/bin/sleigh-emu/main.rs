@@ -1,436 +1,416 @@
 #![allow(unused_variables)]
-#![allow(dead_code)]
+//#![allow(dead_code)]
 
-use std::{cell::RefCell, collections::HashMap, fs::File, path::PathBuf, rc::Rc, str::FromStr};
+use std::{cell::RefCell, collections::HashMap, fs::File, path::PathBuf, rc::Rc};
 
 use clap::Parser;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context as AnyhowContext, Result};
 
 mod space;
 pub mod lift;
 
-use sleigh_rs::{execution::{BlockId, Expr, ExprValue, Statement, VariableId, WriteValue}, SpaceId, TableId};
-use sleigher::*;
-use sleigher::execution::*;
-use table::TableContext;
+use sleigh_rs::{user_function::UserFunction, Sleigh, SpaceId, TableId, TokenFieldId};
+use sleigh_rs::execution::{self, Assignment, Block, BlockId, Build, CpuBranch, Export, Expr, ExprValue, LocalGoto, MemWrite, Statement, UserCall, VariableId, WriteValue};
 
+use sleigher::disassembler::{Context, DisassembledTable, Disassembler};
+use sleigher::value::{Address, Ref, Value, Var};
 use space::{HashSpace, FileRegion};
-use value::{Address, Ref, Value, Var};
+
+pub struct Cpu<'sleigh> {
+    sleigh: &'sleigh Sleigh,
+    disassembler: Disassembler<'sleigh>,
+    state: State,
+}
+
+impl<'sleigh> std::ops::Deref for Cpu<'sleigh> {
+    type Target = Sleigh;
+
+    fn deref(&self) -> &Self::Target {
+        self.sleigh
+    }
+}
 
 #[derive(Debug)]
 pub struct StateInner {
     pc: u64,
     spaces: HashMap<SpaceId, Box<dyn space::MemoryRegion>>,
-    context: (),
 }
 
 #[derive(Debug, Clone)]
 pub struct State(Rc<RefCell<StateInner>>);
 
-impl State {
-    pub fn new() -> Self {
-        State(Rc::new(RefCell::new(StateInner {
-            pc: 0,
-            spaces: HashMap::new(),
-            context: (),
-        })))
-    }
-
-    pub fn new_instruction(self, instruction_bytes: Vec<u8>) -> InstructionExecutor {
-        InstructionExecutor(Rc::new(InstructionExecutorInner {
-            state: self.clone(),
-            table_exports: RefCell::new(HashMap::new()),
-            current_instruction: instruction_bytes
-        }))
-    }
-
-    pub fn write_ref(&self, referance: Ref, data: &[u8]) -> Result<()> {
-        log::trace!("Writing {} <- {:02x?}", referance, data);
-        assert!(data.len() >= referance.1);
-        let data = &data[data.len()-referance.1..];
-        let mut inner_state = self.0.borrow_mut();
-        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Box::new(HashSpace::new()));
-        space.write(referance.2, data)?;
-        Ok(())
-    }
-
-    pub fn read_ref(&self, referance: Ref, data: &mut [u8]) -> Result<()> {
-        let len = data.len();
-        assert!(len >= referance.1);
-        for byte in &mut *data { *byte = 0; }
-        let data = &mut data[len-referance.1..];
-        let mut inner_state = self.0.borrow_mut();
-        let space = inner_state.spaces.entry(referance.0).or_insert_with(|| Box::new(HashSpace::new()));
-        space.read(referance.2, data)?;
-        log::trace!("Reading {} -> {:02x?}", referance, data);
-        Ok(())
-    }
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug)]
-pub struct InstructionExecutorInner {
-    state: State,
-    table_exports: RefCell<HashMap<TableId, Value>>,
-    current_instruction: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct InstructionExecutor(Rc<InstructionExecutorInner>);
-
-impl std::ops::Deref for InstructionExecutor {
-    type Target = InstructionExecutorInner;
+impl<'sleigh> std::ops::Deref for State {
+    type Target = Rc<RefCell<StateInner>>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Default)]
-struct Locals(RefCell<HashMap<VariableId, Value>>);
+impl State {
+    pub fn new() -> Self {
+        State(Rc::new(RefCell::new(StateInner {
+            pc: 0,
+            spaces: HashMap::new(),
+        })))
+    }
 
-#[derive(Debug)]
-pub struct TableExecutor {
-    instruction: InstructionExecutor,
-    locals: Locals,
+    pub fn write_ref(&mut self, referance: Ref, data: &[u8]) -> Result<()> {
+        log::trace!("Writing {} <- {:02x?}", referance, data);
+        assert!(data.len() >= referance.1);
+        let data = &data[data.len()-referance.1..];
+        self.borrow_mut().spaces
+            .entry(referance.0)
+            .or_insert_with(|| Box::new(HashSpace::new()))
+            .write(referance.2, data)
+    }
+
+    pub fn read_ref(&mut self, referance: Ref, data: &mut [u8]) -> Result<()> {
+        let len = data.len();
+        assert!(len >= referance.1);
+        for byte in &mut *data { *byte = 0; }
+        let data = &mut data[len-referance.1..];
+        self.borrow_mut().spaces
+            .entry(referance.0)
+            .or_insert_with(|| Box::new(HashSpace::new()))
+            .read(referance.2, data)?;
+        log::trace!("Reading {} -> {:02x?}", referance, data);
+        Ok(())
+    }
+
+    pub fn read_ref_u32be(&mut self, referance: Ref) -> Result<u32> {
+        let mut bytes = [0u8; 4];
+        self.read_ref(referance, &mut bytes)?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn get_u64(&mut self, value: Value) -> Result<u64> {
+        Ok(match value {
+            Value::Int(x) => x,
+            Value::Ref(referance) => {
+                let mut data = [0u8; 8];
+                self.read_ref(referance, &mut data)?;
+                u64::from_be_bytes(data)
+            },
+        })
+    }
+
+    fn user_call(&mut self, function: &UserFunction, params: Vec<Value>) -> Result<Value> {
+        todo!();
+    }
+}
+
+impl<'sleigh> Cpu<'sleigh> {
+    pub fn step(&mut self) -> Result<()> {
+        let mut instruction_bytes= [0u8; 4];
+        self.fetch_instruction(&mut instruction_bytes)?;
+
+        let instruction = self.disassembler.disassemble(self.state.borrow().pc, Context, &instruction_bytes)?;
+        log::debug!("Executing {:#010x}: {}", instruction.inst_start, instruction);
+
+        let mut table_executor = TableExecutor::new(&instruction.table);
+        let (export, pc) = table_executor.execute(&mut self.state)?;
+        self.state.borrow_mut().pc = pc;
+        Ok(())
+    }
+
+    pub fn fetch_instruction(&mut self, instruction: &mut [u8]) -> Result<()> {
+        let pc = self.state.borrow().pc.clone();
+        self.state.read_ref(Ref(self.sleigh.default_space(), instruction.len(), Address(pc)), instruction)
+    }
+}
+
+pub struct TableExecutor<'st> {
+    table: &'st DisassembledTable<'st>,
+    variables: HashMap<VariableId, Value>,
+    exports: HashMap<TableId, Value>,
     export: Option<Value>,
 }
 
-impl InstructionExecutor {
-    pub fn execute_table(&self, table: SleighTable) -> Result<Option<Value>> {
-        let disasm_table = table.disassemble(self.state.0.borrow().pc, &self.current_instruction)?;
-
-        let mut executor = TableExecutor {
-            instruction: self.clone(),
-            locals: Locals(RefCell::new(HashMap::new())),
-            export: None,
-        };
-
-        if let Some(exec) = disasm_table.constructor.execution() {
-            let mut current_block = Some(exec.entry_block());
-            while let Some(block) = current_block.take() {
-                let next_block_id = executor.execute_block(block)?;
-                current_block = next_block_id.map(|id| exec.block(id));
-            }
-        }
-
-        Ok(executor.into_export())
-    }
+pub enum ControlFlow {
+    Goto(Option<BlockId>),
+    Branch(u64),
 }
 
-impl TableExecutor {
-    pub fn into_export(self) -> Option<Value> {
-        self.export
-    }
-
-    pub fn execute_block(&mut self, block: SleighBlock) -> Result<Option<BlockId>> {
-        for stmt in block.statements() {
-            if let Some(goto_block_id) = self.execute_statement(stmt)? {
-                return Ok(Some(goto_block_id));
-            }
+impl<'st> TableExecutor<'st> {
+    pub fn new(table: &'st DisassembledTable<'st>) -> Self {
+        Self {
+            table,
+            variables: HashMap::new(),
+            exports: HashMap::new(),
+            export: None
         }
-        Ok(block.inner.next)
     }
 
-    pub fn execute_statement(&mut self, stmt: SleighStatement) -> Result<Option<BlockId>> {
-        match stmt.inner {
-            Statement::Export(export) => {
-                self.execute_export(stmt.self_ctx(export))?
-            },
-            Statement::CpuBranch(cpu_branch) => {
-                self.execute_cpubranch(stmt.self_ctx(cpu_branch))?
-            },
-            Statement::LocalGoto(local_goto) => {
-                return self.execute_localgoto(stmt.self_ctx(local_goto));
-            },
-            Statement::Build(build) => {
-                self.execute_build(stmt.self_ctx(build))?
-            },
-            Statement::Assignment(assignment) => {
-                self.execute_assignment(stmt.self_ctx(assignment))?
-            },
-            Statement::MemWrite(mem_write) => {
-                self.execute_memwrite(stmt.self_ctx(mem_write))?
-            },
-            Statement::Declare(variable_id) => {
-                log::trace!("Declare({:?})", variable_id);
-                self.write_var(Var::Local(*variable_id), Value::Int(0));
-            },
-            stmt => bail!("Statement {:?} not implemented", stmt),
-        };
-        return Ok(None);
-    }
+    pub fn execute(&mut self, state: &mut State) -> Result<(Option<Value>, u64)> {
+        log::trace!("Executing table {}", self.table.table.name());
 
-    fn execute_localgoto(&mut self, local_goto: SleighLocalGoto) -> Result<Option<BlockId>> {
-        if let Some(cond_expr) = &local_goto.inner.cond {
-            if self.evaluate_expr(local_goto.same_ctx(cond_expr))? == Value::Int(1) {  //FIXME 
-                log::trace!("LocalGoto {:?} taken conditionally", &local_goto.inner.dst);
-                return Ok(Some(local_goto.inner.dst.clone()));
+        if let Some(execution) = &self.table.constructor.execution {
+            let mut next_block = Some(execution.entry_block);
+            while let Some(block_id) = next_block.take() {
+                match self.execute_block(state, execution.block(block_id))? {
+                    ControlFlow::Goto(block_id) => next_block = block_id,
+                    ControlFlow::Branch(pc) => return Ok((self.export, pc)),
+                };
             }
         } else {
-            log::trace!("LocalGoto {:?} taken unconditionally", &local_goto.inner.dst);
-            return Ok(Some(local_goto.inner.dst.clone()));
+            log::warn!("Constructor has no execution(check sleigh-rs!?)");
         }
-        log::trace!("LocalGoto {:?} not taken", &local_goto.inner.dst);
+        Ok((self.export, self.table.inst_next))
+    }
+
+    pub fn execute_block(&mut self, state: &mut State, block: &Block) -> Result<ControlFlow> {
+        for stmt in block.statements.iter() {
+            if let Some(flow) = self.execute_statement(state, stmt)? {
+                return Ok(flow);
+            }
+        }
+        Ok(ControlFlow::Goto(block.next))
+    }
+
+    pub fn execute_statement(&mut self, state: &mut State, stmt: &Statement) -> Result<Option<ControlFlow>> {
+        match stmt {
+            Statement::Delayslot(delay_slot) => self.execute_delay_slot(*delay_slot)?,
+            Statement::Export(export) => self.execute_export(state, export)?,
+            Statement::CpuBranch(cpu_branch) => return self.execute_cpu_branch(state, cpu_branch),
+            Statement::LocalGoto(local_goto) => return self.execute_local_goto(state, local_goto),
+            Statement::UserCall(user_call) => self.execute_user_call(state, user_call)?,
+            Statement::Build(build) => self.execute_build(state, build)?,
+            Statement::Declare(variable_id) => self.execute_declare(state, *variable_id)?,
+            Statement::Assignment(assignment) => self.execute_assignment(state, assignment)?,
+            Statement::MemWrite(mem_write) => self.execute_mem_write(state, mem_write)?,
+        };
         Ok(None)
     }
 
-    fn execute_cpubranch(&mut self, cpu_branch: SleighCpuBranch) -> Result<()> {
-        let dst_value = self.evaluate_expr(cpu_branch.same_ctx(&cpu_branch.inner.dst))?;
-        let dst = if cpu_branch.inner.direct {
-            dst_value.to_u64()
-        } else {
-            self.get_value(dst_value)
-        };
-        if let Some(cond_expr) = &cpu_branch.inner.cond {
-            let cond_value = self.evaluate_expr(cpu_branch.same_ctx(cond_expr))?;
-            if self.get_value(cond_value) == 1 {
-                log::trace!("CpuBranch {:#018x} taken conditionally", dst);
-                self.instruction.state.0.borrow_mut().pc = dst.wrapping_sub(4);
-                return Ok(());
-            }
-        } else {
-            log::trace!("CpuBranch {:#018x} taken unconditionally", dst);
-            self.instruction.state.0.borrow_mut().pc = dst.wrapping_sub(4);
-            return Ok(());
-        };
-        log::trace!("CpuBranch {:#018x} not taken", dst);
-        Ok(())
+    pub fn execute_delay_slot(&self, delay_slot: u64) -> Result<()> {
+        todo!()
     }
 
-    fn execute_memwrite(&mut self, mem_write: SleighMemWrite) -> Result<()> {
-        let addr = self.get_value(self.evaluate_expr(mem_write.same_ctx(&mem_write.inner.addr))?);
-        let data = self.get_value(self.evaluate_expr(mem_write.same_ctx(&mem_write.inner.right))?);
-        let referance = Ref(mem_write.inner.mem.space, mem_write.inner.mem.len_bytes.get() as usize / 8, Address(addr));
-        log::trace!("MemWrite: {} <- {:02x?}", referance, data);
-        self.write_space(referance, &data.to_be_bytes());
-        Ok(())
-    }
-
-    fn execute_export(&mut self, export: SleighExport) -> Result<()> {
-        let export_value = match export.inner {
-            sleigh_rs::execution::Export::Const { len_bits, location, export: export_const} => {
-                self.evaluate_export_const(export.statement().self_ctx(export_const))?
+    pub fn execute_export(&mut self, state: &mut State, export: &Export) -> Result<()> {
+        let export_value = match export {
+            Export::Const { len_bits, location, export } => match export {
+                execution::ExportConst::DisVar(variable_id) => Value::Int(*self.table.variables.get(variable_id).unwrap() as u64),
+                execution::ExportConst::TokenField(token_field_id) => Value::Int(*self.table.token_fields.get(token_field_id).unwrap() as u64),
+                execution::ExportConst::Context(context_id) => todo!(),
+                execution::ExportConst::InstructionStart => Value::Int(self.table.inst_start),
+                execution::ExportConst::Table(table_id) => self.get_table_export(state, *table_id)?,
+                execution::ExportConst::ExeVar(variable_id) => self.variables.get(variable_id).unwrap().clone(),
             },
-            sleigh_rs::execution::Export::Value(expr) => self.evaluate_expr(export.statement().self_ctx(expr))?,
-            sleigh_rs::execution::Export::Reference { addr, memory } => {
-                let address = self.get_value(self.evaluate_expr(export.statement().self_ctx(addr))?);
+            Export::Value(expr) => self.evaluate_expr(state, expr)?,
+            Export::Reference { addr, memory } => {
+                let address_value = self.evaluate_expr(state, addr)?;
+                let address = state.get_u64(address_value)?;
                 Value::Ref(Ref(memory.space, memory.len_bytes.get() as usize / 8, Address(address)))
             },
         };
-        log::trace!("Export {:?} from table {}", export_value, export.table().name());
         self.export = Some(export_value);
         Ok(())
     }
 
-    fn evaluate_export_const(&self, export_const: SleighExportConst) -> Result<Value> {
-        Ok(match export_const.inner {
-            sleigh_rs::execution::ExportConst::DisVar(variable_id) => {
-                let table = export_const.table();
-                let disassembled_table = table.disassemble(self.instruction.state.0.borrow().pc, &self.instruction.current_instruction)?;
-                let disvar = disassembled_table.variables.get(variable_id).context("Could not find disassembly var")?;
-                Value::Int(*disvar as u64)
-            },
-            export_const => bail!("ExportConst {:?} unimplemented", export_const),
-            //sleigh_rs::execution::ExportConst::TokenField(token_field_id) => todo!(),
-            //sleigh_rs::execution::ExportConst::Context(context_id) => todo!(),
-            //sleigh_rs::execution::ExportConst::InstructionStart => todo!(),
-            //sleigh_rs::execution::ExportConst::Table(table_id) => todo!(),
-            //sleigh_rs::execution::ExportConst::ExeVar(variable_id) => todo!(),
-        })
-    }
-
-    fn get_value(&self, value: Value) -> u64 {
-        match value {
-            Value::Int(x) => x,
-            Value::Ref(referance) => {
-                let mut data = [0u8; 8];
-                self.read_space(referance, &mut data);
-                u64::from_be_bytes(data)
-            },
+    pub fn get_table_export(&self, state: &mut State, table_id: TableId) -> Result<Value> {
+        if let Some(table_export_value) = self.exports.get(&table_id) {
+            Ok(table_export_value.clone())
+        } else {
+            let table = self.table.tables.get(&table_id).unwrap();
+            if let (Some(export_value), _) = TableExecutor::new(table).execute(state)? {
+                Ok(export_value)
+            } else {
+                bail!("table did not export a value")
+            }
         }
     }
 
-    fn execute_build(&self, build: SleighBuild) -> Result<()> {
-        log::trace!("Build: {}", build.table().name());
-
-        if let Some(export) = self.instruction.execute_table(build.table())? {
-            self.instruction.table_exports.borrow_mut().insert(build.inner.table.id, export);
-        }
-
-        Ok(())
-    }
-
-    fn execute_assignment(&self, assignment: SleighAssignment) -> Result<()> {
-        let value = self.evaluate_expr(assignment.right())?;
-        let var = self.write_value(assignment.var())?;
-
-        log::trace!("Assignment: {:?} <- {:?} {:?}", var, value, assignment.inner.op);
-
-        match &assignment.inner.op {
-            None => (),
-            Some(op) => {
-                //log::warn!("Special assignment op {:?} not implemented", op);
-            },
-        }
-
-        self.write_var(var, value);
-
-        Ok(())
-    }
-
-    fn write_var(&self, var: Var, value: Value) {
-        match var {
-            Var::Ref(referance) => {
-                self.write_space(referance, &self.get_value(value).to_be_bytes());
-            },
-            Var::Local(variable_id) => {
-                self.locals.0.borrow_mut().insert(variable_id, value);
-            },
+    pub fn execute_cpu_branch(&self, state: &mut State, cpu_branch: &CpuBranch) -> Result<Option<ControlFlow>> {
+        let dst_value = self.evaluate_expr(state, &cpu_branch.dst)?;
+        let dst = if cpu_branch.direct {
+            dst_value.to_u64()
+        } else {
+            state.get_u64(dst_value)?
         };
+        let taken = if let Some(cond) = &cpu_branch.cond {
+            let cond_value = self.evaluate_expr(state, cond)?;
+            if state.get_u64(cond_value)? == 1 {
+                log::trace!("CpuBranch {:#018x} taken conditionally", dst);
+                return Ok(Some(ControlFlow::Branch(dst)));
+            }
+        } else {
+            log::trace!("CpuBranch {:#018x} taken unconditionally", dst);
+            return Ok(Some(ControlFlow::Branch(dst)));
+        };
+        log::trace!("CpuBranch {:#018x} not taken", dst);
+        Ok(None)
     }
 
-    fn write_space(&self, referance: Ref, data: &[u8]) {
-        self.instruction.state.write_ref(referance, data);
+    pub fn execute_local_goto(&self, state: &mut State, local_goto: &LocalGoto) -> Result<Option<ControlFlow>> {
+        if let Some(cond_expr) = &local_goto.cond {
+            if self.evaluate_expr(state, cond_expr)? == Value::Int(1) { // FIXME
+                log::trace!("LocalGoto {:?} taken conditionally", &local_goto.dst);
+                return Ok(Some(ControlFlow::Goto(Some(local_goto.dst.clone()))));
+            }
+        } else {
+            log::trace!("LocalGoto {:?} taken unconditionally", &local_goto.dst);
+            return Ok(Some(ControlFlow::Goto(Some(local_goto.dst.clone()))));
+
+        }
+        Ok(None)
     }
 
-    fn read_space(&self, referance: Ref, data: &mut [u8]) {
-        self.instruction.state.read_ref(referance, data);
+    pub fn execute_user_call(&self, state: &mut State, user_call: &UserCall) -> Result<()> {
+        self.evaluate_user_call(state, user_call)?;
+        Ok(())
     }
 
-    fn write_value(&self, write_value: SleighWriteValue) -> Result<Var> {
-        Ok(match write_value.inner {
+    pub fn execute_build(&self, state: &mut State, build: &Build) -> Result<()> {
+        todo!()
+    }
+
+    pub fn execute_declare(&self, state: &mut State, variable_id: VariableId) -> Result<()> {
+        log::trace!("DECLARE {variable_id:?}");
+        Ok(())
+    }
+
+    pub fn execute_assignment(&mut self, state: &mut State, assignment: &Assignment) -> Result<()> {
+        let right_value = self.evaluate_expr(state, &assignment.right)?;
+        log::trace!("Assignment {:?} = {:?}", assignment.var, right_value);
+        let var = match &assignment.var {
             WriteValue::Varnode(write_varnode) => {
-                let varnode = write_value.sleigh().varnode(write_varnode.id);
-                Var::Ref(varnode.referance())
+                let varnode = self.table.disassembler.varnode(write_varnode.id);
+                Var::Ref(Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address)))
             },
             WriteValue::Bitrange(write_bitrange) => todo!(),
             WriteValue::TokenField(write_token_field) => todo!(),
-            WriteValue::TableExport(write_table) => {
-                if let Some(value) = self.instruction.table_exports.borrow().get(&write_table.id) {
-                    value.to_var()
-                } else {
-                    let table = write_value.sleigh().table(write_table.id);
-                    self.instruction.execute_table(table.clone())?
-                        .context(format!("Table {}/{} did not export anything", table.clone().name(), write_table.id.0))?
-                        .to_var()
+            WriteValue::TableExport(write_table) => self.get_table_export(state, write_table.id)?.to_var(),
+            WriteValue::Local(write_exe_var) => Var::Local(write_exe_var.id),
+        };
+        match var {
+            Var::Ref(referance) => {
+                let value = state.get_u64(right_value)?;
+                state.write_ref(referance, &value.to_be_bytes())?;
+            },
+            Var::Local(variable_id) => {
+                self.variables.insert(variable_id, right_value);
+            },
+        };
+        Ok(())
+    }
+
+    pub fn execute_mem_write(&self, state: &mut State, mem_write: &MemWrite) -> Result<()> {
+        let right_value = self.evaluate_expr(state, &mem_write.right)?;
+        let addr_value = self.evaluate_expr(state, &mem_write.addr)?.to_u64();
+        let right_bytes = state.get_u64(right_value)?.to_be_bytes();
+        let referance = Ref(mem_write.mem.space, mem_write.mem.len_bytes.get() as usize / 8, sleigher::value::Address(addr_value));
+        state.write_ref(referance, &right_bytes)?;
+        Ok(())
+    }
+
+    pub fn evaluate_expr(&self, state: &mut State, expr: &Expr) -> Result<Value> {
+        Ok(match expr {
+            Expr::Value(expr_element) => {
+                match expr_element {
+                    execution::ExprElement::Op(expr_unary_op) => {
+                        let value = self.evaluate_expr(state, &expr_unary_op.input)?;
+                        match &expr_unary_op.op {
+                            sleigh_rs::execution::Unary::Dereference(memory_location) => {
+                                let referance = Ref(memory_location.space, memory_location.len_bytes.get() as usize / 8, Address(state.get_u64(value)?));
+                                let mut data = [0u8; 8];
+                                state.read_ref(referance, &mut data)?;
+                                Value::Int(u64::from_be_bytes(data))
+                            },
+                            sleigh_rs::execution::Unary::Zext => value,
+                            sleigh_rs::execution::Unary::TakeLsb(_) => value,
+                            sleigh_rs::execution::Unary::Negation => Value::Int((state.get_u64(value)? == 0) as u64),
+                            sleigh_rs::execution::Unary::BitRange(_) => value,
+                            op => bail!(format!("Unimplemented ExprUnaryOp {:?}", op)),
+                        }
+                    },
+                    execution::ExprElement::Value(expr_value) => self.evaluate_expr_value(state, expr_value)?,
+                    execution::ExprElement::UserCall(user_call) => {
+                        self.evaluate_user_call(state, user_call)?
+                    }
+                    //execution::ExprElement::Reference(reference) => todo!(),
+                    //execution::ExprElement::New(expr_new) => todo!(),
+                    //execution::ExprElement::CPool(expr_cpool) => todo!(),
+                    
+                    expr_element => bail!(format!("Unimplemented ExprElement {:?}", expr_element)),
                 }
             },
-            WriteValue::Local(write_exe_var) => {
-                Var::Local(write_exe_var.id)
-            },
+            Expr::Op(expr_binop) => {
+                let left_value = self.evaluate_expr(state, &expr_binop.left)?;
+                let left = state.get_u64(left_value)?;
+                let right_value = self.evaluate_expr(state, &expr_binop.right)?;
+                let right = state.get_u64(right_value)?;
+                Value::Int(match expr_binop.op {
+                    execution::Binary::Add => left.wrapping_add(right),
+                    execution::Binary::Sub => left.wrapping_sub(right),
+                    execution::Binary::And => left & right,
+                    execution::Binary::Xor => left ^ right,
+                    execution::Binary::Or => left | right,
+                    execution::Binary::BitAnd => left & right,
+                    execution::Binary::BitOr => left | right,
+                    execution::Binary::BitXor => left ^ right,
+                    execution::Binary::Lsl => left << right,
+                    execution::Binary::Lsr => left >> right,
+                    execution::Binary::SigLess => ((left as i64) < (right as i64)) as u64,
+                    execution::Binary::Eq => (left == right) as u64,
+                    execution::Binary::Greater => (left > right) as u64,
+                    execution::Binary::Less => (left < right) as u64,
+                    op => bail!("ExprBinaryOp {:?} not implemented", op),
+                })
+            }
         })
     }
 
-    fn evaluate_expr(&self, expr: SleighExpr) -> Result<Value> {
-        match expr.inner {
-            Expr::Value(expr_elem) => self.evaluate_expr_elem(expr.self_ctx(expr_elem)),
-            Expr::Op(expr_binop) => self.evaluate_expr_binop(expr.self_ctx(expr_binop)),
-        }
-    }
-
-    fn evaluate_expr_elem(&self, elem: SleighExprElement) -> Result<Value> {
-        match elem.inner {
-            sleigh_rs::execution::ExprElement::Value(expr_value) => self.evaluate_expr_value(elem.same_ctx(expr_value)),
-            sleigh_rs::execution::ExprElement::Op(expr_unary_op) => self.evaluare_expr_unary_op(elem.same_ctx(expr_unary_op)),
-            expr_elem => bail!(format!("ExprElement {:?} not implemented", expr_elem)),
-        }
-    }
-
-    fn evaluare_expr_unary_op(&self, expr_unary_op: SleighExprUnaryOp) -> Result<Value> {
-        let value = self.evaluate_expr(expr_unary_op.statement().self_ctx(&expr_unary_op.inner.input))?;
-        Ok(match &expr_unary_op.inner.op {
-            sleigh_rs::execution::Unary::Dereference(memory_location) => {
-                let referance = Ref(memory_location.space, memory_location.len_bytes.get() as usize / 8, Address(self.get_value(value)));
-                let mut data = [0u8; 8];
-                self.read_space(referance, &mut data);
-                Value::Int(u64::from_be_bytes(data))
-            },
-            sleigh_rs::execution::Unary::Zext => value,
-            sleigh_rs::execution::Unary::TakeLsb(_) => value,
-            sleigh_rs::execution::Unary::Negation => Value::Int((self.get_value(value) == 0) as u64),
-            sleigh_rs::execution::Unary::BitRange(_) => value,
-            op => bail!(format!("Unimplemented ExprUnaryOp {:?}", op)),
-        })
-    }
-
-    fn evaluate_expr_value(&self, expr_value: SleighExprValue) -> Result<Value> {
-        Ok(match expr_value.inner {
+    pub fn evaluate_expr_value(&self, state: &mut State, expr_value: &ExprValue) -> Result<Value> {
+        Ok(match expr_value {
             ExprValue::Int(expr_number) => {
                 match expr_number.number {
                     sleigh_rs::Number::Positive(x) => Value::Int(x),
-                    sleigh_rs::Number::Negative(x) => Value::Int((-(x as i64)) as u64),
+                    sleigh_rs::Number::Negative(x) => Value::Int(-(x as i64) as u64),
                 }
             },
             ExprValue::TokenField(expr_token_field) => {
-                let token_field = expr_value.sleigh().token_field(expr_token_field.id);
-                let decoded_token_field = token_field.decode(&self.instruction.current_instruction);
-                match token_field.inner.attach {
-                    sleigh_rs::token::TokenFieldAttach::NoAttach(value_fmt) => {
-                        Value::Int(decoded_token_field.value as u64)
-                    },
-                    sleigh_rs::token::TokenFieldAttach::Varnode(attach_varnode_id) => {
-                        let attach_varnode = expr_value.sleigh().inner.attach_varnode(attach_varnode_id);
-                        let varnode_id = attach_varnode.find_value(decoded_token_field.value).unwrap();
-                        let varnode = expr_value.sleigh().varnode(varnode_id);
-                        Value::Ref(varnode.referance())
-                    }
-                    sleigh_rs::token::TokenFieldAttach::Literal(attach_literal_id) => todo!(),
-                    sleigh_rs::token::TokenFieldAttach::Number(print_base, attach_number_id) => todo!(),
-                }
+                self.get_token_field_value(expr_token_field.id)?
             },
-            //ExprValue::InstStart(expr_inst_start) => todo!(),
-            ExprValue::InstNext(expr_inst_next) => {
-                Value::Int(self.instruction.state.0.borrow().pc + 4)
-            },
+            ExprValue::InstStart(expr_inst_start) => Value::Int(self.table.inst_start),
+            ExprValue::InstNext(expr_inst_next) => Value::Int(self.table.inst_next),
             ExprValue::Varnode(expr_varnode) => {
-                let varnode = expr_value.sleigh().varnode(expr_varnode.id);
-                Value::Ref(varnode.referance())
+                let varnode = self.table.varnode(expr_varnode.id);
+                let referance = Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address));
+                Value::Ref(referance)
             },
             //ExprValue::Context(expr_context) => todo!(),
             //ExprValue::Bitrange(expr_bitrange) => todo!(),
-            ExprValue::Table(expr_table) => {
-                let table = expr_value.sleigh().table(expr_table.id);
-                self.instruction.execute_table(table)?.context("Table as no export")?
-            },
+            ExprValue::Table(expr_table) => self.get_table_export(state, expr_table.id)?,
             ExprValue::DisVar(expr_dis_var) => {
-                let disassembled_table = expr_value.table().disassemble(self.instruction.state.0.borrow().pc, &self.instruction.current_instruction)?;
-                let value = disassembled_table.variables.get(&expr_dis_var.id).context(format!("Could not find Disassembly Variable {:?}", expr_dis_var.id))?;
-                Value::Int(*value as u64)
+                Value::Int(self.table.variables.get(&expr_dis_var.id).cloned().context("Disassembly var undefined")? as u64)
             },
-            ExprValue::ExeVar(expr_exe_var) => {
-                self.locals.0.borrow().get(&expr_exe_var.id).context(format!("Local variable {:?} not Declared", expr_exe_var.id))?.clone()
-            }
+            ExprValue::ExeVar(expr_exe_var) => self.variables.get(&expr_exe_var.id).cloned().context("Execution var undefined")?,
             expr_value => bail!("ExprValue {:?} not implemented", expr_value),
         })
     }
 
-    fn evaluate_expr_binop(&self, expr_binop: SleighExprBinaryOp) -> Result<Value> {
-        let left = self.get_value(self.evaluate_expr(expr_binop.statement().self_ctx(&expr_binop.inner.left))?);
-        let right = self.get_value(self.evaluate_expr(expr_binop.statement().self_ctx(&expr_binop.inner.right))?);
-        Ok(Value::Int(match expr_binop.inner.op {
-            sleigh_rs::execution::Binary::Add => left.wrapping_add(right),
-            sleigh_rs::execution::Binary::Sub => left.wrapping_sub(right),
-            sleigh_rs::execution::Binary::And => left & right,
-            sleigh_rs::execution::Binary::Xor => left ^ right,
-            sleigh_rs::execution::Binary::Or => left | right,
-            sleigh_rs::execution::Binary::BitAnd => left & right,
-            sleigh_rs::execution::Binary::BitOr => left | right,
-            sleigh_rs::execution::Binary::BitXor => left ^ right,
-            sleigh_rs::execution::Binary::Lsl => left << right,
-            sleigh_rs::execution::Binary::Lsr => left >> right,
-            sleigh_rs::execution::Binary::SigLess => ((left as i64) < (right as i64)) as u64,
-            sleigh_rs::execution::Binary::Eq => (left == right) as u64,
-            sleigh_rs::execution::Binary::Greater => (left > right) as u64,
-            sleigh_rs::execution::Binary::Less => (left < right) as u64,
-            unknown_op => bail!("ExprBinaryOp {:?} not implemented", unknown_op),
-        }))
+    pub fn get_token_field_value(&self, id: TokenFieldId) -> Result<Value> {
+        let token_field = self.table.disassembler.token_field(id);
+        let token_field_value = self.table.token_fields.get(&id).context("Could not get token field")?;
+        Ok(match token_field.attach {
+            sleigh_rs::token::TokenFieldAttach::NoAttach(value_fmt) => Value::Int(*token_field_value as u64),
+            sleigh_rs::token::TokenFieldAttach::Varnode(attach_varnode_id) => {
+                let attach_varnode = self.table.disassembler.attach_varnode(attach_varnode_id);
+                let varnode_id = attach_varnode.find_value(*token_field_value as usize).context("Could not find attach varnode value")?;
+                let varnode = self.table.disassembler.varnode(varnode_id);
+                Value::Ref(Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address)))
+            },
+            sleigh_rs::token::TokenFieldAttach::Literal(attach_literal_id) => todo!(),
+            sleigh_rs::token::TokenFieldAttach::Number(print_base, attach_number_id) => todo!(),
+        })
+    }
+
+    pub fn evaluate_user_call(&self, state: &mut State, user_call: &UserCall) -> Result<Value> {
+        let user_function = self.table.user_function(user_call.function);
+        let params: Vec<Value> = user_call.params.iter().map(|expr| self.evaluate_expr(state, expr)).collect::<Result<Vec<_>>>()?;
+        Ok(state.user_call(user_function, params)?)
     }
 }
 
@@ -448,7 +428,7 @@ fn parse_int(s: &str) -> std::result::Result<u64, std::num::ParseIntError> {
     }
 }
 
-impl FromStr for FileMap {
+impl std::str::FromStr for FileMap {
     type Err=anyhow::Error;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -465,7 +445,7 @@ struct RamMap {
     length: u64,
 }
 
-impl FromStr for RamMap {
+impl std::str::FromStr for RamMap {
     type Err=anyhow::Error;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -482,7 +462,7 @@ struct RegAssignment {
     value: u64,
 }
 
-impl FromStr for RegAssignment {
+impl std::str::FromStr for RegAssignment {
     type Err=anyhow::Error;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -500,7 +480,7 @@ struct Breakpoint {
     regs: Vec<String>,
 }
 
-impl FromStr for Breakpoint {
+impl std::str::FromStr for Breakpoint {
     type Err=anyhow::Error;
     
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -539,38 +519,6 @@ struct Args {
     steps: Option<u64>
 }
 
-impl State {
-    fn read_ref_vec(&self, referance: Ref) -> Result<Vec<u8>> {
-        let mut data = vec![0u8; referance.1];
-        self.read_ref(referance, &mut data)?;
-        Ok(data)
-    }
-
-    fn read_ref_u32be(&self, referance: Ref) -> Result<u32> {
-        let mut data = [0u8; 4];
-        self.read_ref(referance, &mut data)?;
-        Ok(u32::from_be_bytes(data))
-    }
-
-    fn read_ref_u32le(&self, referance: Ref) -> Result<u32> {
-        let mut data = [0u8; 4];
-        self.read_ref(referance, &mut data)?;
-        Ok(u32::from_le_bytes(data))
-    }
-
-    fn read_ref_u64be(&self, referance: Ref) -> Result<u64> {
-        let mut data = [0u8; 8];
-        self.read_ref(referance, &mut data)?;
-        Ok(u64::from_be_bytes(data))
-    }
-
-    fn read_ref_u64le(&self, referance: Ref) -> Result<u64> {
-        let mut data = [0u8; 8];
-        self.read_ref(referance, &mut data)?;
-        Ok(u64::from_le_bytes(data))
-    }
-}
-
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -583,7 +531,7 @@ fn main() -> Result<()> {
         },
     };
 
-    let sleigh: SleighSleigh = (&sleigh).into();
+
 
     let mut memory = space::MappedSpace::new();
     for file_map in args.file_mappings {
@@ -596,23 +544,31 @@ fn main() -> Result<()> {
         memory.add_mapping(Address(ram_map.address), ram_map.length, Box::new(HashSpace::new()))
     }
 
-    let state = State::new();
+    let mut state = State::new();
     state.0.borrow_mut().spaces.insert(SpaceId(0), Box::new(memory));
     state.0.borrow_mut().pc = args.entrypoint;
 
     log::info!("=== Initializing registers ===");
     for reg in args.registers {
-        let varnode = sleigh.varnode_by_name(&reg.name).unwrap();
-        state.write_ref(varnode.referance(), &reg.value.to_be_bytes())?;
+        let varnode = sleigh.varnodes().iter().find(|varnode| varnode.name() == reg.name).unwrap();
+        let referance = Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address));
+        state.write_ref(referance, &reg.value.to_be_bytes())?;
     }
 
-    let read_reg_u32 = |name| {
-        let varnode = sleigh.varnode_by_name(name).unwrap();
-        state.read_ref_u32be(varnode.referance()).unwrap()
+    let mut cpu = Cpu {
+        sleigh: &sleigh,
+        disassembler: Disassembler::new(&sleigh),
+        state: state,
     };
 
+    fn read_reg_u32(cpu: &mut Cpu, name: &str) -> u32 {
+        let varnode = cpu.sleigh.varnodes().iter().find(|varnode| varnode.name() == name).unwrap();
+        let referance = Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address));
+        cpu.state.read_ref_u32be(referance).unwrap()
+    }
+
     for step in args.steps.map(|steps| 0..steps).unwrap_or(0..u64::MAX) {
-        let pc = state.0.borrow().pc;
+        let pc = cpu.state.borrow().pc;
 
         if pc == 0u64 {
             log::info!("PC = null! Exiting!");
@@ -622,33 +578,17 @@ fn main() -> Result<()> {
         for bp in &args.breakpoints {
             if bp.address == pc {
                 let regs = bp.regs.iter().map(|reg|
-                    format!("{}={:#010x}", reg, read_reg_u32(&reg))
+                    format!("{}={:#010x}", reg, read_reg_u32(&mut cpu, reg.as_str()))
                 ).collect::<Vec<_>>().join(" ");
                 log::info!("Breakpoint {:#010x}: {} {}", bp.address, bp.name, regs);
             }
         }
 
-        let mut instr = [0u8; 4];
-        state.read_ref(Ref(SpaceId(0), 4, Address(pc)), &mut instr)?;
-
-        let table = sleigh.instruction_table();
-        let instruction = table.disassemble(pc, &instr).unwrap();
-        log::debug!("=== {:5}: PC {:#018x} INSTRUCTION {} ===", step, pc, instruction);
-
-        let instr_exec = InstructionExecutor(Rc::new(InstructionExecutorInner {
-            state: state.clone(),
-            table_exports: RefCell::new(Default::default()),
-            current_instruction: instr.to_vec()
-        }));
-
-        instr_exec.execute_table(sleigh.instruction_table())?;
-
-        let pc = state.0.borrow().pc.clone();
-        state.0.borrow_mut().pc = pc.wrapping_add(4);
+        cpu.step()?;
     }
 
     let mut hash_bytes = [0u8; 32];
-    state.read_ref(Ref(SpaceId(0), 32, Address(0xffffff80u64)), &mut hash_bytes)?;
+    cpu.state.read_ref(Ref(SpaceId(0), 32, Address(0xffffff80u64)), &mut hash_bytes)?;
     log::info!("{:02x?}", hash_bytes);
 
     Ok(())

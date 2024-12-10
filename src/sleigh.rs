@@ -1,9 +1,10 @@
-use sleigh_rs::{varnode::Varnode, Sleigh, TableId, TokenFieldId, VarnodeId};
+use sleigh_rs::{meaning::AttachVarnode, varnode::Varnode, Sleigh, TableId, TokenFieldId, VarnodeId};
 
 use crate::{value::{Address, Ref}, with_context, SleighTable, SleighTokenField, WithCtx};
 
 with_context!(SleighSleigh, (), Sleigh, SleighContext, sleigh);
 with_context!(SleighVarnode, SleighSleigh<'a>, Varnode, VarnodeContext, varnode);
+with_context!(SleighAttachVarnode, SleighSleigh<'a>, AttachVarnode, AttachVarnodeContext, attach_varnode);
 
 impl<'a> SleighSleigh<'a> {
     pub fn tables(&self) -> impl Iterator<Item = SleighTable> {

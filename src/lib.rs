@@ -6,6 +6,7 @@ pub mod pattern;
 pub mod bitconstraint;
 pub mod token;
 pub mod execution;
+pub mod disassembler;
 
 pub mod value;
 
