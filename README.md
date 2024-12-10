@@ -13,3 +13,13 @@ Overview of the project
 This project consists of 4 primary parts: A library `sleigher`, and 3 tools `sleigh-disasm`, `sleigh-asm`, `sleigh-emu` using that library.
 
 The 3 tools should be considered example code for using the library as well as being simple but moderately powerful tools for working with Sleigh.
+
+
+Future work
+===========
+- Instruction lifter to a simpler IR than raw sleigh execution semantics
+- Symbolic execution engine
+- JIT emulator for faster execution of lifted instructions
+- Context support is current unimplemented
+- Better testing, more toy examples.
+- Debugger?
