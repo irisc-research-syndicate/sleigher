@@ -1,9 +1,13 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::collections::HashMap;
 
 use anyhow::{bail, Context as _, Result};
+
 use sleigh_rs::{user_function::UserFunction, Sleigh, SpaceId, TableId, TokenFieldId};
 use sleigh_rs::execution::{Assignment, Binary, Block, BlockId, Build, CpuBranch, Export, ExportConst, Expr, ExprElement, ExprValue, LocalGoto, MemWrite, Statement, UserCall, VariableId, WriteValue};
-use crate::{disassembler::{Context, DisassembledTable, Disassembler}, space::{HashSpace, MemoryRegion}, value::{Address, Ref, Value, Var}};
+
+use crate::value::{Address, Ref, Value, Var};
+use crate::space::{HashSpace, MemoryRegion};
+use crate::disassembler::{Context, DisassembledTable, Disassembler};
 
 pub struct Cpu<'sleigh> {
     pub sleigh: &'sleigh Sleigh,

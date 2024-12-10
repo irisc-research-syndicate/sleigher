@@ -1,9 +1,14 @@
-use std::{collections::HashMap, ops::{Deref, Shl}};
+use std::collections::HashMap;
 
-use anyhow::{bail, Context as AnyhowContext, Error, Result};
-use sleigh_rs::{disassembly::{Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId}, display::DisplayElement, execution::{BlockId, MemoryLocation}, pattern::{BitConstraint, Pattern, Verification}, table::{Constructor, Table}, token::TokenFieldAttach, Endian, Sleigh, TableId, TokenFieldId, TokenId};
+use anyhow::{bail, Context as _, Result};
 
-use crate::disassembler;
+use sleigh_rs::{Endian, Sleigh, TableId, TokenFieldId};
+use sleigh_rs::table::{Constructor, Table};
+use sleigh_rs::token::TokenFieldAttach;
+use sleigh_rs::pattern::{BitConstraint, Verification};
+use sleigh_rs::display::DisplayElement;
+use sleigh_rs::disassembly::{Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId};
+
 
 #[derive(Debug, Clone)]
 pub struct Disassembler<'sleigh> {
