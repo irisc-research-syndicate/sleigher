@@ -7,15 +7,12 @@ use clap::Parser;
 
 use anyhow::{bail, Context as AnyhowContext, Result};
 
-mod space;
-pub mod lift;
-
 use sleigh_rs::{user_function::UserFunction, Sleigh, SpaceId, TableId, TokenFieldId};
 use sleigh_rs::execution::{self, Assignment, Block, BlockId, Build, CpuBranch, Export, Expr, ExprValue, LocalGoto, MemWrite, Statement, UserCall, VariableId, WriteValue};
 
 use sleigher::disassembler::{Context, DisassembledTable, Disassembler};
 use sleigher::value::{Address, Ref, Value, Var};
-use space::{HashSpace, FileRegion};
+use sleigher::space::{FileRegion, HashSpace, MappedSpace, MemoryRegion};
 
 pub struct Cpu<'sleigh> {
     sleigh: &'sleigh Sleigh,
@@ -34,7 +31,7 @@ impl<'sleigh> std::ops::Deref for Cpu<'sleigh> {
 #[derive(Debug)]
 pub struct StateInner {
     pc: u64,
-    spaces: HashMap<SpaceId, Box<dyn space::MemoryRegion>>,
+    spaces: HashMap<SpaceId, Box<dyn MemoryRegion>>,
 }
 
 #[derive(Debug, Clone)]
@@ -533,7 +530,7 @@ fn main() -> Result<()> {
 
 
 
-    let mut memory = space::MappedSpace::new();
+    let mut memory = MappedSpace::new();
     for file_map in args.file_mappings {
         let file = File::open(&file_map.path).context(format!("Could not open file: {:?}", &file_map.path))?;
         let size = file.metadata()?.len();
