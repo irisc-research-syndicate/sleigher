@@ -1,8 +1,11 @@
-use std::{collections::{BTreeMap, HashMap}, fs::File, os::unix::fs::FileExt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::File,
+    os::unix::fs::FileExt,
+};
 
 use crate::value::Address;
 use anyhow::Result;
-
 
 pub trait MemoryRegion: core::fmt::Debug {
     fn read(&self, address: Address, data: &mut [u8]) -> Result<()>;
@@ -15,7 +18,10 @@ pub struct HashSpace(HashMap<Address, u8>);
 impl MemoryRegion for HashSpace {
     fn read(&self, address: Address, data: &mut [u8]) -> Result<()> {
         for (offset, byte) in data.iter_mut().enumerate() {
-            *byte = *self.0.get(&Address(address.0 + offset as u64)).unwrap_or(&0);
+            *byte = *self
+                .0
+                .get(&Address(address.0 + offset as u64))
+                .unwrap_or(&0);
         }
         Ok(())
     }
@@ -65,7 +71,8 @@ impl MappedSpace {
     }
 
     pub fn add_mapping(&mut self, address: Address, length: u64, region: Box<dyn MemoryRegion>) {
-        self.0.insert(address, (Address(address.0 + length), region));
+        self.0
+            .insert(address, (Address(address.0 + length), region));
     }
 }
 

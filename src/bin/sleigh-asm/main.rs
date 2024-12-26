@@ -14,9 +14,14 @@ pub fn main() -> Result<()> {
     env_logger::init();
 
     let args = Cli::parse();
-    let sleigh = sleigh_rs::file_to_sleigh(&args.slaspec.clone()).ok().context("Could not open or parse slaspec")?;
+    let sleigh = sleigh_rs::file_to_sleigh(&args.slaspec.clone())
+        .ok()
+        .context("Could not open or parse slaspec")?;
     let assembler = InstructionAssembler::new(sleigh);
-    let (rest, constraints) = assembler.assemble_instruction(&args.instruction).ok().context("Failed to parse instruction")?;
+    let (rest, constraints) = assembler
+        .assemble_instruction(&args.instruction)
+        .ok()
+        .context("Failed to parse instruction")?;
 
     println!("rest: {:?}", rest);
 

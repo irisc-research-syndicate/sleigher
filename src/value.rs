@@ -20,19 +20,23 @@ pub struct Ref(pub SpaceId, pub usize, pub Address);
 
 impl std::fmt::Display for Ref {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}:{}", self.0.0, self.2, self.1)
+        write!(f, "{}:{}:{}", self.0 .0, self.2, self.1)
     }
 }
 
 impl std::fmt::Debug for Ref {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Ref({}:{:?}:{})", self.0.0, self.2, self.1)
+        write!(f, "Ref({}:{:?}:{})", self.0 .0, self.2, self.1)
     }
 }
 
 impl std::convert::From<&Varnode> for Ref {
     fn from(varnode: &Varnode) -> Self {
-        Ref(varnode.space, varnode.len_bytes.get() as usize, Address(varnode.address))
+        Ref(
+            varnode.space,
+            varnode.len_bytes.get() as usize,
+            Address(varnode.address),
+        )
     }
 }
 
@@ -77,7 +81,7 @@ impl Value {
     pub fn to_u64(&self) -> u64 {
         match self {
             Value::Int(x) => *x,
-            Value::Ref(x) => x.2.0,
+            Value::Ref(x) => x.2 .0,
         }
     }
 }

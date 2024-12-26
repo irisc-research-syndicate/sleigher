@@ -1,5 +1,5 @@
-use sleigher::disassembler::{Context, Disassembler};
 use anyhow::{Context as AnyhowContext, Result};
+use sleigher::disassembler::{Context, Disassembler};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -8,7 +8,7 @@ use clap::Parser;
 struct Args {
     slaspec: PathBuf,
 
-    #[clap(short, long, default_value_t=0)]
+    #[clap(short, long, default_value_t = 0)]
     address: u64,
 
     code: PathBuf,
@@ -19,7 +19,9 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let sleigh = sleigh_rs::file_to_sleigh(&args.slaspec).ok().context("Could not open or parse slaspec")?;
+    let sleigh = sleigh_rs::file_to_sleigh(&args.slaspec)
+        .ok()
+        .context("Could not open or parse slaspec")?;
     let disassembler = Disassembler::new(&sleigh);
 
     let code = std::fs::read(args.code)?;
