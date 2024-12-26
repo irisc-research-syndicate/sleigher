@@ -134,6 +134,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
             let mut bytes = bytes;
             let constructor = table.constructor(matcher.constructor);
 
+            log::trace!("Trying to match {:?} table to bytes {:02x?}", table.name(), bytes);
             if bytes.len() < constructor.pattern.len.single_len().unwrap_or(constructor.pattern.len.min()) as usize {
                 bail!("too few bytes to match constructor")
             }
@@ -357,5 +358,45 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
         }
 
         write!(f, "{}", parts.join(""))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::path::Path;
+    use super::*;
+
+    fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>)]) {
+        let _ = env_logger::try_init();
+        log::info!("Loading slaspec: {:?}", slaspec_path.as_ref());
+        let slaspec = sleigh_rs::file_to_sleigh(slaspec_path.as_ref())
+            .expect(&format!("Could not load slaspec: {:?}", slaspec_path.as_ref()));
+        let disasm = Disassembler::new(&slaspec);
+        for (expected_output, input_code) in tests.iter() {
+            log::info!("Disassembling {:02x?} expecting {:?}", input_code, expected_output);
+            let instruction = disasm.disassemble(0x00000000, Context, &input_code).expect("Could not disassemble code");
+            let actual_output = format!("{}", instruction);
+            log::info!("Produced disassembly: {:?}", actual_output);
+            assert_eq!(&actual_output, expected_output);
+        }
+    }
+
+    #[test]
+    fn test_risc_disassemble() {
+        run_tests("examples/risc.slaspec", &[
+            ("xor r2, r15, 0xffff", vec![0x2f, 0x90, 0xff, 0xff]),
+            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34]),
+            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34]),
+            ("xor r4, r5, 0x23450000", vec![0x2a, 0xa2, 0x23, 0x45]),
+            ("and r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x03]),
+        ]);
+    }
+
+    #[test]
+    fn test_vliw_disassemble() {
+        run_tests("examples/vliw.slaspec", &[
+            ("{ unk.0x0 r1, r2, 0x1234 ; unk.0xa r5, r1, 0x1234 ; unk.0xb r10, r11, 0 }", vec![0x50, 0x04, 0x4a, 0x28, 0x56, 0xa5, 0x92, 0x34]),
+            ("{ unk.0x0 r1, r2, 0xffffffff87654321 }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21])
+        ]);
     }
 }
