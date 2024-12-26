@@ -1,6 +1,6 @@
-pub mod disassembler;
 pub mod assembler;
+pub mod disassembler;
 pub mod emulator;
 
-pub mod value;
 pub mod space;
+pub mod value;
