@@ -53,7 +53,7 @@ OP_CONST: fmt3_const is fmt=3 & fmt3_const { }
 OP1_CONST: OP_CONST is op1_const_zero=0 & OP_CONST { }
 OP1_CONST: 0 is op1_const_zero=1 { }
 
-OP2_CONST: OP_CONST is op1_const_zero=0 & OP_CONST { }
+OP2_CONST: OP_CONST is op2_const_zero=0 & OP_CONST { }
 OP2_CONST: 0 is op2_const_zero=1 { }
 
 OP0:"unk."^op0 op0_rd, op0_rs, OP_CONST is op0 & op0_rd & op0_rs & OP_CONST { }
