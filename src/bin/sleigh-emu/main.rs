@@ -23,7 +23,7 @@ fn parse_int(s: &str) -> std::result::Result<u64, std::num::ParseIntError> {
     if let Some(s) = s.strip_prefix("0x") {
         u64::from_str_radix(s, 16)
     } else {
-        u64::from_str_radix(s, 10)
+        s.parse::<u64>()
     }
 }
 
@@ -32,7 +32,7 @@ impl std::str::FromStr for FileMap {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let (address, path) = s
-            .split_once(":")
+            .split_once(':')
             .context("File mapping does not contain ':'")?;
         let address = parse_int(address)?;
         let path = PathBuf::from_str(path)?;
@@ -51,7 +51,7 @@ impl std::str::FromStr for RamMap {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let (address, length) = s
-            .split_once(":")
+            .split_once(':')
             .context("Ram mapping does not contain ':'")?;
         let address = parse_int(address)?;
         let length = parse_int(length)?;
@@ -70,7 +70,7 @@ impl std::str::FromStr for RegAssignment {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let (name, value) = s
-            .split_once("=")
+            .split_once('=')
             .context("register assignemnt must contain '='")?;
         let name = name.to_string();
         let value = parse_int(value)?;
@@ -93,7 +93,7 @@ impl std::str::FromStr for Breakpoint {
             .split_once(':')
             .context("Breakpoint must be on the form: address:name:reglist")?;
         let (name, regs) = name_and_regs
-            .split_once(":")
+            .split_once(':')
             .context("Breakpoint must be on the form: address:name:reglist")?;
         let address = parse_int(address)?;
         let name = name.to_string();

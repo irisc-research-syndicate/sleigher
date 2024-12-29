@@ -62,7 +62,7 @@ impl MemoryRegion for FileRegion {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MappedSpace(BTreeMap<Address, (Address, Box<dyn MemoryRegion>)>);
 
 impl MappedSpace {
@@ -89,7 +89,7 @@ impl MemoryRegion for MappedSpace {
                 address.0 += length as u64;
                 data = &mut data[length..];
             }
-            if data.len() == 0 {
+            if data.is_empty() {
                 break;
             }
         }
@@ -108,7 +108,7 @@ impl MemoryRegion for MappedSpace {
                 address.0 += length as u64;
                 data = &data[length..];
             }
-            if data.len() == 0 {
+            if data.is_empty() {
                 break;
             }
         }

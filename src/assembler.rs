@@ -541,6 +541,7 @@ mod test {
 
     #[test]
     pub fn test_risc_assemble() {
+        #[rustfmt::skip]
         run_tests(
             "examples/risc.slaspec",
             &[

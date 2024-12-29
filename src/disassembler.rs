@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, Result};
 
 use sleigh_rs::disassembly::{Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId};
 use sleigh_rs::display::DisplayElement;
@@ -32,7 +32,7 @@ impl<'sleigh> Disassembler<'sleigh> {
     pub fn disassemble(
         &'sleigh self,
         inst_start: u64,
-        context: Context,
+        _context: Context,
         bytes: &[u8],
     ) -> Result<DisassembledInstruction<'sleigh>> {
         let table = self.disassemble_table(
@@ -149,6 +149,7 @@ pub fn bitconstraint_to_string(constraints: &[BitConstraint]) -> String {
 }
 
 impl<'sleigh> DisassembledTable<'sleigh> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         (self.inst_next - self.inst_start) as usize
     }
@@ -315,7 +316,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     ReadScope::InstStart(_inst_start) => self.inst_start as i64,
                     ReadScope::InstNext(_inst_next) => self.inst_next as i64,
                     ReadScope::Local(variable_id) => {
-                        self.variables.get(&variable_id).unwrap().clone()
+                        *self.variables.get(&variable_id).unwrap()
                     }
                 },
                 ExprElement::Op(span, op_unary, expr) => {
@@ -363,8 +364,7 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
                 }
                 DisplayElement::TokenField(token_field_id) => {
                     let token_field = self.disassembler.token_field(*token_field_id);
-                    if let Some(token_field_value) = self.token_fields.get(&token_field_id).cloned()
-                    {
+                    if let Some(token_field_value) = self.token_fields.get(token_field_id).cloned() {
                         match token_field.attach {
                             TokenFieldAttach::NoAttach(value_fmt) => match value_fmt.base {
                                 sleigh_rs::PrintBase::Dec => format!("{}", token_field_value),
