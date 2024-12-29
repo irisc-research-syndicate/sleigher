@@ -32,7 +32,7 @@ impl<'sleigh> Disassembler<'sleigh> {
     pub fn disassemble(
         &'sleigh self,
         inst_start: u64,
-        _context: Context,
+        context: Context,
         bytes: &[u8],
     ) -> Result<DisassembledInstruction<'sleigh>> {
         let table = self.disassemble_table(
