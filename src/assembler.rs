@@ -26,7 +26,7 @@ use z3::ast::{Ast, Bool, BV};
 
 fn parse_dec(s: &str) -> IResult<&str, u64> {
     map_res(recognize(many1(one_of("0123456789"))), |out: &str| {
-        u64::from_str_radix(out, 10)
+        out.parse::<u64>()
     })(s)
 }
 
@@ -98,6 +98,7 @@ impl<'asm> Constraints<'asm> {
             )
             ._eq(&field_bv));
 
+        #[allow(clippy::comparison_chain)]
         if let Some(sz) = sz {
             if field_bv.get_size() < sz {
                 if token_field.raw_value_is_signed() {
@@ -155,11 +156,11 @@ impl<'asm> Constraints<'asm> {
     }
 
     pub fn build_u64_const(&self, u: u64, sz: u32) -> BV<'asm> {
-        BV::from_u64(&self.asm.ctx, u, sz as u32)
+        BV::from_u64(&self.asm.ctx, u, sz)
     }
 
     pub fn build_i64_const(&self, i: i64, sz: u32) -> BV<'asm> {
-        BV::from_i64(&self.asm.ctx, i, sz as u32)
+        BV::from_i64(&self.asm.ctx, i, sz)
     }
 
     pub fn to_bytes(&self) -> Option<Vec<u8>> {
@@ -265,6 +266,7 @@ impl<'asm> Variables<'asm> {
                 }
             }
         };
+        #[allow(clippy::comparison_chain)]
         if expr_bv.get_size() < sz {
             expr_bv.sign_ext(sz - expr_bv.get_size())
         } else if expr_bv.get_size() > sz {
