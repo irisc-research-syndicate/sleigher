@@ -48,7 +48,7 @@ impl<'sleigh> Disassembler<'sleigh> {
         &'sleigh self,
         inst_start: u64,
         table: &'sleigh Table,
-        context: Context,
+        _context: Context,
         bytes: &[u8],
     ) -> Result<DisassembledTable<'sleigh>> {
         DisassembledTable::disassemble(self, inst_start, table, bytes)
@@ -213,7 +213,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                 disassembler,
                 table,
                 constructor,
-                inst_start: inst_start,
+                inst_start,
                 inst_next: inst_start,
                 token_fields: HashMap::new(),
                 tables: HashMap::new(),
@@ -255,11 +255,11 @@ impl<'sleigh> DisassembledTable<'sleigh> {
 
                 for assertion in block.pre_disassembler() {
                     match assertion {
-                        Assertation::GlobalSet(global_set) => todo!(),
+                        Assertation::GlobalSet(_global_set) => todo!(),
                         Assertation::Assignment(assignment) => {
                             let value = disasm_table.evaluate_expr(&assignment.right, bytes);
                             match assignment.left {
-                                sleigh_rs::disassembly::WriteScope::Context(context_id) => todo!(),
+                                sleigh_rs::disassembly::WriteScope::Context(_context_id) => todo!(),
                                 sleigh_rs::disassembly::WriteScope::Local(variable_id) => {
                                     disasm_table.variables.insert(variable_id, value);
                                 }
@@ -270,10 +270,14 @@ impl<'sleigh> DisassembledTable<'sleigh> {
 
                 for verification in block.verifications() {
                     match verification {
-                        Verification::ContextCheck { context, op, value } => todo!(),
+                        Verification::ContextCheck {
+                            context: _,
+                            op: _,
+                            value: _,
+                        } => todo!(),
                         Verification::TableBuild {
-                            produced_table,
-                            verification,
+                            produced_table: _,
+                            verification: _,
                         } => {}
                         Verification::TokenFieldCheck { field, op, value } => {
                             let field_value = disassembler.extract_token_field(*field, bytes);
@@ -291,7 +295,10 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                                 continue 'match_loop;
                             }
                         }
-                        Verification::SubPattern { location, pattern } => todo!(),
+                        Verification::SubPattern {
+                            location: _,
+                            pattern: _,
+                        } => todo!(),
                     }
                 }
                 bytes = &bytes[block_len as usize..];
@@ -304,22 +311,20 @@ impl<'sleigh> DisassembledTable<'sleigh> {
     pub fn evaluate_expr(&self, expr: &Expr, bytes: &[u8]) -> i64 {
         match expr {
             Expr::Value(expr_element) => match expr_element {
-                ExprElement::Value { value, location } => match *value {
+                ExprElement::Value { value, location: _ } => match *value {
                     ReadScope::Integer(number) => match number {
                         sleigh_rs::Number::Positive(x) => x as i64,
                         sleigh_rs::Number::Negative(x) => -(x as i64),
                     },
-                    ReadScope::Context(context_id) => todo!(),
+                    ReadScope::Context(_context_id) => todo!(),
                     ReadScope::TokenField(token_field_id) => {
                         self.disassembler.extract_token_field(token_field_id, bytes)
                     }
                     ReadScope::InstStart(_inst_start) => self.inst_start as i64,
                     ReadScope::InstNext(_inst_next) => self.inst_next as i64,
-                    ReadScope::Local(variable_id) => {
-                        *self.variables.get(&variable_id).unwrap()
-                    }
+                    ReadScope::Local(variable_id) => *self.variables.get(&variable_id).unwrap(),
                 },
-                ExprElement::Op(span, op_unary, expr) => {
+                ExprElement::Op(_, op_unary, expr) => {
                     let expr = self.evaluate_expr(expr, bytes);
                     match op_unary {
                         OpUnary::Negation => !expr,
@@ -364,7 +369,8 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
                 }
                 DisplayElement::TokenField(token_field_id) => {
                     let token_field = self.disassembler.token_field(*token_field_id);
-                    if let Some(token_field_value) = self.token_fields.get(token_field_id).cloned() {
+                    if let Some(token_field_value) = self.token_fields.get(token_field_id).cloned()
+                    {
                         match token_field.attach {
                             TokenFieldAttach::NoAttach(value_fmt) => match value_fmt.base {
                                 sleigh_rs::PrintBase::Dec => format!("{}", token_field_value),

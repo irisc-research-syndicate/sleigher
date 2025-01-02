@@ -1,4 +1,4 @@
-use anyhow::{Context as AnyhowContext, Result};
+use anyhow::{Context as _, Result};
 use sleigher::disassembler::{Context, Disassembler};
 use std::path::PathBuf;
 
