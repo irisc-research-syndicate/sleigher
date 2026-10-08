@@ -158,8 +158,8 @@ pub struct Instance<'asm> {
     pub parent: Option<(usize, usize)>,
 }
 
-/// A token occurrence: constructor instance, pattern block in that constructor, token index
-pub type TokenKey = (usize, usize, usize);
+/// A token occurrence: constructor instance, pattern block in that constructor, token
+pub type TokenKey = (usize, usize, TokenId);
 
 static NEXT_INSTANCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -227,7 +227,7 @@ impl<'asm> Constraints<'asm> {
         if let Some(bv) = self.tokens.get(&key) {
             return bv.clone();
         }
-        let token_id = TokenId(key.2);
+        let token_id = key.2;
         let token = self.asm.token(token_id);
         let bv = BV::fresh_const(
             &self.asm.ctx,
@@ -253,11 +253,7 @@ impl<'asm> Constraints<'asm> {
                 .tokens
                 .iter()
                 .filter_map(|(other_key, other_bv)| {
-                    Some((
-                        self.token_offset(*other_key)?,
-                        TokenId(other_key.2),
-                        other_bv,
-                    ))
+                    Some((self.token_offset(*other_key)?, other_key.2, other_bv))
                 })
                 .collect::<Vec<_>>();
             for (other_offset, other_id, other_bv) in overlapping {
@@ -319,7 +315,7 @@ impl<'asm> Constraints<'asm> {
                 field_bv
             })
             .clone();
-        let token_bv = self.token((instance, block, token_field.token.0));
+        let token_bv = self.token((instance, block, token_field.token));
         self.eq(token_bv
             .extract(
                 (token_field.bits.end().get() - 1) as u32,
@@ -375,7 +371,7 @@ impl<'asm> Constraints<'asm> {
         self.tokens
             .iter()
             .filter(|((instance, token_block, _), _)| *instance == id && *token_block == block)
-            .map(|((_, _, token_id), bv)| (TokenId(*token_id), bv))
+            .map(|((_, _, token_id), bv)| (*token_id, bv))
             .collect()
     }
 

@@ -7,7 +7,6 @@ use sleigh_rs::execution::{
     BranchCall, CpuBranch, DynamicValueType, Export, Expr, ExprElement, ExprValue, ReferencedValue,
     Statement, Unary, UserCall, VariableId,
 };
-use sleigh_rs::space::SpaceType;
 use sleigh_rs::{
     AttachVarnodeId, Endian, Number, Sleigh, SpaceId, TableId, TokenFieldId, VarnodeId,
 };
@@ -205,24 +204,8 @@ impl PcodeOp {
     }
 }
 
-/// Name of a space: its type, with its index when several spaces share a type
-pub fn space_name(sleigh: &Sleigh, space: SpaceId) -> String {
-    let space_type = sleigh.space(space).space_type;
-    let name = match space_type {
-        SpaceType::Ram => "ram",
-        SpaceType::Rom => "rom",
-        SpaceType::Register => "register",
-    };
-    let same_type = sleigh
-        .spaces()
-        .iter()
-        .filter(|other| other.space_type == space_type)
-        .count();
-    if same_type > 1 {
-        format!("{}{}", name, space.0)
-    } else {
-        name.to_string()
-    }
+pub fn space_name(sleigh: &Sleigh, space: SpaceId) -> &str {
+    &sleigh.space(space).name
 }
 
 pub struct DisplayVarnode<'a> {
@@ -665,8 +648,7 @@ impl<'s> Lifter<'s> {
             Export::Reference { addr, memory } => Handle::Pointer {
                 space: memory.space,
                 addr: self.expr(scope, addr, None)?,
-                // MemoryLocation::len_bytes holds bits
-                size: bits_to_bytes(memory.len_bytes.get()),
+                size: memory.len_bytes.get() as u32,
             },
             Export::AttachVarnode {
                 attach_value,
@@ -866,7 +848,7 @@ impl<'s> Lifter<'s> {
                 self.write(target, op, value, first_op)
             }
             AssignmentWrite::Memory { mem, addr } => {
-                let size = bits_to_bytes(mem.len_bytes.get());
+                let size = mem.len_bytes.get() as u32;
                 let addr = self.expr(scope, addr, None)?;
                 let value = self.expr(scope, &assignment.right, Some(size))?;
                 let value = self.resize(value, size);
@@ -1034,7 +1016,7 @@ impl<'s> Lifter<'s> {
                 let space = Varnode::constant(memory.space.0 as u64, 4);
                 self.op(
                     OpCode::Load,
-                    bits_to_bytes(memory.len_bytes.get()),
+                    memory.len_bytes.get() as u32,
                     vec![space, input],
                 )
             }
