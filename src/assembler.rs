@@ -14,12 +14,60 @@ use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{token::TokenFieldAttach, Endian, Number, Sleigh, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
 
+use anyhow::{anyhow, bail};
+
 use crate::disassembler::{Context, Disassembler};
 
 /// Labels a program defines: resolved to an address, or `None` while their address is unknown
 pub type Labels = BTreeMap<String, Option<u64>>;
 
 const NO_LABELS: &Labels = &BTreeMap::new();
+
+/// Passes over a program before label addresses have to stop changing
+const MAX_PASSES: usize = 16;
+
+/// One source line of an assembled program that holds an instruction
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    /// 1-based line number in the source
+    pub line_no: usize,
+    pub address: u64,
+    pub bytes: Vec<u8>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Program {
+    pub base: u64,
+    pub bytes: Vec<u8>,
+    pub labels: BTreeMap<String, u64>,
+    pub lines: Vec<Line>,
+}
+
+/// A source line split into its label definitions and instruction text
+struct SourceLine<'s> {
+    line_no: usize,
+    labels: Vec<&'s str>,
+    instruction: Option<&'s str>,
+}
+
+/// Strip a `//` comment and peel off leading `name:` label definitions
+fn parse_source_line(line_no: usize, line: &str) -> SourceLine<'_> {
+    let mut rest = line.split("//").next().unwrap_or_default().trim();
+    let mut labels = vec![];
+    while let Some((after, name)) = parse_identifier(rest) {
+        let Some(after) = after.strip_prefix(':') else {
+            break;
+        };
+        labels.push(name);
+        rest = after.trim_start();
+    }
+    SourceLine {
+        line_no,
+        labels,
+        instruction: (!rest.is_empty()).then_some(rest),
+    }
+}
 
 /// Every way a parser matched a prefix of the input, each with the remaining input.
 /// An empty list means no match.
@@ -469,6 +517,93 @@ impl InstructionAssembler {
                     .collect(),
             )),
         }
+    }
+
+    /// Assemble a program of one instruction per line, starting at `base`. Lines may start with
+    /// `name:` label definitions, `//` starts a comment, and operands may name any label.
+    ///
+    /// The first pass treats every label as unknown to find instruction lengths. Later passes
+    /// resolve the labels, require exactly one encoding per instruction and repeat until the
+    /// label addresses stop changing.
+    pub fn assemble_program(&self, source: &str, base: u64) -> anyhow::Result<Program> {
+        let source_lines = source
+            .lines()
+            .enumerate()
+            .map(|(index, line)| parse_source_line(index + 1, line))
+            .collect::<Vec<_>>();
+
+        let mut labels = Labels::new();
+        for line in source_lines.iter() {
+            for name in line.labels.iter() {
+                if self
+                    .varnodes()
+                    .iter()
+                    .any(|varnode| varnode.name() == *name)
+                {
+                    bail!("line {}: label {:?} is a register name", line.line_no, name);
+                }
+                if labels.insert(name.to_string(), None).is_some() {
+                    bail!("line {}: duplicate label {:?}", line.line_no, name);
+                }
+            }
+        }
+
+        for pass in 0..MAX_PASSES {
+            let resolved = pass > 0;
+            let mut address = base;
+            let mut addresses = Labels::new();
+            let mut lines = vec![];
+            for line in source_lines.iter() {
+                for name in line.labels.iter() {
+                    addresses.insert(name.to_string(), Some(address));
+                }
+                let Some(text) = line.instruction else {
+                    continue;
+                };
+                let error = |err: &dyn std::fmt::Display| {
+                    anyhow!("line {}: {:?}: {}", line.line_no, text, err)
+                };
+                let bytes = if resolved {
+                    let constraints = self
+                        .assemble_instruction_at(text, address, &labels)
+                        .map_err(|err| error(&err))?;
+                    constraints
+                        .to_bytes()
+                        .ok_or_else(|| error(&"constraints produced no bytes"))?
+                } else {
+                    // Labels are unknown, so only take the length of the shortest candidate
+                    let len = self
+                        .assemble_candidates_at(text, address, &labels)
+                        .into_iter()
+                        .filter(|(rest, _)| rest.trim_end().is_empty())
+                        .map(|(_, candidate)| candidate.len_bytes())
+                        .min()
+                        .ok_or_else(|| error(&AsmError::NoMatch))?;
+                    vec![0; len as usize]
+                };
+                lines.push(Line {
+                    line_no: line.line_no,
+                    address,
+                    bytes,
+                    source: text.to_string(),
+                });
+                address += lines.last().unwrap().bytes.len() as u64;
+            }
+
+            if resolved && addresses == labels {
+                return Ok(Program {
+                    base,
+                    bytes: lines.iter().flat_map(|line| line.bytes.clone()).collect(),
+                    labels: labels
+                        .into_iter()
+                        .map(|(name, address)| (name, address.unwrap()))
+                        .collect(),
+                    lines,
+                });
+            }
+            labels = addresses;
+        }
+        bail!("label addresses did not settle after {} passes", MAX_PASSES)
     }
 
     fn candidate(&self, constraints: &Constraints) -> Candidate {
@@ -1113,6 +1248,122 @@ mod test {
         assert_eq!(assemble("jz unknown").map(|bytes| bytes.len()), Ok(2));
         // Only defined labels are operands
         assert_eq!(assemble("jz nowhere"), Err(AsmError::NoMatch));
+    }
+
+    #[test]
+    fn cisc_program_counting_loop() {
+        let asm = load("examples/cisc.slaspec");
+        let source = "
+            // r1 = r2 + (r2 - 1) + ... + 1
+            start:  xor r1, r1
+            loop:   add r1, r2
+                    sub r2, r3  // r3 = 1
+                    jnz loop
+            done:   nop
+        ";
+        let program = asm.assemble_program(source, 0x1000).unwrap();
+        // Same bytes as the hand encoded emulator test cisc_counting_loop
+        assert_eq!(
+            program.bytes,
+            vec![0x06, 0x09, 0x02, 0x0a, 0x03, 0x13, 0x12, 0xfa, 0x00]
+        );
+        assert_eq!(
+            program.labels,
+            BTreeMap::from([
+                ("start".to_string(), 0x1000),
+                ("loop".to_string(), 0x1002),
+                ("done".to_string(), 0x1008),
+            ])
+        );
+        let lines = program
+            .lines
+            .iter()
+            .map(|line| (line.line_no, line.address))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                (3, 0x1000),
+                (4, 0x1002),
+                (5, 0x1004),
+                (6, 0x1006),
+                (7, 0x1008)
+            ]
+        );
+    }
+
+    #[test]
+    fn cisc_program_forward_references() {
+        let asm = load("examples/cisc.slaspec");
+        let source = "
+            jz end
+            jmp end
+
+            mov r1, #end
+            end:
+            nop
+        ";
+        let program = asm.assemble_program(source, 0x1000).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(program.bytes, vec![
+            0x11, 0x0b,                         // 0x1000: jz end
+            0x10, 0x00, 0x00, 0x10, 0x0d,       // 0x1002: jmp end
+            0x01, 0xc8, 0x00, 0x00, 0x10, 0x0d, // 0x1007: mov r1, #end
+            0x00,                               // 0x100d: end: nop
+        ]);
+    }
+
+    #[test]
+    fn program_errors() {
+        let cisc = load("examples/cisc.slaspec");
+        let risc = load("examples/risc.slaspec");
+        let error = |asm: &InstructionAssembler, source: &str| {
+            asm.assemble_program(source, 0x1000)
+                .unwrap_err()
+                .to_string()
+        };
+        let far = format!("jz end\n{}end: nop", "nop\n".repeat(130));
+        let errors = [
+            (
+                error(&cisc, &far),
+                "line 1: \"jz end\": no constructor matches the input",
+            ),
+            (
+                error(&cisc, "a: nop\na: nop"),
+                "line 2: duplicate label \"a\"",
+            ),
+            (
+                error(&cisc, "r1: nop"),
+                "line 1: label \"r1\" is a register name",
+            ),
+            (
+                error(&cisc, "nop\nmul r1, r2"),
+                "line 2: \"mul r1, r2\": no constructor matches the input",
+            ),
+            (
+                error(&risc, "add r1, r2, r3\nadd r1, r2, 0x5"),
+                "line 2: \"add r1, r2, 0x5\": ambiguous, 2 encodings:",
+            ),
+        ];
+        for (actual, expected) in errors.iter() {
+            assert!(
+                actual.starts_with(expected),
+                "{:?} does not start with {:?}",
+                actual,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn risc_program_label_operand() {
+        let asm = load("examples/risc.slaspec");
+        // data lands at 0x12340000, which only the uimm16 << 16 form can produce
+        let program = asm
+            .assemble_program("add r1, r0, data\ndata:", 0x1233fffc)
+            .unwrap();
+        assert_eq!(program.bytes, vec![0x00, 0x0a, 0x12, 0x34]);
+        assert_eq!(program.labels["data"], 0x12340000);
     }
 
     #[test]
