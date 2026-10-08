@@ -1,21 +1,27 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context as _, Result};
 
 use sleigh_rs::execution::{
-    Assignment, Binary, Block, BlockId, Build, CpuBranch, Export, Expr, ExprElement, ExprValue,
-    LocalGoto, Statement, UserCall, VariableId,
+    Assignment, Binary, Block, BlockId, Build, CpuBranch, DynamicValueType, Export, Expr,
+    ExprElement, ExprValue, LocalGoto, Statement, UserCall, VariableId,
 };
-use sleigh_rs::{user_function::UserFunction, Sleigh, SpaceId, TableId, TokenFieldId};
+use sleigh_rs::{
+    user_function::UserFunction, AttachVarnodeId, Sleigh, SpaceId, TableId, TokenFieldId,
+};
 
 use crate::disassembler::{Context, DisassembledTable, Disassembler};
 use crate::space::{HashSpace, MemoryRegion};
 use crate::value::{Address, Ref, Value, Var};
 
+/// Bytes fetched per step when the instruction length is unbounded (recursive patterns)
+const FALLBACK_INSTRUCTION_LEN: usize = 16;
+
 pub struct Cpu<'sleigh> {
     pub sleigh: &'sleigh Sleigh,
     pub disassembler: Disassembler<'sleigh>,
     pub state: State,
+    pub max_instruction_len: usize,
 }
 
 impl<'sleigh> std::ops::Deref for Cpu<'sleigh> {
@@ -28,15 +34,21 @@ impl<'sleigh> std::ops::Deref for Cpu<'sleigh> {
 
 impl<'sleigh> Cpu<'sleigh> {
     pub fn new(sleigh: &'sleigh Sleigh, state: State) -> Self {
+        let max_instruction_len = sleigh
+            .table(sleigh.instruction_table())
+            .pattern_len
+            .max()
+            .map_or(FALLBACK_INSTRUCTION_LEN, |len| len as usize);
         Self {
             sleigh,
             disassembler: Disassembler::new(sleigh),
             state,
+            max_instruction_len,
         }
     }
 
     pub fn step(&mut self) -> Result<()> {
-        let mut instruction_bytes = [0u8; 4];
+        let mut instruction_bytes = vec![0u8; self.max_instruction_len];
         self.fetch_instruction(&mut instruction_bytes)?;
 
         let instruction =
@@ -127,6 +139,7 @@ impl State {
 pub struct TableExecutor<'st> {
     table: &'st DisassembledTable<'st>,
     variables: HashMap<VariableId, Value>,
+    built: HashSet<TableId>,
     exports: HashMap<TableId, Value>,
     export: Option<Value>,
 }
@@ -141,26 +154,76 @@ impl<'st> TableExecutor<'st> {
         Self {
             table,
             variables: HashMap::new(),
+            built: HashSet::new(),
             exports: HashMap::new(),
             export: None,
         }
     }
 
     pub fn execute(&mut self, state: &mut State) -> Result<(Option<Value>, u64)> {
+        let branch = self.run(state)?;
+        Ok((self.export, branch.unwrap_or(self.table.inst_next)))
+    }
+
+    /// Run the constructor's semantics, returning the destination if it branched
+    fn run(&mut self, state: &mut State) -> Result<Option<u64>> {
         log::trace!("Executing table {}", self.table.table.name());
 
-        if let Some(execution) = &self.table.constructor.execution {
-            let mut next_block = Some(execution.entry_block);
-            while let Some(block_id) = next_block.take() {
-                match self.execute_block(state, execution.block(block_id))? {
-                    ControlFlow::Goto(block_id) => next_block = block_id,
-                    ControlFlow::Branch(pc) => return Ok((self.export, pc)),
-                };
-            }
-        } else {
+        let Some(execution) = &self.table.constructor.execution else {
             log::warn!("Constructor has no execution(check sleigh-rs!?)");
+            return Ok(None);
+        };
+
+        // Subtables without an explicit `build` are built before the constructor's own semantics
+        let explicit_builds = execution
+            .blocks()
+            .iter()
+            .flat_map(|block| block.statements.iter())
+            .filter_map(|stmt| match stmt {
+                Statement::Build(build) => Some(build.table),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        for pattern_block in self.table.constructor.pattern.blocks() {
+            for produced_table in pattern_block.tables() {
+                if explicit_builds.contains(&produced_table.table)
+                    || !self.table.tables.contains_key(&produced_table.table)
+                {
+                    continue;
+                }
+                if let Some(pc) = self.build_table(state, produced_table.table)? {
+                    return Ok(Some(pc));
+                }
+            }
         }
-        Ok((self.export, self.table.inst_next))
+
+        let mut next_block = Some(execution.entry_block);
+        while let Some(block_id) = next_block.take() {
+            match self.execute_block(state, execution.block(block_id))? {
+                ControlFlow::Goto(block_id) => next_block = block_id,
+                ControlFlow::Branch(pc) => return Ok(Some(pc)),
+            };
+        }
+        Ok(None)
+    }
+
+    /// Run a subtable's semantics once and record its export, returning the destination if it
+    /// branched
+    pub fn build_table(&mut self, state: &mut State, table_id: TableId) -> Result<Option<u64>> {
+        if !self.built.insert(table_id) {
+            return Ok(None);
+        }
+        let table = self
+            .table
+            .tables
+            .get(&table_id)
+            .context("build of a table that is not an operand")?;
+        let mut executor = TableExecutor::new(table);
+        let branch = executor.run(state)?;
+        if let Some(export) = executor.export {
+            self.exports.insert(table_id, export);
+        }
+        Ok(branch)
     }
 
     pub fn execute_block(&mut self, state: &mut State, block: &Block) -> Result<ControlFlow> {
@@ -183,7 +246,7 @@ impl<'st> TableExecutor<'st> {
             Statement::CpuBranch(cpu_branch) => return self.execute_cpu_branch(state, cpu_branch),
             Statement::LocalGoto(local_goto) => return self.execute_local_goto(state, local_goto),
             Statement::UserCall(user_call) => self.execute_user_call(state, user_call)?,
-            Statement::Build(build) => self.execute_build(state, build)?,
+            Statement::Build(build) => return self.execute_build(state, build),
             Statement::Declare(variable_id) => self.execute_declare(state, *variable_id)?,
             Statement::Assignment(assignment) => self.execute_assignment(state, assignment)?,
         };
@@ -222,22 +285,19 @@ impl<'st> TableExecutor<'st> {
             Export::Table {
                 location: _,
                 table_id,
-            } => self.get_table_export(state, *table_id)?,
+            } => self.get_table_export(*table_id)?,
         };
         self.export = Some(export_value);
         Ok(())
     }
 
-    pub fn get_table_export(&self, state: &mut State, table_id: TableId) -> Result<Value> {
+    pub fn get_table_export(&self, table_id: TableId) -> Result<Value> {
         if let Some(table_export_value) = self.exports.get(&table_id) {
             Ok(*table_export_value)
+        } else if self.built.contains(&table_id) {
+            bail!("table did not export a value")
         } else {
-            let table = self.table.tables.get(&table_id).unwrap();
-            if let (Some(export_value), _) = TableExecutor::new(table).execute(state)? {
-                Ok(export_value)
-            } else {
-                bail!("table did not export a value")
-            }
+            bail!("table used before it was built")
         }
     }
 
@@ -289,9 +349,15 @@ impl<'st> TableExecutor<'st> {
         Ok(())
     }
 
-    pub fn execute_build(&self, _state: &mut State, build: &Build) -> Result<()> {
+    pub fn execute_build(
+        &mut self,
+        state: &mut State,
+        build: &Build,
+    ) -> Result<Option<ControlFlow>> {
         log::trace!("BUILD {build:?}");
-        todo!()
+        Ok(self
+            .build_table(state, build.table)?
+            .map(ControlFlow::Branch))
     }
 
     pub fn execute_declare(&self, _state: &mut State, variable_id: VariableId) -> Result<()> {
@@ -313,7 +379,17 @@ impl<'st> TableExecutor<'st> {
                     ))
                 }
                 sleigh_rs::execution::AssignmentWriteVariable::Bitrange(_) => todo!(),
-                sleigh_rs::execution::AssignmentWriteVariable::DynVarnode { .. } => todo!(),
+                sleigh_rs::execution::AssignmentWriteVariable::DynVarnode {
+                    value_id,
+                    attach_id,
+                } => match value_id {
+                    DynamicValueType::TokenField(token_field_id) => self
+                        .get_attach_varnode(*attach_id, *token_field_id)?
+                        .to_var(),
+                    DynamicValueType::Context(_context_id) => {
+                        bail!("AssignmentWriteVariable {:?} not implemented", value)
+                    }
+                },
                 sleigh_rs::execution::AssignmentWriteVariable::Variable(variable_id) => {
                     Var::Local(*variable_id)
                 }
@@ -330,7 +406,7 @@ impl<'st> TableExecutor<'st> {
                 table_id,
                 op: _,
                 size: _,
-            } => self.get_table_export(state, *table_id)?.to_var(),
+            } => self.get_table_export(*table_id)?.to_var(),
         };
         match var {
             Var::Ref(referance) => {
@@ -371,7 +447,7 @@ impl<'st> TableExecutor<'st> {
                             op => bail!(format!("Unimplemented ExprUnaryOp {:?}", op)),
                         }
                     }
-                    ExprElement::Value { value, .. } => self.evaluate_expr_value(state, value)?,
+                    ExprElement::Value { value, .. } => self.evaluate_expr_value(value)?,
                     ExprElement::UserCall(user_call) => {
                         self.evaluate_user_call(state, user_call)?
                     }
@@ -407,7 +483,7 @@ impl<'st> TableExecutor<'st> {
         })
     }
 
-    pub fn evaluate_expr_value(&self, state: &mut State, expr_value: &ExprValue) -> Result<Value> {
+    pub fn evaluate_expr_value(&self, expr_value: &ExprValue) -> Result<Value> {
         Ok(match expr_value {
             ExprValue::Int(expr_number) => match expr_number.number {
                 sleigh_rs::Number::Positive(x) => Value::Int(x),
@@ -429,7 +505,7 @@ impl<'st> TableExecutor<'st> {
             }
             //ExprValue::Context(expr_context) => todo!(),
             //ExprValue::Bitrange(expr_bitrange) => todo!(),
-            ExprValue::Table(table_id) => self.get_table_export(state, *table_id)?,
+            ExprValue::Table(table_id) => self.get_table_export(*table_id)?,
             ExprValue::DisVar(expr_dis_var) => Value::Int(
                 self.table
                     .variables
@@ -442,6 +518,14 @@ impl<'st> TableExecutor<'st> {
                 .get(variable_id)
                 .cloned()
                 .context("Execution var undefined")?,
+            ExprValue::VarnodeDynamic(varnode_dynamic) => match varnode_dynamic.attach_value {
+                DynamicValueType::TokenField(token_field_id) => {
+                    self.get_attach_varnode(varnode_dynamic.attach_id, token_field_id)?
+                }
+                DynamicValueType::Context(_context_id) => {
+                    bail!("ExprValue {:?} not implemented", expr_value)
+                }
+            },
             expr_value => bail!("ExprValue {:?} not implemented", expr_value),
         })
     }
@@ -458,20 +542,29 @@ impl<'st> TableExecutor<'st> {
                 Value::Int(*token_field_value as u64)
             }
             sleigh_rs::token::TokenFieldAttach::Varnode(attach_varnode_id) => {
-                let attach_varnode = self.table.disassembler.attach_varnode(attach_varnode_id);
-                let varnode_id = attach_varnode
-                    .find_value(*token_field_value as usize)
-                    .context("Could not find attach varnode value")?;
-                let varnode = self.table.disassembler.varnode(varnode_id);
-                Value::Ref(Ref(
-                    varnode.space,
-                    varnode.len_bytes.get() as usize,
-                    Address(varnode.address),
-                ))
+                self.get_attach_varnode(attach_varnode_id, id)?
             }
             sleigh_rs::token::TokenFieldAttach::Literal(_attach_literal_id) => todo!(),
             sleigh_rs::token::TokenFieldAttach::Number(_print_base, _attach_number_id) => todo!(),
         })
+    }
+
+    pub fn get_attach_varnode(
+        &self,
+        attach_id: AttachVarnodeId,
+        token_field_id: TokenFieldId,
+    ) -> Result<Value> {
+        let token_field_value = self
+            .table
+            .token_fields
+            .get(&token_field_id)
+            .context("Could not get token field")?;
+        let attach_varnode = self.table.disassembler.attach_varnode(attach_id);
+        let varnode_id = attach_varnode
+            .find_value(*token_field_value as usize)
+            .context("Could not find attach varnode value")?;
+        let varnode = self.table.disassembler.varnode(varnode_id);
+        Ok(Value::Ref(varnode.into()))
     }
 
     pub fn evaluate_user_call(&self, state: &mut State, user_call: &UserCall) -> Result<Value> {
