@@ -149,7 +149,7 @@ fn main() -> Result<()> {
     let mut memory = MappedSpace::new();
     for file_map in args.file_mappings {
         let file = File::open(&file_map.path)
-            .context(format!("Could not open file: {:?}", &file_map.path))?;
+            .context(format!("Could not open file: {:?}", file_map.path))?;
         let size = file.metadata()?.len();
         memory.add_mapping(Address(file_map.address), size, Box::new(FileRegion(file)))
     }

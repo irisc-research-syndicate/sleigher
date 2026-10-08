@@ -530,10 +530,8 @@ mod test {
     fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>)]) {
         let _ = env_logger::try_init();
         log::info!("Loading slaspec: {:?}", slaspec_path.as_ref());
-        let slaspec = sleigh_rs::file_to_sleigh(slaspec_path.as_ref()).expect(&format!(
-            "Could not load slaspec: {:?}",
-            slaspec_path.as_ref()
-        ));
+        let slaspec = sleigh_rs::file_to_sleigh(slaspec_path.as_ref())
+            .unwrap_or_else(|_| panic!("Could not load slaspec: {:?}", slaspec_path.as_ref()));
         let disasm = Disassembler::new(&slaspec);
         for (expected_output, input_code) in tests.iter() {
             log::info!(
@@ -542,7 +540,7 @@ mod test {
                 expected_output
             );
             let instruction = disasm
-                .disassemble(0x00000000, Context, &input_code)
+                .disassemble(0x00000000, Context, input_code)
                 .expect("Could not disassemble code");
             let actual_output = format!("{}", instruction);
             log::info!("Produced disassembly: {:?}", actual_output);

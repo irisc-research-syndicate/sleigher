@@ -1086,10 +1086,8 @@ mod test {
     fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>)]) {
         let _ = env_logger::try_init();
         log::info!("Loading slaspec: {:?}", slaspec_path.as_ref());
-        let slaspec = sleigh_rs::file_to_sleigh(slaspec_path.as_ref()).expect(&format!(
-            "Could not load slaspec: {:?}",
-            slaspec_path.as_ref()
-        ));
+        let slaspec = sleigh_rs::file_to_sleigh(slaspec_path.as_ref())
+            .unwrap_or_else(|_| panic!("Could not load slaspec: {:?}", slaspec_path.as_ref()));
         let assembler = InstructionAssembler::new(slaspec);
 
         for (input, expected_bytes) in tests.iter() {
