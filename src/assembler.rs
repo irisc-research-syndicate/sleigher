@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use sleigh_rs::disassembly::{
@@ -11,7 +12,7 @@ use sleigh_rs::display::DisplayElement;
 use sleigh_rs::meaning::AttachVarnode;
 use sleigh_rs::pattern::{CmpOp, Verification};
 use sleigh_rs::table::{Constructor, Table};
-use sleigh_rs::{token::TokenFieldAttach, Endian, Number, Sleigh, TokenFieldId, TokenId};
+use sleigh_rs::{token::TokenFieldAttach, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
 
 use anyhow::{anyhow, bail};
@@ -149,14 +150,26 @@ pub fn parse_identifier(s: &str) -> Option<(&str, &str)> {
     Some((&s[len..], &s[..len]))
 }
 
+/// A constructor matched while assembling
+#[derive(Debug, Clone)]
+pub struct Instance<'asm> {
+    pub constructor: &'asm Constructor,
+    /// The parent instance and the index of its pattern block that holds this subtable
+    pub parent: Option<(usize, usize)>,
+}
+
+/// A token occurrence: constructor instance, pattern block in that constructor, token index
+pub type TokenKey = (usize, usize, usize);
+
+static NEXT_INSTANCE: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Clone)]
 pub struct Constraints<'asm> {
     pub asm: &'asm InstructionAssembler,
 
-    pub token_order: Vec<TokenId>,
-
-    pub tokens: HashMap<TokenId, BV<'asm>>,
-    pub fields: HashMap<TokenFieldId, BV<'asm>>,
+    pub instances: BTreeMap<usize, Instance<'asm>>,
+    pub tokens: BTreeMap<TokenKey, BV<'asm>>,
+    pub fields: HashMap<(usize, TokenFieldId), BV<'asm>>,
 
     pub eqs: HashSet<Bool<'asm>>,
 
@@ -171,8 +184,8 @@ impl<'asm> Constraints<'asm> {
     pub fn new(asm: &'asm InstructionAssembler, inst_start: u64, labels: &'asm Labels) -> Self {
         Self {
             asm,
-            token_order: Vec::new(),
-            tokens: HashMap::new(),
+            instances: BTreeMap::new(),
+            tokens: BTreeMap::new(),
             fields: HashMap::new(),
             eqs: HashSet::new(),
             inst_start,
@@ -194,32 +207,109 @@ impl<'asm> Constraints<'asm> {
         Some((s, value))
     }
 
-    /// Instruction length in bytes from the tokens used so far
-    pub fn len_bytes(&self) -> u64 {
-        self.token_order
+    pub fn new_instance(
+        &mut self,
+        constructor: &'asm Constructor,
+        parent: Option<(usize, usize)>,
+    ) -> usize {
+        let id = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        self.instances.insert(
+            id,
+            Instance {
+                constructor,
+                parent,
+            },
+        );
+        id
+    }
+
+    pub fn token(&mut self, key: TokenKey) -> BV<'asm> {
+        if let Some(bv) = self.tokens.get(&key) {
+            return bv.clone();
+        }
+        let token_id = TokenId(key.2);
+        let token = self.asm.token(token_id);
+        let bv = BV::fresh_const(
+            &self.asm.ctx,
+            token.name(),
+            8 * (token.len_bytes().get() as u32),
+        );
+
+        // Tie bytes shared with tokens already placed, when the offsets are known before the
+        // whole instruction is parsed. That keeps constraint checks while parsing precise;
+        // finalize ties the rest.
+        if let Some(offset) = self.token_offset(key) {
+            // The same token at the same offset is the same value
+            let same = self.tokens.iter().find(|(other_key, _)| {
+                other_key.2 == key.2 && self.token_offset(**other_key) == Some(offset)
+            });
+            if let Some((_, same_bv)) = same {
+                let same_bv = same_bv.clone();
+                self.tokens.insert(key, same_bv.clone());
+                return same_bv;
+            }
+            let len = token.len_bytes().get();
+            let overlapping = self
+                .tokens
+                .iter()
+                .filter_map(|(other_key, other_bv)| {
+                    Some((
+                        self.token_offset(*other_key)?,
+                        TokenId(other_key.2),
+                        other_bv,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for (other_offset, other_id, other_bv) in overlapping {
+                let other_len = self.asm.token(other_id).len_bytes().get();
+                for position in
+                    offset.max(other_offset)..(offset + len).min(other_offset + other_len)
+                {
+                    let byte = self.token_byte(token_id, &bv, position - offset);
+                    let other_byte = self.token_byte(other_id, other_bv, position - other_offset);
+                    self.eqs.insert(byte._eq(&other_byte));
+                }
+            }
+        }
+
+        self.tokens.insert(key, bv.clone());
+        bv
+    }
+
+    /// Offset of an instance in the instruction, if every block before it has a fixed length
+    fn instance_offset(&self, id: usize) -> Option<u64> {
+        match self.instances[&id].parent {
+            None => Some(0),
+            Some((parent, block)) => {
+                Some(self.instance_offset(parent)? + self.fixed_offset(parent, block)?)
+            }
+        }
+    }
+
+    /// Offset of a block in its instance, if every block before it has a fixed length
+    fn fixed_offset(&self, id: usize, block: usize) -> Option<u64> {
+        self.instances[&id].constructor.pattern.blocks()[..block]
             .iter()
-            .map(|token_id| self.asm.token(*token_id).len_bytes().get())
+            .map(|block| block.len().single_len())
             .sum()
     }
 
-    pub fn token(&mut self, token_id: TokenId) -> BV<'asm> {
-        let token = self.asm.token(token_id);
-        let bv = self.tokens.entry(token_id).or_insert_with(|| {
-            self.token_order.push(token_id);
-            BV::fresh_const(
-                &self.asm.ctx,
-                token.name(),
-                8 * (token.len_bytes().get() as u32),
-            )
-        });
-        bv.clone()
+    fn token_offset(&self, key: TokenKey) -> Option<u64> {
+        Some(self.instance_offset(key.0)? + self.fixed_offset(key.0, key.1)?)
     }
 
-    pub fn token_field(&mut self, token_field_id: TokenFieldId, sz: Option<u32>) -> BV<'asm> {
+    /// A token field read from the token in `block` of constructor `instance`
+    pub fn token_field_at(
+        &mut self,
+        instance: usize,
+        block: usize,
+        token_field_id: TokenFieldId,
+        sz: Option<u32>,
+    ) -> BV<'asm> {
         let token_field = self.asm.sleigh.token_field(token_field_id);
         let field_bv = self
             .fields
-            .entry(token_field_id)
+            .entry((instance, token_field_id))
             .or_insert_with(|| {
                 let field_bv = BV::fresh_const(
                     &self.asm.ctx,
@@ -229,7 +319,7 @@ impl<'asm> Constraints<'asm> {
                 field_bv
             })
             .clone();
-        let token_bv = self.token(token_field.token);
+        let token_bv = self.token((instance, block, token_field.token.0));
         self.eq(token_bv
             .extract(
                 (token_field.bits.end().get() - 1) as u32,
@@ -260,20 +350,116 @@ impl<'asm> Constraints<'asm> {
     }
 
     pub fn merge(&mut self, other: Constraints<'asm>) {
-        for (field_id, field_bv) in other.fields.into_iter() {
-            if let Some(self_field_bv) = self.fields.get(&field_id) {
-                self.eqs.insert(field_bv._eq(self_field_bv));
-            } else {
-                self.fields.insert(field_id, field_bv);
-            }
-        }
-        self.eqs.extend(other.eqs);
+        self.instances.extend(other.instances);
         self.tokens.extend(other.tokens);
-        for token_id in other.token_order {
-            if !self.token_order.contains(&token_id) {
-                self.token_order.push(token_id);
+        self.fields.extend(other.fields);
+        self.eqs.extend(other.eqs);
+    }
+
+    fn root(&self) -> Option<usize> {
+        self.instances
+            .iter()
+            .find(|(_, instance)| instance.parent.is_none())
+            .map(|(id, _)| *id)
+    }
+
+    fn children(&self, id: usize, block: usize) -> Vec<usize> {
+        self.instances
+            .iter()
+            .filter(|(_, instance)| instance.parent == Some((id, block)))
+            .map(|(child, _)| *child)
+            .collect()
+    }
+
+    fn block_tokens(&self, id: usize, block: usize) -> Vec<(TokenId, &BV<'asm>)> {
+        self.tokens
+            .iter()
+            .filter(|((instance, token_block, _), _)| *instance == id && *token_block == block)
+            .map(|((_, _, token_id), bv)| (TokenId(*token_id), bv))
+            .collect()
+    }
+
+    fn block_len(&self, id: usize, block: usize) -> u64 {
+        let pattern_block = &self.instances[&id].constructor.pattern.blocks()[block];
+        if let Some(len) = pattern_block.len().single_len() {
+            return len;
+        }
+        // Variable length: the longest of the block's tokens and the subtables chosen for it
+        let tokens = self
+            .block_tokens(id, block)
+            .into_iter()
+            .map(|(token_id, _)| self.asm.token(token_id).len_bytes().get());
+        let children = self
+            .children(id, block)
+            .into_iter()
+            .map(|child| self.instance_len(child));
+        tokens
+            .chain(children)
+            .max()
+            .unwrap_or(pattern_block.len().min())
+    }
+
+    fn instance_len(&self, id: usize) -> u64 {
+        let blocks = self.instances[&id].constructor.pattern.blocks().len();
+        (0..blocks).map(|block| self.block_len(id, block)).sum()
+    }
+
+    /// Instruction length in bytes
+    pub fn len_bytes(&self) -> u64 {
+        self.root().map_or(0, |root| self.instance_len(root))
+    }
+
+    /// Byte `index` of a token, in instruction order
+    fn token_byte(&self, token_id: TokenId, bv: &BV<'asm>, index: u64) -> BV<'asm> {
+        let token = self.asm.token(token_id);
+        let len = token.len_bytes().get();
+        let low = match token.endian() {
+            Endian::Big => 8 * (len - 1 - index),
+            Endian::Little => 8 * index,
+        } as u32;
+        bv.extract(low + 7, low)
+    }
+
+    /// Every token byte placed at each offset of the instruction
+    pub fn layout(&self) -> Vec<Vec<BV<'asm>>> {
+        let mut bytes = vec![vec![]; self.len_bytes() as usize];
+        if let Some(root) = self.root() {
+            self.place(root, 0, &mut bytes);
+        }
+        bytes
+    }
+
+    fn place(&self, id: usize, offset: u64, bytes: &mut Vec<Vec<BV<'asm>>>) {
+        let mut block_offset = offset;
+        let blocks = self.instances[&id].constructor.pattern.blocks().len();
+        for block in 0..blocks {
+            for (token_id, bv) in self.block_tokens(id, block) {
+                for index in 0..self.asm.token(token_id).len_bytes().get() {
+                    let position = (block_offset + index) as usize;
+                    if bytes.len() <= position {
+                        bytes.resize(position + 1, vec![]);
+                    }
+                    bytes[position].push(self.token_byte(token_id, bv, index));
+                }
+            }
+            for child in self.children(id, block) {
+                self.place(child, block_offset, bytes);
+            }
+            block_offset += self.block_len(id, block);
+        }
+    }
+
+    /// Once the whole instruction is parsed: token bytes at the same offset are the same
+    /// byte, and inst_next follows the instruction
+    pub fn finalize(&mut self) {
+        for byte in self.layout() {
+            for other in byte.iter().skip(1) {
+                self.eq(byte[0]._eq(other));
             }
         }
+        let inst_next = self.build_u64_const(self.inst_start + self.len_bytes(), 64);
+        let eq = self.inst_next._eq(&inst_next);
+        self.eq(eq);
     }
 
     pub fn solver(&self) -> z3::Solver<'asm> {
@@ -309,21 +495,18 @@ impl<'asm> Constraints<'asm> {
 
     /// Whether some instruction bytes satisfy both `self` and `other`
     pub fn same_encoding(&self, other: &Constraints<'asm>) -> bool {
-        if self.token_order.len() != other.token_order.len() {
+        let (self_layout, other_layout) = (self.layout(), other.layout());
+        if self_layout.len() != other_layout.len() {
             return false;
         }
         let solver = self.solver();
         for eq in other.eqs.iter() {
             solver.assert(eq);
         }
-        for (self_id, other_id) in self.token_order.iter().zip(other.token_order.iter()) {
-            let (self_token, other_token) = (self.asm.token(*self_id), self.asm.token(*other_id));
-            if self_token.len_bytes() != other_token.len_bytes()
-                || self_token.endian() != other_token.endian()
-            {
-                return false;
+        for (self_byte, other_byte) in self_layout.iter().zip(other_layout.iter()) {
+            if let (Some(self_byte), Some(other_byte)) = (self_byte.first(), other_byte.first()) {
+                solver.assert(&self_byte._eq(other_byte));
             }
-            solver.assert(&self.tokens[self_id]._eq(&other.tokens[other_id]));
         }
         solver.check() == z3::SatResult::Sat
     }
@@ -331,27 +514,20 @@ impl<'asm> Constraints<'asm> {
     pub fn to_bytes(&self) -> Option<Vec<u8>> {
         log::debug!("Generating instruction bytes");
         let model = self.model()?;
-        let mut instruction_bytes = vec![];
-        for token_id in self.token_order.iter() {
-            let token = self.asm.token(*token_id);
-            let token_bv = self.tokens.get(token_id)?;
-            let token_value = model.eval(token_bv, true)?.as_u64()?;
-            let token_length = token.len_bytes().get() as usize;
-
-            log::debug!("{}: {:#010X}/{}", token.name(), token_value, token_length);
-
-            instruction_bytes.extend(match token.endian() {
-                Endian::Little => token_value.to_le_bytes()[..token_length].to_vec(),
-                Endian::Big => token_value.to_be_bytes()[8 - token_length..].to_vec(),
-            });
-        }
-        Some(instruction_bytes)
+        self.layout()
+            .iter()
+            .map(|byte| match byte.first() {
+                Some(bv) => Some(model.eval(bv, true)?.as_u64()? as u8),
+                None => Some(0),
+            })
+            .collect()
     }
 }
 
 #[derive(Debug, Clone)]
 struct Variables<'asm> {
     constructor: &'asm Constructor,
+    instance: usize,
     constraints: Constraints<'asm>,
     variables: HashMap<VariableId, BV<'asm>>,
 }
@@ -371,12 +547,56 @@ impl<'asm> DerefMut for Variables<'asm> {
 }
 
 impl<'asm> Variables<'asm> {
-    pub fn new(constraints: Constraints<'asm>, constructor: &'asm Constructor) -> Self {
+    pub fn new(
+        mut constraints: Constraints<'asm>,
+        constructor: &'asm Constructor,
+        parent: Option<(usize, usize)>,
+    ) -> Self {
+        let instance = constraints.new_instance(constructor, parent);
         Self {
             constraints,
             constructor,
+            instance,
             variables: HashMap::new(),
         }
+    }
+
+    /// The pattern block of this constructor whose token holds the field
+    fn field_block(&self, token_field_id: TokenFieldId) -> usize {
+        let token_of = |field: TokenFieldId| self.asm.sleigh.token_field(field).token;
+        let token = token_of(token_field_id);
+        self.constructor
+            .pattern
+            .blocks()
+            .iter()
+            .position(|block| {
+                block
+                    .token_fields()
+                    .iter()
+                    .any(|produced| token_of(produced.field) == token)
+                    || block.verifications().iter().any(|verification| {
+                        matches!(verification, Verification::TokenFieldCheck { field, .. }
+                            if token_of(*field) == token)
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn token_field(&mut self, token_field_id: TokenFieldId, sz: Option<u32>) -> BV<'asm> {
+        let block = self.field_block(token_field_id);
+        let instance = self.instance;
+        self.constraints
+            .token_field_at(instance, block, token_field_id, sz)
+    }
+
+    /// The pattern block of this constructor that holds the subtable
+    fn table_block(&self, table_id: TableId) -> usize {
+        self.constructor
+            .pattern
+            .blocks()
+            .iter()
+            .position(|block| block.tables().iter().any(|table| table.table == table_id))
+            .unwrap_or(0)
     }
 
     pub fn variable(&mut self, variable_id: VariableId) -> BV<'asm> {
@@ -630,12 +850,10 @@ impl InstructionAssembler {
         labels: &'asm Labels,
     ) -> Parses<'a, Constraints<'asm>> {
         let constraints = Constraints::new(self, inst_start, labels);
-        self.assemble_table(self.table(self.instruction_table()), constraints, s)
+        self.assemble_table(self.table(self.instruction_table()), constraints, s, None)
             .into_iter()
             .filter_map(|(rest, mut candidate)| {
-                let inst_next = candidate.build_u64_const(inst_start + candidate.len_bytes(), 64);
-                let eq = candidate.inst_next._eq(&inst_next);
-                candidate.eq(eq);
+                candidate.finalize();
                 candidate.check().then_some((rest, candidate))
             })
             .collect()
@@ -646,11 +864,14 @@ impl InstructionAssembler {
         table: &'asm Table,
         constraints: Constraints<'asm>,
         s: &'a str,
+        parent: Option<(usize, usize)>,
     ) -> Parses<'a, Constraints<'asm>> {
         table
             .constructors()
             .iter()
-            .flat_map(|constructor| self.assemble_constructor(constructor, constraints.clone(), s))
+            .flat_map(|constructor| {
+                self.assemble_constructor(constructor, constraints.clone(), s, parent)
+            })
             .collect()
     }
 
@@ -659,6 +880,7 @@ impl InstructionAssembler {
         constructor: &'asm Constructor,
         constraints: Constraints<'asm>,
         s: &'a str,
+        parent: Option<(usize, usize)>,
     ) -> Parses<'a, Constraints<'asm>> {
         let s = match constructor.display.mneumonic.as_ref() {
             Some(mneumonic) => match parse_literal(mneumonic, s) {
@@ -671,7 +893,7 @@ impl InstructionAssembler {
             None => s,
         };
 
-        let mut variables = Variables::new(constraints, constructor);
+        let mut variables = Variables::new(constraints, constructor, parent);
 
         for block in constructor.pattern.blocks() {
             for verification in block.verifications() {
@@ -803,7 +1025,8 @@ impl InstructionAssembler {
             DisplayElement::Table(table_id) => {
                 let table = self.table(*table_id);
                 log::trace!("TABLE: {:?}/{:?} {:?}", table.name(), table_id, s);
-                self.assemble_table(table, variables.constraints.clone(), s)
+                let parent = Some((variables.instance, variables.table_block(*table_id)));
+                self.assemble_table(table, variables.constraints.clone(), s, parent)
                     .into_iter()
                     .map(|(s, table_constraints)| {
                         let mut variables = variables.clone();
@@ -1370,6 +1593,35 @@ mod test {
     fn cisc_roundtrip() {
         let asm = load("examples/cisc.slaspec");
         assert_roundtrips(&asm, 6, 2000);
+    }
+
+    #[test]
+    fn layout_operands_out_of_byte_order() {
+        let asm = load("examples/layout.slaspec");
+        // imm8 is displayed before reg, but its byte comes after
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("ldi 0x5, r2", vec![0x01, 0x02, 0x05]),
+        ]);
+    }
+
+    #[test]
+    fn layout_repeated_token() {
+        let asm = load("examples/layout.slaspec");
+        // REG and OPND both use regbyte, at different offsets
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("mov r1, r2", vec![0x02, 0x01, 0x02]),
+            ("mov r1, #0x7", vec![0x02, 0x01, 0x80, 0x07]),
+            ("add r2, r3", vec![0x03, 0x02, 0x03]),
+            ("add #0x7, r3", vec![0x03, 0x80, 0x07, 0x03]),
+        ]);
+    }
+
+    #[test]
+    fn layout_roundtrip() {
+        let asm = load("examples/layout.slaspec");
+        assert_roundtrips(&asm, 4, 5000);
     }
 
     #[test]

@@ -75,7 +75,6 @@ pub fn main() -> Result<()> {
     let labels = Labels::new();
     let constraints = assembler.assemble_instruction_at(instruction, args.base, &labels)?;
 
-    println!("token_order: {:?}", constraints.token_order);
     println!("tokens: {:?}", constraints.tokens);
     println!("fields: {:#?}", constraints.fields.values());
     println!("eqs: {:#?}", constraints.eqs);

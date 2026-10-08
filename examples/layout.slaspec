@@ -1,0 +1,42 @@
+# Instruction layouts that are hard to assemble:
+# - operands displayed in a different order than their bytes (ldi)
+# - the same token type used more than once in one instruction (mov, add)
+# - an operand placed after a variable length operand (add)
+#
+#   [opcode] [operand...]
+#
+# operand byte: mode=(7) reg=(0,1)
+#   mode=0: reg       register
+#   mode=1: #imm8     immediate in the following byte
+
+define endian=big;
+define alignment=1;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [ r0 r1 r2 r3 ];
+
+define token opbyte(8)
+    opcode=(0, 7)
+;
+
+define token regbyte(8)
+    mode=(7, 7)
+    reg=(0, 1)
+;
+
+define token immbyte(8)
+    imm8=(0, 7)
+;
+
+attach variables [ reg ] [ r0 r1 r2 r3 ];
+
+REG: reg is mode=0 & reg { export reg; }
+
+OPND: reg is mode=0 & reg { export reg; }
+OPND: "#"^imm8 is mode=1; imm8 { export *[const]:4 imm8; }
+
+:ldi imm8, reg is opcode=0x01; reg; imm8 { reg = imm8; }
+:mov REG, OPND is opcode=0x02; REG; OPND { REG = OPND; }
+:add OPND, REG is opcode=0x03; OPND; REG { REG = REG + OPND; }

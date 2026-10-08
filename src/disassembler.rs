@@ -578,4 +578,16 @@ mod test {
             ("jnz 0x0", vec![0x12, 0xfe]),
         ]);
     }
+
+    #[test]
+    fn test_layout_disassemble() {
+        #[rustfmt::skip]
+        run_tests("examples/layout.slaspec", &[
+            ("ldi 0x5, r2", vec![0x01, 0x02, 0x05]),
+            ("mov r1, r2", vec![0x02, 0x01, 0x02]),
+            ("mov r1, #0x7", vec![0x02, 0x01, 0x80, 0x07]),
+            ("add r2, r3", vec![0x03, 0x02, 0x03]),
+            ("add #0x7, r3", vec![0x03, 0x80, 0x07, 0x03]),
+        ]);
+    }
 }
