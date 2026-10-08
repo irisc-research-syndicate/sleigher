@@ -577,3 +577,289 @@ impl<'st> TableExecutor<'st> {
         state.user_call(user_function, params)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::path::Path;
+
+    const BASE: u64 = 0x1000;
+
+    type Regs<'a> = &'a [(&'a str, u64)];
+    type Mem<'a> = &'a [(u64, u32)];
+    /// (asm, bytes, registers before, memory before, registers after, memory after)
+    type Case<'a> = (&'a str, Vec<u8>, Regs<'a>, Mem<'a>, Regs<'a>, Mem<'a>);
+
+    fn load(slaspec_path: impl AsRef<Path>) -> Sleigh {
+        let _ = env_logger::try_init();
+        sleigh_rs::file_to_sleigh(slaspec_path.as_ref()).unwrap_or_else(|_| {
+            panic!("Could not load slaspec: {:?}", slaspec_path.as_ref());
+        })
+    }
+
+    fn new_cpu<'sleigh>(sleigh: &'sleigh Sleigh, program: &[u8]) -> Cpu<'sleigh> {
+        let mut state = State::new();
+        state.pc = BASE;
+        let program_ref = Ref(sleigh.default_space(), program.len(), Address(BASE));
+        state.write_ref(program_ref, program).unwrap();
+        Cpu::new(sleigh, state)
+    }
+
+    fn reg_ref(cpu: &Cpu, name: &str) -> Ref {
+        cpu.varnodes()
+            .iter()
+            .find(|varnode| varnode.name() == name)
+            .unwrap_or_else(|| panic!("No register named {:?}", name))
+            .into()
+    }
+
+    fn set_reg(cpu: &mut Cpu, name: &str, value: u64) {
+        let reg = reg_ref(cpu, name);
+        cpu.state.write_ref(reg, &value.to_be_bytes()).unwrap();
+    }
+
+    fn get_reg(cpu: &mut Cpu, name: &str) -> u64 {
+        let reg = reg_ref(cpu, name);
+        let mut bytes = [0u8; 8];
+        cpu.state.read_ref(reg, &mut bytes).unwrap();
+        u64::from_be_bytes(bytes)
+    }
+
+    fn set_mem(cpu: &mut Cpu, address: u64, value: u32) {
+        let mem = Ref(cpu.default_space(), 4, Address(address));
+        cpu.state.write_ref(mem, &value.to_be_bytes()).unwrap();
+    }
+
+    fn get_mem(cpu: &mut Cpu, address: u64) -> u32 {
+        let mem = Ref(cpu.default_space(), 4, Address(address));
+        cpu.state.read_ref_u32be(mem).unwrap()
+    }
+
+    /// Execute each instruction once from `BASE` and compare registers, memory and pc.
+    /// `pc` may be listed as an expected register, otherwise it must point past the instruction.
+    /// The instruction bytes must also disassemble to `asm`, which keeps the encodings honest.
+    fn assert_executes(sleigh: &Sleigh, tests: &[Case]) {
+        let mut failures = vec![];
+        for (asm, program, regs_in, mem_in, regs_out, mem_out) in tests.iter() {
+            let mut cpu = new_cpu(sleigh, program);
+            match cpu.disassembler.disassemble(BASE, Context, program) {
+                Ok(instruction) if instruction.to_string() == *asm => {}
+                result => failures.push(format!(
+                    "{:?}: disassembles as {:?}",
+                    asm,
+                    result.map(|instruction| instruction.to_string())
+                )),
+            }
+            for (name, value) in regs_in.iter() {
+                set_reg(&mut cpu, name, *value);
+            }
+            for (address, value) in mem_in.iter() {
+                set_mem(&mut cpu, *address, *value);
+            }
+
+            if let Err(err) = cpu.step() {
+                failures.push(format!("{:?}: step failed: {:#}", asm, err));
+                continue;
+            }
+
+            let mut expected_pc = BASE + program.len() as u64;
+            for (name, expected) in regs_out.iter() {
+                if *name == "pc" {
+                    expected_pc = *expected;
+                    continue;
+                }
+                let actual = get_reg(&mut cpu, name);
+                if actual != *expected {
+                    failures.push(format!(
+                        "{:?}: {} = {:#x}, expected {:#x}",
+                        asm, name, actual, expected
+                    ));
+                }
+            }
+            if cpu.state.pc != expected_pc {
+                failures.push(format!(
+                    "{:?}: pc = {:#x}, expected {:#x}",
+                    asm, cpu.state.pc, expected_pc
+                ));
+            }
+            for (address, expected) in mem_out.iter() {
+                let actual = get_mem(&mut cpu, *address);
+                if actual != *expected {
+                    failures.push(format!(
+                        "{:?}: [{:#x}] = {:#x}, expected {:#x}",
+                        asm, address, actual, expected
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn risc_immediate_operands() {
+        let sleigh = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("add r1, r2, 0x1234", vec![0x01, 0x08, 0x12, 0x34], &[("r2", 0x10)], &[], &[("r1", 0x1244), ("r2", 0x10)], &[]),
+            ("sub r1, r2, 0x1", vec![0x09, 0x08, 0x00, 0x01], &[("r2", 0)], &[], &[("r1", 0xffffffff)], &[]),
+            ("or r3, r4, 0xff00", vec![0x12, 0x18, 0xff, 0x00], &[("r4", 0x00ff)], &[], &[("r3", 0xffff)], &[]),
+            ("and r3, r4, 0xff", vec![0x22, 0x18, 0x00, 0xff], &[("r4", 0x1234)], &[], &[("r3", 0x34)], &[]),
+            ("xor r3, r4, 0xffff", vec![0x2a, 0x18, 0xff, 0xff], &[("r4", 0x1234)], &[], &[("r3", 0xedcb)], &[]),
+            ("add r1, r2, -0x1", vec![0x01, 0x0c, 0xff, 0xff], &[("r2", 0x10)], &[], &[("r1", 0xf)], &[]),
+            ("add r1, r2, 0x12340000", vec![0x01, 0x0a, 0x12, 0x34], &[("r2", 1)], &[], &[("r1", 0x12340001)], &[]),
+            ("add r1, r2, 0x123400", vec![0x01, 0x0e, 0x12, 0x34], &[("r2", 0)], &[], &[("r1", 0x123400)], &[]),
+            ("add r1, r2, -0x10000", vec![0x01, 0x0e, 0xff, 0x00], &[("r2", 0x20000)], &[], &[("r1", 0x10000)], &[]),
+            ("unk.0x7 r1, r2, 0x1", vec![0x39, 0x08, 0x00, 0x01], &[("r1", 0x99), ("r2", 0x10)], &[], &[("r1", 0x99), ("r2", 0x10)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn risc_register_operands() {
+        let sleigh = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("add r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x00], &[("r2", 0xfffffffe), ("r3", 3)], &[], &[("r1", 1)], &[]),
+            ("sub r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x01], &[("r2", 3), ("r3", 5)], &[], &[("r1", 0xfffffffe)], &[]),
+            ("or r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x02], &[("r2", 0xff00ff00), ("r3", 0x0ff00ff0)], &[], &[("r1", 0xfff0fff0)], &[]),
+            ("and r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x03], &[("r2", 0xff00ff00), ("r3", 0x0ff00ff0)], &[], &[("r1", 0x0f000f00)], &[]),
+            ("xor r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x04], &[("r2", 0xff00ff00), ("r3", 0x0ff00ff0)], &[], &[("r1", 0xf0f0f0f0)], &[]),
+            ("xor r1, r1, r1", vec![0xf8, 0x88, 0x80, 0x04], &[("r1", 0x1234)], &[], &[("r1", 0)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn vliw_bundles() {
+        let sleigh = load("examples/vliw.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("{ add r1, r2, 0x5 }", vec![0xc8, 0x04, 0x40, 0x00, 0x00, 0x00, 0x00, 0x05], &[("r2", 10)], &[], &[("r1", 15)], &[]),
+            ("{ sub r1, r2, -0x1 }", vec![0xc8, 0x84, 0x40, 0x00, 0xff, 0xff, 0xff, 0xff], &[("r2", 10)], &[], &[("r1", 11)], &[]),
+            ("{ add r1, r2, 0x1 ; sub r3, r4, 0x1 }", vec![0x88, 0x04, 0x51, 0x19, 0x00, 0x00, 0x00, 0x01], &[("r2", 1), ("r4", 1)], &[], &[("r1", 2), ("r3", 0)], &[]),
+            ("{ add r1, r2, 0x7 ; sub r3, r4, 0 }", vec![0xa8, 0x04, 0x51, 0x19, 0x00, 0x00, 0x00, 0x07], &[("r2", 1), ("r4", 5)], &[], &[("r1", 8), ("r3", 5)], &[]),
+            ("{ add r1, r1, 0x1 ; add r2, r2, 0x1 ; add r3, r3, 0 }", vec![0x58, 0x04, 0x30, 0x10, 0xa0, 0x31, 0x80, 0x01], &[("r1", 1), ("r2", 2), ("r3", 3)], &[], &[("r1", 2), ("r2", 3), ("r3", 3)], &[]),
+            ("{ add r1, r2, 0 ; xor r3, r3, 0 ; or r4, r5, 0 ; mov r6, r7 }", vec![0x08, 0x04, 0x54, 0x18, 0xe6, 0x42, 0xc0, 0xc7], &[("r2", 0x11), ("r3", 0x22), ("r5", 0x55), ("r7", 0x77)], &[], &[("r1", 0x11), ("r3", 0x22), ("r4", 0x55), ("r6", 0x77)], &[]),
+            ("{ unk.0x0 r0, r0, 0 ; unk.0x0 r0, r0, 0 ; unk.0x0 r0, r0, 0 ; add r8, r9 }", vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x45, 0x09], &[("r8", 1), ("r9", 2)], &[], &[("r8", 3)], &[]),
+            ("{ unk.0x0 r0, r0, 0 ; unk.0x0 r0, r0, 0 ; unk.0x0 r0, r0, 0 ; sub r8, r9 }", vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x49, 0x09], &[("r8", 5), ("r9", 2)], &[], &[("r8", 3)], &[]),
+            ("{ unk.0x0 r1, r2, 0x5 }", vec![0xc0, 0x04, 0x40, 0x00, 0x00, 0x00, 0x00, 0x05], &[("r1", 0x99), ("r2", 10)], &[], &[("r1", 0x99)], &[]),
+            ("{ add r1, r1, 0x1 ; add r2, r1, 0x1 }", vec![0x88, 0x04, 0x30, 0x10, 0x40, 0x00, 0x00, 0x01], &[("r1", 1)], &[], &[("r1", 2), ("r2", 3)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn cisc_register_operands() {
+        let sleigh = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("nop", vec![0x00], &[("r1", 5)], &[], &[("r1", 5)], &[]),
+            ("mov r1, r2", vec![0x01, 0x0a], &[("r2", 0x12345678)], &[], &[("r1", 0x12345678), ("r2", 0x12345678)], &[]),
+            ("mov sp, r0", vec![0x01, 0x38], &[("r0", 0x8000)], &[], &[("sp", 0x8000)], &[]),
+            ("add r1, r2", vec![0x02, 0x0a], &[("r1", 3), ("r2", 4), ("ZF", 1)], &[], &[("r1", 7), ("ZF", 0)], &[]),
+            ("add r1, r2", vec![0x02, 0x0a], &[("r1", 0xffffffff), ("r2", 1)], &[], &[("r1", 0), ("ZF", 1)], &[]),
+            ("sub r1, r2", vec![0x03, 0x0a], &[("r1", 10), ("r2", 3)], &[], &[("r1", 7), ("ZF", 0)], &[]),
+            ("sub r1, r2", vec![0x03, 0x0a], &[("r1", 0), ("r2", 1)], &[], &[("r1", 0xffffffff), ("ZF", 0)], &[]),
+            ("sub r1, r1", vec![0x03, 0x09], &[("r1", 42)], &[], &[("r1", 0), ("ZF", 1)], &[]),
+            ("and r1, r2", vec![0x04, 0x0a], &[("r1", 0xff00ff00), ("r2", 0x0ff00ff0)], &[], &[("r1", 0x0f000f00), ("ZF", 0)], &[]),
+            ("or r1, r2", vec![0x05, 0x0a], &[("r1", 0xff00ff00), ("r2", 0x0ff00ff0)], &[], &[("r1", 0xfff0fff0), ("ZF", 0)], &[]),
+            ("xor r1, r2", vec![0x06, 0x0a], &[("r1", 0xff00ff00), ("r2", 0x0ff00ff0)], &[], &[("r1", 0xf0f0f0f0), ("ZF", 0)], &[]),
+            ("xor r3, r3", vec![0x06, 0x1b], &[("r3", 0x1234)], &[], &[("r3", 0), ("ZF", 1)], &[]),
+            ("cmp r1, r2", vec![0x07, 0x0a], &[("r1", 5), ("r2", 5)], &[], &[("r1", 5), ("ZF", 1)], &[]),
+            ("cmp r1, r2", vec![0x07, 0x0a], &[("r1", 5), ("r2", 6), ("ZF", 1)], &[], &[("r1", 5), ("ZF", 0)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn cisc_immediate_operands() {
+        let sleigh = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("mov r1, #0x12345678", vec![0x01, 0xc8, 0x12, 0x34, 0x56, 0x78], &[], &[], &[("r1", 0x12345678)], &[]),
+            ("add r1, #0x1", vec![0x02, 0xc8, 0x00, 0x00, 0x00, 0x01], &[("r1", 1)], &[], &[("r1", 2), ("ZF", 0)], &[]),
+            ("cmp r1, #0x2a", vec![0x07, 0xc8, 0x00, 0x00, 0x00, 0x2a], &[("r1", 0x2a)], &[], &[("ZF", 1)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn cisc_memory_loads() {
+        let sleigh = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("mov r1, [r2]", vec![0x01, 0x4a], &[("r2", 0x2000)], &[(0x2000, 0xdeadbeef)], &[("r1", 0xdeadbeef)], &[]),
+            ("mov r1, [r2+0x4]", vec![0x01, 0x8a, 0x04], &[("r2", 0x2000)], &[(0x2004, 0xdeadbeef)], &[("r1", 0xdeadbeef)], &[]),
+            ("mov r1, [r2+-0x4]", vec![0x01, 0x8a, 0xfc], &[("r2", 0x2000)], &[(0x1ffc, 0xdeadbeef)], &[("r1", 0xdeadbeef)], &[]),
+            ("add r1, [r2]", vec![0x02, 0x4a], &[("r1", 1), ("r2", 0x2000)], &[(0x2000, 0x41)], &[("r1", 0x42)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn cisc_memory_stores() {
+        let sleigh = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("mov [r2], r1", vec![0x08, 0x4a], &[("r1", 0xcafebabe), ("r2", 0x2000)], &[], &[], &[(0x2000, 0xcafebabe)]),
+            ("mov [r2+0x4], r1", vec![0x08, 0x8a, 0x04], &[("r1", 0xcafebabe), ("r2", 0x2000)], &[], &[], &[(0x2004, 0xcafebabe)]),
+            ("mov [r2+-0x4], r1", vec![0x08, 0x8a, 0xfc], &[("r1", 0xcafebabe), ("r2", 0x2000)], &[], &[], &[(0x1ffc, 0xcafebabe)]),
+        ]);
+    }
+
+    #[test]
+    fn cisc_branches() {
+        let sleigh = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("jmp 0x2000", vec![0x10, 0x00, 0x00, 0x20, 0x00], &[], &[], &[("pc", 0x2000)], &[]),
+            ("jz 0x1012", vec![0x11, 0x10], &[("ZF", 1)], &[], &[("pc", 0x1012)], &[]),
+            ("jz 0x1012", vec![0x11, 0x10], &[("ZF", 0)], &[], &[("pc", 0x1002)], &[]),
+            ("jz 0x1000", vec![0x11, 0xfe], &[("ZF", 1)], &[], &[("pc", 0x1000)], &[]),
+            ("jnz 0x1012", vec![0x12, 0x10], &[("ZF", 0)], &[], &[("pc", 0x1012)], &[]),
+            ("jnz 0x1012", vec![0x12, 0x10], &[("ZF", 1)], &[], &[("pc", 0x1002)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn cisc_store_then_load() {
+        let sleigh = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        let mut cpu = new_cpu(&sleigh, &[
+            0x08, 0x8a, 0x04, // mov [r2+0x4], r1
+            0x01, 0x9a, 0x04, // mov r3, [r2+0x4]
+        ]);
+        set_reg(&mut cpu, "r1", 0x11223344);
+        set_reg(&mut cpu, "r2", 0x2000);
+        cpu.step().unwrap();
+        cpu.step().unwrap();
+        assert_eq!(get_reg(&mut cpu, "r3"), 0x11223344);
+        assert_eq!(get_mem(&mut cpu, 0x2004), 0x11223344);
+    }
+
+    #[test]
+    fn cisc_counting_loop() {
+        let sleigh = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        let mut cpu = new_cpu(&sleigh, &[
+            0x06, 0x09, // 0x1000: xor r1, r1
+            0x02, 0x0a, // 0x1002: add r1, r2
+            0x03, 0x13, // 0x1004: sub r2, r3
+            0x12, 0xfa, // 0x1006: jnz 0x1002
+            0x00,       // 0x1008: nop
+        ]);
+        set_reg(&mut cpu, "r1", 0xffff);
+        set_reg(&mut cpu, "r2", 5);
+        set_reg(&mut cpu, "r3", 1);
+
+        let mut steps = 0;
+        while cpu.state.pc != 0x1008 {
+            assert!(
+                steps < 100,
+                "loop did not terminate, pc = {:#x}",
+                cpu.state.pc
+            );
+            cpu.step().unwrap();
+            steps += 1;
+        }
+
+        assert_eq!(steps, 16);
+        assert_eq!(get_reg(&mut cpu, "r1"), 5 + 4 + 3 + 2 + 1);
+        assert_eq!(get_reg(&mut cpu, "r2"), 0);
+        assert_eq!(get_reg(&mut cpu, "ZF"), 1);
+    }
+}
