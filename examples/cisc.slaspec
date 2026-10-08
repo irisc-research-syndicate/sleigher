@@ -1,0 +1,74 @@
+# Minimal CISC example: variable length instructions, a ModR/M style
+# operand byte and register/memory/immediate addressing modes.
+#
+#   [opcode] [modrm] [disp8 | imm32]
+#
+# modrm: md=(6,7) rd=(3,5) rm=(0,2)
+#   md=0: rm         register
+#   md=1: [rm]       memory indirect
+#   md=2: [rm+disp8] memory indirect with signed displacement
+#   md=3: #imm32     immediate (sources only)
+
+define endian=big;
+define alignment=1;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [
+    r0 r1 r2 r3 r4 r5 r6 sp
+];
+
+define register offset=0x40 size=1 [ ZF ];
+
+define token opbyte(8)
+    opcode=(0, 7)
+;
+
+define token modrm(8)
+    md=(6, 7)
+    rd=(3, 5)
+    rm=(0, 2)
+;
+
+define token disp8(8)
+    simm8=(0, 7) signed
+;
+
+define token imm32(32)
+    uimm32=(0, 31)
+;
+
+attach variables [ rd rm ] [ r0 r1 r2 r3 r4 r5 r6 sp ];
+
+# Memory addressing modes, usable as both source and destination
+MEM: [rm] is md=1 & rm { export *:4 rm; }
+MEM: [rm+simm8] is md=2 & rm; simm8 {
+    local addr:4 = rm + simm8;
+    export *:4 addr;
+}
+
+# Source operand: register, memory or immediate
+SRC: rm is md=0 & rm { export rm; }
+SRC: MEM is MEM { export MEM; }
+SRC: "#"^uimm32 is md=3; uimm32 { export *[const]:4 uimm32; }
+
+REL8: dest is simm8 [ dest = inst_next + simm8; ] { export *:4 dest; }
+ABS32: uimm32 is uimm32 { export *:4 uimm32; }
+
+:nop is opcode=0x00 { }
+
+:mov rd, SRC is opcode=0x01; rd & SRC { rd = SRC; }
+:add rd, SRC is opcode=0x02; rd & SRC { rd = rd + SRC; ZF = rd == 0; }
+:sub rd, SRC is opcode=0x03; rd & SRC { rd = rd - SRC; ZF = rd == 0; }
+:and rd, SRC is opcode=0x04; rd & SRC { rd = rd & SRC; ZF = rd == 0; }
+:or  rd, SRC is opcode=0x05; rd & SRC { rd = rd | SRC; ZF = rd == 0; }
+:xor rd, SRC is opcode=0x06; rd & SRC { rd = rd ^ SRC; ZF = rd == 0; }
+:cmp rd, SRC is opcode=0x07; rd & SRC { ZF = rd == SRC; }
+
+# Store: memory destination
+:mov MEM, rd is opcode=0x08; rd & MEM { MEM = rd; }
+
+:jmp ABS32 is opcode=0x10; ABS32 { goto ABS32; }
+:jz REL8   is opcode=0x11; REL8 { if (ZF) goto REL8; }
+:jnz REL8  is opcode=0x12; REL8 { if (!ZF) goto REL8; }

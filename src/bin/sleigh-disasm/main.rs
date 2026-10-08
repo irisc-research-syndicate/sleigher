@@ -31,8 +31,8 @@ fn main() -> Result<()> {
 
     while let Ok(instruction) = disassembler.disassemble(pc, Context, cursor) {
         println!("{:#010x}: {}", pc, instruction);
-        pc += instruction.len() as u64;
-        cursor = &cursor[instruction.len()..];
+        pc += instruction.len as u64;
+        cursor = &cursor[instruction.len..];
     }
 
     Ok(())

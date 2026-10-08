@@ -51,7 +51,11 @@ impl<'sleigh> Disassembler<'sleigh> {
         _context: Context,
         bytes: &[u8],
     ) -> Result<DisassembledTable<'sleigh>> {
-        DisassembledTable::disassemble(self, inst_start, table, bytes)
+        let mut disassembled = DisassembledTable::disassemble(self, inst_start, table, bytes)?;
+        // inst_next is the address of the next instruction, which is only known
+        // once the whole instruction (including all subtables) has been matched.
+        disassembled.resolve(inst_start + disassembled.len as u64);
+        Ok(disassembled)
     }
 
     pub fn extract_token_field(&self, token_field_id: TokenFieldId, bytes: &[u8]) -> i64 {
@@ -125,6 +129,9 @@ pub struct DisassembledTable<'sleigh> {
     pub token_fields: HashMap<TokenFieldId, i64>,
     pub tables: HashMap<TableId, DisassembledTable<'sleigh>>,
     pub variables: HashMap<VariableId, i64>,
+    pub len: usize,
+    pub bytes: Vec<u8>,
+    pub block_offsets: Vec<usize>,
 }
 
 impl<'sleigh> std::ops::Deref for DisassembledTable<'sleigh> {
@@ -149,11 +156,6 @@ pub fn bitconstraint_to_string(constraints: &[BitConstraint]) -> String {
 }
 
 impl<'sleigh> DisassembledTable<'sleigh> {
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        (self.inst_next - self.inst_start) as usize
-    }
-
     pub fn disassemble(
         disassembler: &'sleigh Disassembler<'sleigh>,
         inst_start: u64,
@@ -178,7 +180,11 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     .single_len()
                     .unwrap_or(constructor.pattern.len.min()) as usize
             {
-                bail!("too few bytes to match constructor")
+                log::trace!(
+                    "{}: too few bytes to match constructor, continuing to next matcher",
+                    table.name()
+                );
+                continue 'match_loop;
             }
 
             let (context_constraints, data_constraints) = constructor.variant(matcher.variant_id);
@@ -218,14 +224,21 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                 token_fields: HashMap::new(),
                 tables: HashMap::new(),
                 variables: HashMap::new(),
+                len: 0,
+                bytes: Vec::new(),
+                block_offsets: Vec::new(),
             };
 
             for block in constructor.pattern.blocks() {
-                let block_len = block.len().single_len().unwrap_or(block.len().min());
-                if bytes.len() < block_len as usize {
-                    bail!("too few bytes to match block")
+                let mut block_len = block.len().single_len().unwrap_or(block.len().min()) as usize;
+                if bytes.len() < block_len {
+                    log::trace!(
+                        "{}: too few bytes to match block, continuing to next matcher",
+                        table.name()
+                    );
+                    continue 'match_loop;
                 }
-                disasm_table.inst_next += block_len;
+                disasm_table.block_offsets.push(disasm_table.len);
 
                 for produced_token_field in block.token_fields() {
                     let token_field_value =
@@ -240,6 +253,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     if let Ok(subtable_value) =
                         DisassembledTable::disassemble(disassembler, inst_start, subtable, bytes)
                     {
+                        block_len = block_len.max(subtable_value.len);
                         disasm_table
                             .tables
                             .insert(produced_table.table, subtable_value);
@@ -250,21 +264,6 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                             subtable.name()
                         );
                         continue 'match_loop;
-                    }
-                }
-
-                for assertion in block.pre_disassembler() {
-                    match assertion {
-                        Assertation::GlobalSet(_global_set) => todo!(),
-                        Assertation::Assignment(assignment) => {
-                            let value = disasm_table.evaluate_expr(&assignment.right, bytes);
-                            match assignment.left {
-                                sleigh_rs::disassembly::WriteScope::Context(_context_id) => todo!(),
-                                sleigh_rs::disassembly::WriteScope::Local(variable_id) => {
-                                    disasm_table.variables.insert(variable_id, value);
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -301,11 +300,57 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                         } => todo!(),
                     }
                 }
-                bytes = &bytes[block_len as usize..];
+                if bytes.len() < block_len {
+                    log::trace!(
+                        "{}: too few bytes for block, continuing to next matcher",
+                        table.name()
+                    );
+                    continue 'match_loop;
+                }
+                disasm_table.bytes.extend_from_slice(&bytes[..block_len]);
+                disasm_table.len += block_len;
+                bytes = &bytes[block_len..];
             }
+            disasm_table.inst_next = inst_start + disasm_table.len as u64;
             return Ok(disasm_table);
         }
         bail!("{}: Failed to disassemble table", table.name());
+    }
+
+    fn resolve(&mut self, inst_next: u64) {
+        self.inst_next = inst_next;
+        for subtable in self.tables.values_mut() {
+            subtable.resolve(inst_next);
+        }
+
+        let constructor = self.constructor;
+        for (block, offset) in constructor
+            .pattern
+            .blocks()
+            .iter()
+            .zip(self.block_offsets.clone())
+        {
+            self.apply_assertions(block.pre_disassembler(), offset);
+            self.apply_assertions(block.post_disassembler(), offset);
+        }
+        self.apply_assertions(constructor.pattern.disassembly_pos_match(), 0);
+    }
+
+    fn apply_assertions(&mut self, assertions: &[Assertation], offset: usize) {
+        for assertion in assertions {
+            match assertion {
+                Assertation::GlobalSet(_global_set) => todo!(),
+                Assertation::Assignment(assignment) => {
+                    let value = self.evaluate_expr(&assignment.right, &self.bytes[offset..]);
+                    match assignment.left {
+                        sleigh_rs::disassembly::WriteScope::Context(_context_id) => todo!(),
+                        sleigh_rs::disassembly::WriteScope::Local(variable_id) => {
+                            self.variables.insert(variable_id, value);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn evaluate_expr(&self, expr: &Expr, bytes: &[u8]) -> i64 {
@@ -317,9 +362,13 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                         sleigh_rs::Number::Negative(x) => -(x as i64),
                     },
                     ReadScope::Context(_context_id) => todo!(),
-                    ReadScope::TokenField(token_field_id) => {
-                        self.disassembler.extract_token_field(token_field_id, bytes)
-                    }
+                    ReadScope::TokenField(token_field_id) => self
+                        .token_fields
+                        .get(&token_field_id)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            self.disassembler.extract_token_field(token_field_id, bytes)
+                        }),
                     ReadScope::InstStart(_inst_start) => self.inst_start as i64,
                     ReadScope::InstNext(_inst_next) => self.inst_next as i64,
                     ReadScope::Local(variable_id) => *self.variables.get(&variable_id).unwrap(),
@@ -374,7 +423,7 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
                         match token_field.attach {
                             TokenFieldAttach::NoAttach(value_fmt) => match value_fmt.base {
                                 sleigh_rs::PrintBase::Dec => format!("{}", token_field_value),
-                                sleigh_rs::PrintBase::Hex => format!("{:#x}", token_field_value),
+                                sleigh_rs::PrintBase::Hex => fmt_hex(token_field_value),
                             },
                             TokenFieldAttach::Varnode(attach_varnode_id) => {
                                 let attach_varnode =
@@ -443,7 +492,7 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
                 }
                 DisplayElement::Disassembly(variable_id) => {
                     if let Some(variable) = self.variables.get(variable_id) {
-                        format!("{:#x}", variable)
+                        fmt_hex(*variable)
                     } else {
                         format!("<UNDEFINED DISASSEMBLY VAR {}>", variable_id.0)
                     }
@@ -454,6 +503,14 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
         }
 
         write!(f, "{}", parts.join(""))
+    }
+}
+
+fn fmt_hex(value: i64) -> String {
+    if value < 0 {
+        format!("-{:#x}", value.unsigned_abs())
+    } else {
+        format!("{:#x}", value)
     }
 }
 
@@ -502,7 +559,23 @@ mod test {
         #[rustfmt::skip]
         run_tests("examples/vliw.slaspec", &[
             ("{ unk.0x0 r1, r2, 0x1234 ; unk.0xa r5, r1, 0x1234 ; unk.0xb r10, r11, 0 }", vec![0x50, 0x04, 0x4a, 0x28, 0x56, 0xa5, 0x92, 0x34]),
-            ("{ unk.0x0 r1, r2, 0xffffffff87654321 }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21])
+            ("{ unk.0x0 r1, r2, -0x789abcdf }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21])
+        ]);
+    }
+
+    #[test]
+    fn test_cisc_disassemble() {
+        #[rustfmt::skip]
+        run_tests("examples/cisc.slaspec", &[
+            ("nop", vec![0x00]),
+            ("mov r1, #0x10", vec![0x01, 0xc8, 0x00, 0x00, 0x00, 0x10]),
+            ("add r1, r2", vec![0x02, 0x0a]),
+            ("sub r0, [r3]", vec![0x03, 0x43]),
+            ("xor r2, [sp+-0x4]", vec![0x06, 0x97, 0xfc]),
+            ("mov [r4+0x8], r1", vec![0x08, 0x8c, 0x08]),
+            ("jmp 0x1234", vec![0x10, 0x00, 0x00, 0x12, 0x34]),
+            ("jz 0x4", vec![0x11, 0x02]),
+            ("jnz 0x0", vec![0x12, 0xfe]),
         ]);
     }
 }
