@@ -21,6 +21,10 @@ define register offset=0x00 size=4 [
 
 define register offset=0x40 size=1 [ ZF ];
 
+# I/O through user defined p-code operations
+define pcodeop out;
+define pcodeop in;
+
 define token opbyte(8)
     opcode=(0, 7)
 ;
@@ -72,3 +76,6 @@ ABS32: uimm32 is uimm32 { export *:4 uimm32; }
 :jmp ABS32 is opcode=0x10; ABS32 { goto ABS32; }
 :jz REL8   is opcode=0x11; REL8 { if (ZF) goto REL8; }
 :jnz REL8  is opcode=0x12; REL8 { if (!ZF) goto REL8; }
+
+:out rd is opcode=0x20; rd { out(rd); }
+:in rd  is opcode=0x21; rd { rd = in(); }

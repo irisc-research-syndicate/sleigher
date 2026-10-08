@@ -9,6 +9,8 @@ use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::token::TokenFieldAttach;
 use sleigh_rs::{Endian, Sleigh, TableId, TokenFieldId};
 
+use crate::pcode::{LiftError, PcodeOp};
+
 #[derive(Debug, Clone)]
 pub struct Disassembler<'sleigh> {
     pub sleigh: &'sleigh Sleigh,
@@ -41,7 +43,11 @@ impl<'sleigh> Disassembler<'sleigh> {
             context,
             bytes,
         )?;
-        Ok(DisassembledInstruction { table })
+        let pcode = crate::pcode::lift(&table);
+        if let Err(err) = &pcode {
+            log::debug!("Could not lift {}: {}", table, err);
+        }
+        Ok(DisassembledInstruction { table, pcode })
     }
 
     pub fn disassemble_table(
@@ -103,6 +109,8 @@ impl<'sleigh> Disassembler<'sleigh> {
 #[derive(Debug, Clone)]
 pub struct DisassembledInstruction<'sleigh> {
     pub table: DisassembledTable<'sleigh>,
+    /// The instruction's semantics, or why they could not be lifted
+    pub pcode: Result<Vec<PcodeOp>, LiftError>,
 }
 
 impl<'sleigh> std::ops::Deref for DisassembledInstruction<'sleigh> {
@@ -576,6 +584,8 @@ mod test {
             ("jmp 0x1234", vec![0x10, 0x00, 0x00, 0x12, 0x34]),
             ("jz 0x4", vec![0x11, 0x02]),
             ("jnz 0x0", vec![0x12, 0xfe]),
+            ("out r3", vec![0x20, 0x18]),
+            ("in r1", vec![0x21, 0x08]),
         ]);
     }
 
