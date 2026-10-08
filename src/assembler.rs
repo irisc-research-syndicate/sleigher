@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     ops::{Deref, DerefMut},
+    rc::Rc,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -163,6 +164,11 @@ pub type TokenKey = (usize, usize, TokenId);
 
 static NEXT_INSTANCE: AtomicUsize = AtomicUsize::new(0);
 
+/// All constraints are quantifier free bit-vector formulas
+fn new_solver(ctx: &z3::Context) -> z3::Solver<'_> {
+    z3::Solver::new_for_logic(ctx, "QF_BV").unwrap()
+}
+
 #[derive(Debug, Clone)]
 pub struct Constraints<'asm> {
     pub asm: &'asm InstructionAssembler,
@@ -178,6 +184,9 @@ pub struct Constraints<'asm> {
     pub inst_next: BV<'asm>,
 
     pub labels: &'asm Labels,
+
+    /// One solver for every check of an instruction, much cheaper than a new solver per check
+    checker: Rc<z3::Solver<'asm>>,
 }
 
 impl<'asm> Constraints<'asm> {
@@ -190,6 +199,7 @@ impl<'asm> Constraints<'asm> {
             eqs: HashSet::new(),
             inst_start,
             inst_next: BV::fresh_const(&asm.ctx, "inst_next", 64),
+            checker: Rc::new(new_solver(&asm.ctx)),
             labels,
         }
     }
@@ -459,7 +469,7 @@ impl<'asm> Constraints<'asm> {
     }
 
     pub fn solver(&self) -> z3::Solver<'asm> {
-        let solver = z3::Solver::new(&self.asm.ctx);
+        let solver = new_solver(&self.asm.ctx);
         for eq in self.eqs.iter() {
             solver.assert(eq)
         }
@@ -467,7 +477,13 @@ impl<'asm> Constraints<'asm> {
     }
 
     pub fn check(&self) -> bool {
-        match self.solver().check() {
+        self.checker.push();
+        for eq in self.eqs.iter() {
+            self.checker.assert(eq);
+        }
+        let result = self.checker.check();
+        self.checker.pop(1);
+        match result {
             z3::SatResult::Unsat | z3::SatResult::Unknown => false,
             z3::SatResult::Sat => true,
         }
