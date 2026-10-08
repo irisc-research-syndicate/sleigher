@@ -1,13 +1,35 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use sleigher::assembler::InstructionAssembler;
+use sleigher::assembler::{InstructionAssembler, Labels};
+
+fn parse_int(s: &str) -> std::result::Result<u64, std::num::ParseIntError> {
+    if let Some(s) = s.strip_prefix("0x") {
+        u64::from_str_radix(s, 16)
+    } else {
+        s.parse::<u64>()
+    }
+}
 
 #[derive(Debug, Clone, Parser)]
 struct Cli {
     slaspec: PathBuf,
-    instruction: String,
+
+    /// A single instruction to assemble
+    instruction: Option<String>,
+
+    /// Assemble a program file: one instruction per line, `name:` labels and `//` comments
+    #[arg(short, long, conflicts_with = "instruction")]
+    file: Option<PathBuf>,
+
+    /// Address of the first instruction
+    #[arg(short, long, default_value = "0", value_parser = parse_int)]
+    base: u64,
+
+    /// Write the program's raw bytes to this file
+    #[arg(short, long, requires = "file")]
+    output: Option<PathBuf>,
 }
 
 pub fn main() -> Result<()> {
@@ -18,7 +40,40 @@ pub fn main() -> Result<()> {
         .ok()
         .context("Could not open or parse slaspec")?;
     let assembler = InstructionAssembler::new(sleigh);
-    let constraints = assembler.assemble_instruction(&args.instruction)?;
+
+    if let Some(path) = &args.file {
+        let source =
+            std::fs::read_to_string(path).with_context(|| format!("Could not read {:?}", path))?;
+        let program = assembler.assemble_program(&source, args.base)?;
+
+        for line in program.lines.iter() {
+            let bytes = line
+                .bytes
+                .iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{:#010x}: {:<24} {}", line.address, bytes, line.source);
+        }
+        if !program.labels.is_empty() {
+            println!();
+            for (name, address) in program.labels.iter() {
+                println!("{:#010x} {}", address, name);
+            }
+        }
+
+        if let Some(output) = &args.output {
+            std::fs::write(output, &program.bytes)
+                .with_context(|| format!("Could not write {:?}", output))?;
+        }
+        return Ok(());
+    }
+
+    let Some(instruction) = &args.instruction else {
+        bail!("Give an instruction or --file");
+    };
+    let labels = Labels::new();
+    let constraints = assembler.assemble_instruction_at(instruction, args.base, &labels)?;
 
     println!("token_order: {:?}", constraints.token_order);
     println!("tokens: {:?}", constraints.tokens);
