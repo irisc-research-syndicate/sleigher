@@ -18,12 +18,7 @@ pub fn main() -> Result<()> {
         .ok()
         .context("Could not open or parse slaspec")?;
     let assembler = InstructionAssembler::new(sleigh);
-    let (rest, constraints) = assembler
-        .assemble_instruction(&args.instruction)
-        .ok()
-        .context("Failed to parse instruction")?;
-
-    println!("rest: {:?}", rest);
+    let constraints = assembler.assemble_instruction(&args.instruction)?;
 
     println!("token_order: {:?}", constraints.token_order);
     println!("tokens: {:?}", constraints.tokens);

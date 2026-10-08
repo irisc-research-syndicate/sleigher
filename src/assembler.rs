@@ -14,19 +14,36 @@ use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{token::TokenFieldAttach, Endian, Number, Sleigh, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
 
+use crate::disassembler::{Context, Disassembler};
+
 /// Every way a parser matched a prefix of the input, each with the remaining input.
 /// An empty list means no match.
 pub type Parses<'a, T> = Vec<(&'a str, T)>;
 
+/// One of several distinct encodings of an ambiguous instruction
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub bytes: Vec<u8>,
+    pub disassembly: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AsmError {
     NoMatch,
+    Ambiguous(Vec<Candidate>),
 }
 
 impl std::fmt::Display for AsmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AsmError::NoMatch => write!(f, "no constructor matches the input"),
+            AsmError::Ambiguous(candidates) => {
+                write!(f, "ambiguous, {} encodings:", candidates.len())?;
+                for candidate in candidates {
+                    write!(f, "\n  {:02x?} {}", candidate.bytes, candidate.disassembly)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -180,6 +197,27 @@ impl<'asm> Constraints<'asm> {
         BV::from_i64(&self.asm.ctx, i, sz)
     }
 
+    /// Whether some instruction bytes satisfy both `self` and `other`
+    pub fn same_encoding(&self, other: &Constraints<'asm>) -> bool {
+        if self.token_order.len() != other.token_order.len() {
+            return false;
+        }
+        let solver = self.solver();
+        for eq in other.eqs.iter() {
+            solver.assert(eq);
+        }
+        for (self_id, other_id) in self.token_order.iter().zip(other.token_order.iter()) {
+            let (self_token, other_token) = (self.asm.token(*self_id), self.asm.token(*other_id));
+            if self_token.len_bytes() != other_token.len_bytes()
+                || self_token.endian() != other_token.endian()
+            {
+                return false;
+            }
+            solver.assert(&self.tokens[self_id]._eq(&other.tokens[other_id]));
+        }
+        solver.check() == z3::SatResult::Sat
+    }
+
     pub fn to_bytes(&self) -> Option<Vec<u8>> {
         log::debug!("Generating instruction bytes");
         let model = self.model()?;
@@ -316,15 +354,40 @@ impl InstructionAssembler {
         }
     }
 
-    /// Assemble one instruction, taking the first complete candidate in table order
-    pub fn assemble_instruction<'a, 'asm>(
-        &'asm self,
-        s: &'a str,
-    ) -> Result<(&'a str, Constraints<'asm>), AsmError> {
-        self.assemble_candidates(s)
-            .into_iter()
-            .next()
-            .ok_or(AsmError::NoMatch)
+    /// Assemble one instruction that must consume all of `s` (up to trailing whitespace) and
+    /// have exactly one encoding. Parses that can produce the same bytes count as one encoding.
+    pub fn assemble_instruction<'asm>(&'asm self, s: &str) -> Result<Constraints<'asm>, AsmError> {
+        let mut encodings: Vec<Constraints<'asm>> = vec![];
+        for (rest, candidate) in self.assemble_candidates(s) {
+            if !rest.trim_end().is_empty() {
+                continue;
+            }
+            if !encodings
+                .iter()
+                .any(|encoding| encoding.same_encoding(&candidate))
+            {
+                encodings.push(candidate);
+            }
+        }
+        match encodings.len() {
+            0 => Err(AsmError::NoMatch),
+            1 => Ok(encodings.pop().unwrap()),
+            _ => Err(AsmError::Ambiguous(
+                encodings
+                    .iter()
+                    .map(|encoding| self.candidate(encoding))
+                    .collect(),
+            )),
+        }
+    }
+
+    fn candidate(&self, constraints: &Constraints) -> Candidate {
+        let bytes = constraints.to_bytes().unwrap_or_default();
+        let disassembly = Disassembler::new(&self.sleigh)
+            .disassemble(0, Context, &bytes)
+            .map(|instruction| instruction.to_string())
+            .unwrap_or_else(|err| format!("<{}>", err));
+        Candidate { bytes, disassembly }
     }
 
     /// Every way the instruction table matches a prefix of `s`
@@ -563,10 +626,9 @@ impl InstructionAssembler {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::disassembler::{Context, Disassembler};
     use std::path::Path;
 
-    fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>, &str)]) {
+    fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>)]) {
         let _ = env_logger::try_init();
         log::info!("Loading slaspec: {:?}", slaspec_path.as_ref());
         let slaspec = sleigh_rs::file_to_sleigh(slaspec_path.as_ref()).expect(&format!(
@@ -575,23 +637,18 @@ mod test {
         ));
         let assembler = InstructionAssembler::new(slaspec);
 
-        for (input, expected_bytes, expected_rest) in tests.iter() {
-            log::info!(
-                "Assembling {:?} expecting {:02x?} {:?}",
-                input,
-                expected_bytes,
-                expected_rest
-            );
+        for (input, expected_bytes) in tests.iter() {
+            log::info!("Assembling {:?} expecting {:02x?}", input, expected_bytes);
 
-            let (rest, constraints) = assembler.assemble_instruction(input).unwrap();
-            log::info!("Rest of input: {:?}", rest);
+            let constraints = assembler
+                .assemble_instruction(input)
+                .unwrap_or_else(|err| panic!("{:?}: {}", input, err));
 
             let bytes = constraints
                 .to_bytes()
                 .expect("Constraints failed to produce bytes");
             log::info!("Produced bytes: {:02x?}", bytes);
 
-            assert_eq!(rest, *expected_rest);
             assert_eq!(bytes, *expected_bytes);
         }
     }
@@ -600,8 +657,8 @@ mod test {
     pub fn test_vliw_assemble() {
         #[rustfmt::skip]
         run_tests("examples/vliw.slaspec", &[
-            ("{ unk.0x0 r1, r2, 0x1234 ; unk.0xa r5, r1, 0x1234 ; unk.0xb r10, r11, 0 }", vec![0x50, 0x04, 0x4a, 0x28, 0x56, 0xa5, 0x92, 0x34], ""),
-            ("{ unk.0x0 r1, r2, 0xffffffff87654321 }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21], ""),
+            ("{ unk.0x0 r1, r2, 0x1234 ; unk.0xa r5, r1, 0x1234 ; unk.0xb r10, r11, 0 }", vec![0x50, 0x04, 0x4a, 0x28, 0x56, 0xa5, 0x92, 0x34]),
+            ("{ unk.0x0 r1, r2, 0xffffffff87654321 }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21]),
         ]);
     }
 
@@ -609,11 +666,9 @@ mod test {
     pub fn test_risc_assemble() {
         #[rustfmt::skip]
         run_tests("examples/risc.slaspec", &[
-            ("xor r2, r15, 0xffff", vec![0x2f, 0x90, 0xff, 0xff], ""),
-            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
-            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
-            ("xor r4, r5, 0x23450000", vec![0x2a, 0xa2, 0x23, 0x45], ""),
-            ("and r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x03], ""),
+            ("xor r2, r15, 0xffff", vec![0x2f, 0x90, 0xff, 0xff]),
+            ("xor r4, r5, 0x23450000", vec![0x2a, 0xa2, 0x23, 0x45]),
+            ("and r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x03]),
         ]);
     }
 
@@ -625,10 +680,11 @@ mod test {
         InstructionAssembler::new(sleigh)
     }
 
-    fn assemble(assembler: &InstructionAssembler, input: &str) -> Option<(String, Vec<u8>)> {
-        let (rest, constraints) = assembler.assemble_instruction(input).ok()?;
-        let bytes = constraints.to_bytes()?;
-        Some((rest.to_string(), bytes))
+    fn assemble(assembler: &InstructionAssembler, input: &str) -> Result<Vec<u8>, AsmError> {
+        let constraints = assembler.assemble_instruction(input)?;
+        Ok(constraints
+            .to_bytes()
+            .expect("Constraints failed to produce bytes"))
     }
 
     fn disassemble(assembler: &InstructionAssembler, bytes: &[u8]) -> Option<String> {
@@ -641,7 +697,7 @@ mod test {
         let mut failures = vec![];
         for (input, expected_bytes) in tests.iter() {
             match assemble(assembler, input) {
-                Some((rest, bytes)) if rest.is_empty() && bytes == *expected_bytes => {}
+                Ok(bytes) if bytes == *expected_bytes => {}
                 result => failures.push(format!(
                     "{:?}: expected {:02x?}, got {:02x?}",
                     input, expected_bytes, result
@@ -654,11 +710,26 @@ mod test {
     fn assert_rejects(assembler: &InstructionAssembler, inputs: &[&str]) {
         let mut failures = vec![];
         for input in inputs.iter() {
-            if let Some(result) = assemble(assembler, input) {
-                failures.push(format!(
+            match assemble(assembler, input) {
+                Err(AsmError::NoMatch) => {}
+                result => failures.push(format!(
                     "{:?}: expected rejection, got {:02x?}",
                     input, result
-                ));
+                )),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    fn assert_ambiguous(assembler: &InstructionAssembler, tests: &[(&str, usize)]) {
+        let mut failures = vec![];
+        for (input, expected_count) in tests.iter() {
+            match assemble(assembler, input) {
+                Err(AsmError::Ambiguous(candidates)) if candidates.len() == *expected_count => {}
+                result => failures.push(format!(
+                    "{:?}: expected {} candidates, got {:02x?}",
+                    input, expected_count, result
+                )),
             }
         }
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
@@ -677,15 +748,18 @@ mod test {
                 continue;
             };
             checked += 1;
+            // Either one encoding that disassembles to the same text, or an ambiguity whose
+            // candidates include one that does
             let reassembled = assemble(assembler, &text);
-            let redisassembled = reassembled
-                .as_ref()
-                .and_then(|(_, bytes)| disassemble(assembler, bytes));
-            if redisassembled.as_deref() != Some(text.as_str()) {
-                failures.push(format!(
-                    "{:02x?} {:?} -> {:02x?} -> {:?}",
-                    bytes, text, reassembled, redisassembled
-                ));
+            let ok = match &reassembled {
+                Ok(bytes) => disassemble(assembler, bytes).as_deref() == Some(text.as_str()),
+                Err(AsmError::Ambiguous(candidates)) => candidates
+                    .iter()
+                    .any(|candidate| candidate.disassembly == text),
+                Err(AsmError::NoMatch) => false,
+            };
+            if !ok {
+                failures.push(format!("{:02x?} {:?} -> {:02x?}", bytes, text, reassembled));
             }
         }
         assert!(checked > 0, "no generated word disassembled");
@@ -703,9 +777,7 @@ mod test {
         let asm = load("examples/risc.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
-            ("sub r0, r0, 0x0", vec![0x08, 0x00, 0x00, 0x00]),
             ("or r15, r15, 0xffff", vec![0x17, 0xf8, 0xff, 0xff]),
-            ("add r1, r2, 12", vec![0x01, 0x08, 0x00, 0x0c]),
         ]);
     }
 
@@ -715,8 +787,6 @@ mod test {
         #[rustfmt::skip]
         assert_encodes(&asm, &[
             ("add r1, r2, -1", vec![0x01, 0x0c, 0xff, 0xff]),
-            ("add r1, r2, -0x100", vec![0x01, 0x0c, 0xff, 0x00]),
-            ("add r1, r2, -0x8000", vec![0x01, 0x0c, 0x80, 0x00]),
         ]);
     }
 
@@ -725,7 +795,6 @@ mod test {
         let asm = load("examples/risc.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
-            ("add r1, r2, 0x10000", vec![0x01, 0x0a, 0x00, 0x01]),
             ("add r1, r2, 0xffff0000", vec![0x01, 0x0a, 0xff, 0xff]),
             ("add r1, r2, 0x123400", vec![0x01, 0x0e, 0x12, 0x34]),
         ]);
@@ -750,6 +819,22 @@ mod test {
     }
 
     #[test]
+    fn risc_ambiguous_immediates() {
+        let asm = load("examples/risc.slaspec");
+        // The IMM16 forms overlap: uimm16, simm16, uimm16 << 16 and simm16 << 8
+        #[rustfmt::skip]
+        assert_ambiguous(&asm, &[
+            ("add r4, r5, 0x1234", 2),
+            ("add r1, r2, 12", 2),
+            ("sub r0, r0, 0x0", 4),
+            ("add r1, r2, -0x100", 2),
+            ("add r1, r2, -0x8000", 2),
+            ("add r1, r2, 0x10000", 2),
+            ("unk.0x7 r3, r4, 0x1", 2),
+        ]);
+    }
+
+    #[test]
     fn risc_register_operands() {
         let asm = load("examples/risc.slaspec");
         #[rustfmt::skip]
@@ -765,7 +850,6 @@ mod test {
         let asm = load("examples/risc.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
-            ("unk.0x7 r3, r4, 0x1", vec![0x3a, 0x18, 0x00, 0x01]),
             ("unk.0x20 r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x20]),
         ]);
     }
@@ -799,13 +883,27 @@ mod test {
     #[test]
     fn risc_returns_remaining_input() {
         let asm = load("examples/risc.slaspec");
-        let (rest, bytes) = assemble(&asm, "and r1, r2, r3 ; next").unwrap();
-        assert_eq!(rest, " ; next");
-        assert_eq!(bytes, vec![0xf9, 0x09, 0x80, 0x03]);
+        let prefix = |input| {
+            asm.assemble_candidates(input)
+                .into_iter()
+                .map(|(rest, constraints)| (rest, constraints.to_bytes().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            prefix("and r1, r2, r3 ; next"),
+            vec![(" ; next", vec![0xf9, 0x09, 0x80, 0x03])]
+        );
+        assert!(prefix("add r4, r5, 0x1234\n").contains(&("\n", vec![0x02, 0xa0, 0x12, 0x34])));
 
-        let (rest, bytes) = assemble(&asm, "add r4, r5, 0x1234\n").unwrap();
-        assert_eq!(rest, "\n");
-        assert_eq!(bytes, vec![0x02, 0xa0, 0x12, 0x34]);
+        // A complete instruction may be followed by whitespace, but nothing else
+        assert_eq!(
+            assemble(&asm, "and r1, r2, r3 \n"),
+            Ok(vec![0xf9, 0x09, 0x80, 0x03])
+        );
+        assert_eq!(
+            assemble(&asm, "and r1, r2, r3 ; next"),
+            Err(AsmError::NoMatch)
+        );
     }
 
     #[test]
@@ -815,11 +913,12 @@ mod test {
     }
 
     #[test]
-    fn vliw_four_slot_bundle() {
+    fn vliw_ambiguous_zero_constants() {
         let asm = load("examples/vliw.slaspec");
+        // A 0 in slots 1 and 2 is either the shared constant or the op1/op2_const_zero literal
         #[rustfmt::skip]
-        assert_encodes(&asm, &[
-            ("{ unk.0x1 r2, r3, 0 ; unk.0x2 r4, r5, 0 ; unk.0x3 r6, r7, 0 ; unk.0x4 r8, r9 }", vec![0x00, 0x88, 0x62, 0x21, 0x46, 0x63, 0x91, 0x09]),
+        assert_ambiguous(&asm, &[
+            ("{ unk.0x1 r2, r3, 0 ; unk.0x2 r4, r5, 0 ; unk.0x3 r6, r7, 0 ; unk.0x4 r8, r9 }", 4),
         ]);
     }
 
