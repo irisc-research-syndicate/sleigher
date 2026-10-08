@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
@@ -15,6 +15,11 @@ use sleigh_rs::{token::TokenFieldAttach, Endian, Number, Sleigh, TokenFieldId, T
 use z3::ast::{Ast, Bool, BV};
 
 use crate::disassembler::{Context, Disassembler};
+
+/// Labels a program defines: resolved to an address, or `None` while their address is unknown
+pub type Labels = BTreeMap<String, Option<u64>>;
+
+const NO_LABELS: &Labels = &BTreeMap::new();
 
 /// Every way a parser matched a prefix of the input, each with the remaining input.
 /// An empty list means no match.
@@ -74,6 +79,28 @@ fn parse_dec(s: &str) -> Option<(&str, u64)> {
     parse_digits(s, 10)
 }
 
+fn parse_number(signed: bool, s: &str) -> Option<(&str, i64)> {
+    let (s, sign) = match s.strip_prefix('-') {
+        Some(s) if signed => (s, true),
+        _ => (s, false),
+    };
+    let (s, value) = parse_hex(s).or_else(|| parse_dec(s))?;
+    let value = if sign { -(value as i64) } else { value as i64 };
+    Some((s, value))
+}
+
+/// `[A-Za-z_.][A-Za-z0-9_.]*`
+pub fn parse_identifier(s: &str) -> Option<(&str, &str)> {
+    let is_start = |c: char| c.is_ascii_alphabetic() || c == '_' || c == '.';
+    if !s.starts_with(is_start) {
+        return None;
+    }
+    let len = s
+        .find(|c: char| !(is_start(c) || c.is_ascii_digit()))
+        .unwrap_or(s.len());
+    Some((&s[len..], &s[..len]))
+}
+
 #[derive(Debug, Clone)]
 pub struct Constraints<'asm> {
     pub asm: &'asm InstructionAssembler,
@@ -88,10 +115,12 @@ pub struct Constraints<'asm> {
     pub inst_start: u64,
     /// Address after the instruction, tied to its length once the whole instruction is parsed
     pub inst_next: BV<'asm>,
+
+    pub labels: &'asm Labels,
 }
 
 impl<'asm> Constraints<'asm> {
-    pub fn new(asm: &'asm InstructionAssembler, inst_start: u64) -> Self {
+    pub fn new(asm: &'asm InstructionAssembler, inst_start: u64, labels: &'asm Labels) -> Self {
         Self {
             asm,
             token_order: Vec::new(),
@@ -100,7 +129,21 @@ impl<'asm> Constraints<'asm> {
             eqs: HashSet::new(),
             inst_start,
             inst_next: BV::fresh_const(&asm.ctx, "inst_next", 64),
+            labels,
         }
+    }
+
+    /// A number or a defined label, as a 64-bit value. Unresolved labels are symbolic.
+    pub fn parse_operand<'a>(&self, signed: bool, s: &'a str) -> Option<(&'a str, BV<'asm>)> {
+        if let Some((s, value)) = parse_number(signed, s) {
+            return Some((s, self.build_u64_const(value as u64, 64)));
+        }
+        let (s, name) = parse_identifier(s)?;
+        let value = match self.labels.get(name)? {
+            Some(address) => self.build_u64_const(*address, 64),
+            None => BV::new_const(&self.asm.ctx, name, 64),
+        };
+        Some((s, value))
     }
 
     /// Instruction length in bytes from the tokens used so far
@@ -392,19 +435,20 @@ impl InstructionAssembler {
 
     /// Assemble one instruction at address 0, see `assemble_instruction_at`
     pub fn assemble_instruction<'asm>(&'asm self, s: &str) -> Result<Constraints<'asm>, AsmError> {
-        self.assemble_instruction_at(s, 0)
+        self.assemble_instruction_at(s, 0, NO_LABELS)
     }
 
     /// Assemble one instruction at `inst_start` that must consume all of `s` (up to trailing
     /// whitespace) and have exactly one encoding. Parses that can produce the same bytes count
-    /// as one encoding.
+    /// as one encoding. Operands may name any of `labels`.
     pub fn assemble_instruction_at<'asm>(
         &'asm self,
         s: &str,
         inst_start: u64,
+        labels: &'asm Labels,
     ) -> Result<Constraints<'asm>, AsmError> {
         let mut encodings: Vec<Constraints<'asm>> = vec![];
-        for (rest, candidate) in self.assemble_candidates_at(s, inst_start) {
+        for (rest, candidate) in self.assemble_candidates_at(s, inst_start, labels) {
             if !rest.trim_end().is_empty() {
                 continue;
             }
@@ -438,7 +482,7 @@ impl InstructionAssembler {
 
     /// Every way the instruction table matches a prefix of `s` at address 0
     pub fn assemble_candidates<'a, 'asm>(&'asm self, s: &'a str) -> Parses<'a, Constraints<'asm>> {
-        self.assemble_candidates_at(s, 0)
+        self.assemble_candidates_at(s, 0, NO_LABELS)
     }
 
     /// Every way the instruction table matches a prefix of `s` at `inst_start`. Candidates whose
@@ -448,8 +492,9 @@ impl InstructionAssembler {
         &'asm self,
         s: &'a str,
         inst_start: u64,
+        labels: &'asm Labels,
     ) -> Parses<'a, Constraints<'asm>> {
-        let constraints = Constraints::new(self, inst_start);
+        let constraints = Constraints::new(self, inst_start, labels);
         self.assemble_table(self.table(self.instruction_table()), constraints, s)
             .into_iter()
             .filter_map(|(rest, mut candidate)| {
@@ -573,40 +618,42 @@ impl InstructionAssembler {
                 let token_field = self.token_field(*token_field_id);
                 log::trace!("TOKEN_FIELD: {:?} {:?}", token_field.name(), s);
                 let token_field_bv = variables.token_field(*token_field_id, None);
-                let values = match token_field.attach {
+                let size = token_field_bv.get_size();
+                match token_field.attach {
                     TokenFieldAttach::NoAttach(value_fmt) => {
-                        self.parse_value(value_fmt.signed, s).into_iter().collect()
+                        let Some((s, value)) = variables.parse_operand(value_fmt.signed, s) else {
+                            return vec![];
+                        };
+                        // The field's value, extended to 64 bits, has to be the operand. This
+                        // rejects values that do not fit the field.
+                        let field_value = if size == 64 {
+                            token_field_bv
+                        } else if token_field.raw_value_is_signed() {
+                            token_field_bv.sign_ext(64 - size)
+                        } else {
+                            token_field_bv.zero_ext(64 - size)
+                        };
+                        variables.eq(field_value._eq(&value));
+                        vec![(s, variables)]
                     }
                     TokenFieldAttach::Varnode(attach_varnode_id) => {
                         let attach_varnode = self.attach_varnode(attach_varnode_id);
                         self.parse_attach_varnode(attach_varnode, s)
+                            .into_iter()
+                            .map(|(s, value)| {
+                                let mut variables = variables.clone();
+                                let const_bv = variables.build_u64_const(value as u64, size);
+                                variables.eq(token_field_bv._eq(&const_bv));
+                                (s, variables)
+                            })
+                            .collect()
                     }
                     TokenFieldAttach::Literal(_attach_literal_id) => todo!(),
                     TokenFieldAttach::Number(_print_base, _attach_number_id) => todo!(),
-                };
-                let size = token_field_bv.get_size();
-                values
-                    .into_iter()
-                    .filter_map(|(s, value)| {
-                        let in_range = if token_field.raw_value_is_signed() {
-                            let high = value.checked_shr(size - 1).unwrap_or(value >> 63);
-                            high == 0 || high == -1
-                        } else {
-                            (value as u64).checked_shr(size).unwrap_or(0) == 0
-                        };
-                        if !in_range {
-                            log::trace!("Immidiate out of range {} {}", size, value);
-                            return None;
-                        }
-                        let mut variables = variables.clone();
-                        let const_bv = variables.build_u64_const(value as u64, size);
-                        variables.eq(token_field_bv._eq(&const_bv));
-                        Some((s, variables))
-                    })
-                    .collect()
+                }
             }
             DisplayElement::InstStart(_) | DisplayElement::InstNext(_) => {
-                let Some((s, value)) = self.parse_value(false, s) else {
+                let Some((s, value)) = variables.parse_operand(false, s) else {
                     return vec![];
                 };
                 let address = match elem {
@@ -615,8 +662,7 @@ impl InstructionAssembler {
                     }
                     _ => variables.inst_next.clone(),
                 };
-                let const_bv = variables.build_u64_const(value as u64, 64);
-                variables.eq(address._eq(&const_bv));
+                variables.eq(address._eq(&value));
                 vec![(s, variables)]
             }
             DisplayElement::Table(table_id) => {
@@ -634,12 +680,11 @@ impl InstructionAssembler {
             DisplayElement::Disassembly(variable_id) => {
                 let variable = constructor.pattern.disassembly_var(*variable_id);
                 log::trace!("DISASSEMBLY: {:?} {:?}", variable.name(), s);
-                let Some((s, value)) = self.parse_value(true, s) else {
+                let Some((s, value)) = variables.parse_operand(true, s) else {
                     return vec![];
                 };
                 let var = variables.variable(*variable_id);
-                let const_bv = variables.build_u64_const(value as u64, var.get_size());
-                variables.eq(var._eq(&const_bv));
+                variables.eq(var._eq(&value));
                 vec![(s, variables)]
             }
             DisplayElement::Literal(lit) => {
@@ -657,17 +702,6 @@ impl InstructionAssembler {
                     .collect()
             }
         }
-    }
-
-    pub fn parse_value<'a>(&self, signed: bool, s: &'a str) -> Option<(&'a str, i64)> {
-        //TODO: labels?
-        let (s, sign) = match s.strip_prefix('-') {
-            Some(s) if signed => (s, true),
-            _ => (s, false),
-        };
-        let (s, value) = parse_hex(s).or_else(|| parse_dec(s))?;
-        let value = if sign { -(value as i64) } else { value as i64 };
-        Some((s, value))
     }
 
     /// Every register name in the attach list that prefixes `s`, e.g. both `r1` and `r10`,
@@ -756,7 +790,16 @@ mod test {
         input: &str,
         address: u64,
     ) -> Result<Vec<u8>, AsmError> {
-        let constraints = assembler.assemble_instruction_at(input, address)?;
+        assemble_with(assembler, input, address, NO_LABELS)
+    }
+
+    fn assemble_with(
+        assembler: &InstructionAssembler,
+        input: &str,
+        address: u64,
+        labels: &Labels,
+    ) -> Result<Vec<u8>, AsmError> {
+        let constraints = assembler.assemble_instruction_at(input, address, labels)?;
         Ok(constraints
             .to_bytes()
             .expect("Constraints failed to produce bytes"))
@@ -918,6 +961,22 @@ mod test {
     }
 
     #[test]
+    fn risc_label_operands() {
+        let asm = load("examples/risc.slaspec");
+        let labels = Labels::from([("data".to_string(), Some(0x12340000))]);
+        // Only uimm16 << 16 can produce 0x12340000
+        assert_eq!(
+            assemble_with(&asm, "add r1, r0, data", 0, &labels),
+            Ok(vec![0x00, 0x0a, 0x12, 0x34])
+        );
+        // Register names stay registers when labels are defined
+        assert_eq!(
+            assemble_with(&asm, "add r1, r2, r3", 0, &labels),
+            Ok(vec![0xf9, 0x09, 0x80, 0x00])
+        );
+    }
+
+    #[test]
     fn risc_register_operands() {
         let asm = load("examples/risc.slaspec");
         #[rustfmt::skip]
@@ -1031,6 +1090,29 @@ mod test {
             assemble_at(&asm, "jz 0xf81", 0x1000),
             Err(AsmError::NoMatch)
         );
+    }
+
+    #[test]
+    fn cisc_label_operands() {
+        let asm = load("examples/cisc.slaspec");
+        let labels = Labels::from([
+            ("target".to_string(), Some(0x1012)),
+            ("unknown".to_string(), None),
+        ]);
+        let assemble = |input| assemble_with(&asm, input, 0x1000, &labels);
+        assert_eq!(assemble("jz target"), Ok(vec![0x11, 0x10]));
+        assert_eq!(
+            assemble("jmp target"),
+            Ok(vec![0x10, 0x00, 0x00, 0x10, 0x12])
+        );
+        assert_eq!(
+            assemble("mov r1, #target"),
+            Ok(vec![0x01, 0xc8, 0x00, 0x00, 0x10, 0x12])
+        );
+        // An unresolved label can take any value, so only the instruction's shape is known
+        assert_eq!(assemble("jz unknown").map(|bytes| bytes.len()), Ok(2));
+        // Only defined labels are operands
+        assert_eq!(assemble("jz nowhere"), Err(AsmError::NoMatch));
     }
 
     #[test]
