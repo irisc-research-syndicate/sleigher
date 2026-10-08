@@ -84,17 +84,31 @@ pub struct Constraints<'asm> {
     pub fields: HashMap<TokenFieldId, BV<'asm>>,
 
     pub eqs: HashSet<Bool<'asm>>,
+
+    pub inst_start: u64,
+    /// Address after the instruction, tied to its length once the whole instruction is parsed
+    pub inst_next: BV<'asm>,
 }
 
 impl<'asm> Constraints<'asm> {
-    pub fn new(asm: &'asm InstructionAssembler) -> Self {
+    pub fn new(asm: &'asm InstructionAssembler, inst_start: u64) -> Self {
         Self {
             asm,
             token_order: Vec::new(),
             tokens: HashMap::new(),
             fields: HashMap::new(),
             eqs: HashSet::new(),
+            inst_start,
+            inst_next: BV::fresh_const(&asm.ctx, "inst_next", 64),
         }
+    }
+
+    /// Instruction length in bytes from the tokens used so far
+    pub fn len_bytes(&self) -> u64 {
+        self.token_order
+            .iter()
+            .map(|token_id| self.asm.token(*token_id).len_bytes().get())
+            .sum()
     }
 
     pub fn token(&mut self, token_id: TokenId) -> BV<'asm> {
@@ -164,6 +178,11 @@ impl<'asm> Constraints<'asm> {
         }
         self.eqs.extend(other.eqs);
         self.tokens.extend(other.tokens);
+        for token_id in other.token_order {
+            if !self.token_order.contains(&token_id) {
+                self.token_order.push(token_id);
+            }
+        }
     }
 
     pub fn solver(&self) -> z3::Solver<'asm> {
@@ -279,6 +298,25 @@ impl<'asm> Variables<'asm> {
             .clone()
     }
 
+    /// Add disassembly action assignments as constraints
+    pub fn assert_all(&mut self, assertions: &[Assertation]) {
+        for assertion in assertions {
+            match assertion {
+                Assertation::GlobalSet(_global_set) => todo!(),
+                Assertation::Assignment(assignment) => {
+                    let value = self.build_expr_bv(&assignment.right, 64);
+                    match assignment.left {
+                        WriteScope::Context(_context_id) => todo!(),
+                        WriteScope::Local(variable_id) => {
+                            let var = self.variable(variable_id);
+                            self.eq(var._eq(&value))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn build_expr_bv(&mut self, expr: &Expr, sz: u32) -> BV<'asm> {
         let expr_bv = match expr {
             Expr::Value(expr_element) => match expr_element {
@@ -291,10 +329,8 @@ impl<'asm> Variables<'asm> {
                     ReadScope::TokenField(token_field_id) => {
                         self.token_field(*token_field_id, Some(sz))
                     }
-                    ReadScope::InstStart(_inst_start) => {
-                        self.build_u64_const(0x1234567890abcdef, sz)
-                    }
-                    ReadScope::InstNext(_inst_next) => todo!(),
+                    ReadScope::InstStart(_inst_start) => self.build_u64_const(self.inst_start, sz),
+                    ReadScope::InstNext(_inst_next) => self.inst_next.clone(),
                     ReadScope::Local(variable_id) => self.variable(*variable_id),
                 },
                 ExprElement::Op(_span, op_unary, expr) => {
@@ -354,11 +390,21 @@ impl InstructionAssembler {
         }
     }
 
-    /// Assemble one instruction that must consume all of `s` (up to trailing whitespace) and
-    /// have exactly one encoding. Parses that can produce the same bytes count as one encoding.
+    /// Assemble one instruction at address 0, see `assemble_instruction_at`
     pub fn assemble_instruction<'asm>(&'asm self, s: &str) -> Result<Constraints<'asm>, AsmError> {
+        self.assemble_instruction_at(s, 0)
+    }
+
+    /// Assemble one instruction at `inst_start` that must consume all of `s` (up to trailing
+    /// whitespace) and have exactly one encoding. Parses that can produce the same bytes count
+    /// as one encoding.
+    pub fn assemble_instruction_at<'asm>(
+        &'asm self,
+        s: &str,
+        inst_start: u64,
+    ) -> Result<Constraints<'asm>, AsmError> {
         let mut encodings: Vec<Constraints<'asm>> = vec![];
-        for (rest, candidate) in self.assemble_candidates(s) {
+        for (rest, candidate) in self.assemble_candidates_at(s, inst_start) {
             if !rest.trim_end().is_empty() {
                 continue;
             }
@@ -384,16 +430,35 @@ impl InstructionAssembler {
     fn candidate(&self, constraints: &Constraints) -> Candidate {
         let bytes = constraints.to_bytes().unwrap_or_default();
         let disassembly = Disassembler::new(&self.sleigh)
-            .disassemble(0, Context, &bytes)
+            .disassemble(constraints.inst_start, Context, &bytes)
             .map(|instruction| instruction.to_string())
             .unwrap_or_else(|err| format!("<{}>", err));
         Candidate { bytes, disassembly }
     }
 
-    /// Every way the instruction table matches a prefix of `s`
+    /// Every way the instruction table matches a prefix of `s` at address 0
     pub fn assemble_candidates<'a, 'asm>(&'asm self, s: &'a str) -> Parses<'a, Constraints<'asm>> {
-        let constraints = Constraints::new(self);
+        self.assemble_candidates_at(s, 0)
+    }
+
+    /// Every way the instruction table matches a prefix of `s` at `inst_start`. Candidates whose
+    /// constraints fail once `inst_next` is tied to their length (e.g. a branch out of range)
+    /// are dropped.
+    pub fn assemble_candidates_at<'a, 'asm>(
+        &'asm self,
+        s: &'a str,
+        inst_start: u64,
+    ) -> Parses<'a, Constraints<'asm>> {
+        let constraints = Constraints::new(self, inst_start);
         self.assemble_table(self.table(self.instruction_table()), constraints, s)
+            .into_iter()
+            .filter_map(|(rest, mut candidate)| {
+                let inst_next = candidate.build_u64_const(inst_start + candidate.len_bytes(), 64);
+                let eq = candidate.inst_next._eq(&inst_next);
+                candidate.eq(eq);
+                candidate.check().then_some((rest, candidate))
+            })
+            .collect()
     }
 
     pub fn assemble_table<'a, 'asm>(
@@ -461,22 +526,12 @@ impl InstructionAssembler {
                     } => todo!(),
                 }
             }
-            for assertion in block.pre_disassembler() {
-                match assertion {
-                    Assertation::GlobalSet(_global_set) => todo!(),
-                    Assertation::Assignment(assignment) => {
-                        let value = variables.build_expr_bv(&assignment.right, 64);
-                        match assignment.left {
-                            WriteScope::Context(_context_id) => todo!(),
-                            WriteScope::Local(variable_id) => {
-                                let var = variables.variable(variable_id);
-                                variables.eq(var._eq(&value))
-                            }
-                        }
-                    }
-                }
-            }
+            variables.assert_all(block.pre_disassembler());
+            variables.assert_all(block.post_disassembler());
         }
+        // Post-disassembler and post-match assertions are the ones that need inst_next; as
+        // constraints the order they are evaluated in does not matter
+        variables.assert_all(constructor.pattern.disassembly_pos_match());
 
         let mut states = vec![(s, variables)];
         for elem in constructor.display.elements() {
@@ -550,8 +605,20 @@ impl InstructionAssembler {
                     })
                     .collect()
             }
-            DisplayElement::InstStart(_inst_start) => todo!(),
-            DisplayElement::InstNext(_inst_next) => todo!(),
+            DisplayElement::InstStart(_) | DisplayElement::InstNext(_) => {
+                let Some((s, value)) = self.parse_value(false, s) else {
+                    return vec![];
+                };
+                let address = match elem {
+                    DisplayElement::InstStart(_) => {
+                        variables.build_u64_const(variables.inst_start, 64)
+                    }
+                    _ => variables.inst_next.clone(),
+                };
+                let const_bv = variables.build_u64_const(value as u64, 64);
+                variables.eq(address._eq(&const_bv));
+                vec![(s, variables)]
+            }
             DisplayElement::Table(table_id) => {
                 let table = self.table(*table_id);
                 log::trace!("TABLE: {:?}/{:?} {:?}", table.name(), table_id, s);
@@ -681,7 +748,15 @@ mod test {
     }
 
     fn assemble(assembler: &InstructionAssembler, input: &str) -> Result<Vec<u8>, AsmError> {
-        let constraints = assembler.assemble_instruction(input)?;
+        assemble_at(assembler, input, 0)
+    }
+
+    fn assemble_at(
+        assembler: &InstructionAssembler,
+        input: &str,
+        address: u64,
+    ) -> Result<Vec<u8>, AsmError> {
+        let constraints = assembler.assemble_instruction_at(input, address)?;
         Ok(constraints
             .to_bytes()
             .expect("Constraints failed to produce bytes"))
@@ -694,9 +769,17 @@ mod test {
     }
 
     fn assert_encodes(assembler: &InstructionAssembler, tests: &[(&str, Vec<u8>)]) {
+        assert_encodes_at(assembler, 0, tests)
+    }
+
+    fn assert_encodes_at(
+        assembler: &InstructionAssembler,
+        address: u64,
+        tests: &[(&str, Vec<u8>)],
+    ) {
         let mut failures = vec![];
         for (input, expected_bytes) in tests.iter() {
-            match assemble(assembler, input) {
+            match assemble_at(assembler, input, address) {
                 Ok(bytes) if bytes == *expected_bytes => {}
                 result => failures.push(format!(
                     "{:?}: expected {:02x?}, got {:02x?}",
@@ -910,6 +993,50 @@ mod test {
     fn risc_roundtrip() {
         let asm = load("examples/risc.slaspec");
         assert_roundtrips(&asm, 4, 500);
+    }
+
+    #[test]
+    fn cisc_operands() {
+        let asm = load("examples/cisc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("nop", vec![0x00]),
+            ("mov r1, r2", vec![0x01, 0x0a]),
+            ("mov r1, [r2]", vec![0x01, 0x4a]),
+            ("mov r1, [r2+0x4]", vec![0x01, 0x8a, 0x04]),
+            ("mov r1, #0x12345678", vec![0x01, 0xc8, 0x12, 0x34, 0x56, 0x78]),
+            ("cmp r1, #0x2a", vec![0x07, 0xc8, 0x00, 0x00, 0x00, 0x2a]),
+            ("mov [r2], r1", vec![0x08, 0x4a]),
+            ("mov [r2+-0x4], r1", vec![0x08, 0x8a, 0xfc]),
+            ("jmp 0x2000", vec![0x10, 0x00, 0x00, 0x20, 0x00]),
+        ]);
+    }
+
+    #[test]
+    fn cisc_relative_branches() {
+        let asm = load("examples/cisc.slaspec");
+        // dest = inst_next + simm8, with inst_next = 0x1002
+        #[rustfmt::skip]
+        assert_encodes_at(&asm, 0x1000, &[
+            ("jz 0x1012", vec![0x11, 0x10]),
+            ("jz 0x1000", vec![0x11, 0xfe]),
+            ("jnz 0x1081", vec![0x12, 0x7f]),
+            ("jnz 0xf82", vec![0x12, 0x80]),
+        ]);
+        assert_eq!(
+            assemble_at(&asm, "jz 0x1082", 0x1000),
+            Err(AsmError::NoMatch)
+        );
+        assert_eq!(
+            assemble_at(&asm, "jz 0xf81", 0x1000),
+            Err(AsmError::NoMatch)
+        );
+    }
+
+    #[test]
+    fn cisc_roundtrip() {
+        let asm = load("examples/cisc.slaspec");
+        assert_roundtrips(&asm, 6, 2000);
     }
 
     #[test]
