@@ -4,16 +4,6 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
-use nom::{
-    branch::alt,
-    bytes::complete::tag,
-    character::complete::one_of,
-    combinator::{map_res, recognize},
-    multi::many1,
-    sequence::preceded,
-    IResult,
-};
-
 use sleigh_rs::disassembly::{
     Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId, WriteScope,
 };
@@ -24,20 +14,47 @@ use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{token::TokenFieldAttach, Endian, Number, Sleigh, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
 
-fn parse_dec(s: &str) -> IResult<&str, u64> {
-    map_res(recognize(many1(one_of("0123456789"))), |out: &str| {
-        out.parse::<u64>()
-    })(s)
+/// Every way a parser matched a prefix of the input, each with the remaining input.
+/// An empty list means no match.
+pub type Parses<'a, T> = Vec<(&'a str, T)>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsmError {
+    NoMatch,
 }
 
-fn parse_hex(s: &str) -> IResult<&str, u64> {
-    map_res(
-        preceded(
-            alt((tag("0x"), tag("0X"))),
-            recognize(many1(one_of("0123456789abcdefABCDEF"))),
-        ),
-        |out: &str| u64::from_str_radix(out, 16),
-    )(s)
+impl std::fmt::Display for AsmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AsmError::NoMatch => write!(f, "no constructor matches the input"),
+        }
+    }
+}
+
+impl std::error::Error for AsmError {}
+
+fn parse_literal<'a>(lit: &str, s: &'a str) -> Option<&'a str> {
+    s.strip_prefix(lit)
+}
+
+fn parse_space1(s: &str) -> Option<&str> {
+    let rest = s.trim_start_matches([' ', '\t']);
+    (rest.len() < s.len()).then_some(rest)
+}
+
+fn parse_digits(s: &str, radix: u32) -> Option<(&str, u64)> {
+    let len = s.find(|c: char| !c.is_digit(radix)).unwrap_or(s.len());
+    let value = u64::from_str_radix(&s[..len], radix).ok()?;
+    Some((&s[len..], value))
+}
+
+fn parse_hex(s: &str) -> Option<(&str, u64)> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    parse_digits(s, 16)
+}
+
+fn parse_dec(s: &str) -> Option<(&str, u64)> {
+    parse_digits(s, 10)
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +201,7 @@ impl<'asm> Constraints<'asm> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Variables<'asm> {
     constructor: &'asm Constructor,
     constraints: Constraints<'asm>,
@@ -299,10 +316,19 @@ impl InstructionAssembler {
         }
     }
 
+    /// Assemble one instruction, taking the first complete candidate in table order
     pub fn assemble_instruction<'a, 'asm>(
         &'asm self,
         s: &'a str,
-    ) -> IResult<&'a str, Constraints<'asm>> {
+    ) -> Result<(&'a str, Constraints<'asm>), AsmError> {
+        self.assemble_candidates(s)
+            .into_iter()
+            .next()
+            .ok_or(AsmError::NoMatch)
+    }
+
+    /// Every way the instruction table matches a prefix of `s`
+    pub fn assemble_candidates<'a, 'asm>(&'asm self, s: &'a str) -> Parses<'a, Constraints<'asm>> {
         let constraints = Constraints::new(self);
         self.assemble_table(self.table(self.instruction_table()), constraints, s)
     }
@@ -312,28 +338,32 @@ impl InstructionAssembler {
         table: &'asm Table,
         constraints: Constraints<'asm>,
         s: &'a str,
-    ) -> IResult<&'a str, Constraints<'asm>> {
-        for constructor in table.constructors() {
-            match self.assemble_constructor(constructor, constraints.clone(), s) {
-                Ok(x) => return Ok(x),
-                Err(_) => continue,
-            }
-        }
-        nom::combinator::fail(s)
+    ) -> Parses<'a, Constraints<'asm>> {
+        table
+            .constructors()
+            .iter()
+            .flat_map(|constructor| self.assemble_constructor(constructor, constraints.clone(), s))
+            .collect()
     }
 
     pub fn assemble_constructor<'a, 'asm>(
         &'asm self,
         constructor: &'asm Constructor,
-        variables: Constraints<'asm>,
-        mut s: &'a str,
-    ) -> IResult<&'a str, Constraints<'asm>> {
-        if let Some(mneumonic) = constructor.display.mneumonic.as_ref() {
-            s = nom::bytes::complete::tag(mneumonic.as_str())(s)?.0;
-            log::trace!("MNEUMONIC: {}", mneumonic);
-        }
+        constraints: Constraints<'asm>,
+        s: &'a str,
+    ) -> Parses<'a, Constraints<'asm>> {
+        let s = match constructor.display.mneumonic.as_ref() {
+            Some(mneumonic) => match parse_literal(mneumonic, s) {
+                Some(s) => {
+                    log::trace!("MNEUMONIC: {}", mneumonic);
+                    s
+                }
+                None => return vec![],
+            },
+            None => s,
+        };
 
-        let mut variables = Variables::new(variables, constructor);
+        let mut variables = Variables::new(constraints, constructor);
 
         for block in constructor.pattern.blocks() {
             for verification in block.verifications() {
@@ -385,112 +415,148 @@ impl InstructionAssembler {
             }
         }
 
+        let mut states = vec![(s, variables)];
         for elem in constructor.display.elements() {
-            s = match elem {
-                DisplayElement::Varnode(_varnode_id) => todo!(),
-                DisplayElement::Context(_context_id) => todo!(),
-                DisplayElement::TokenField(token_field_id) => {
-                    let token_field = self.token_field(*token_field_id);
-                    log::trace!("TOKEN_FIELD: {:?} {:?}", token_field.name(), s);
-                    let token_field_bv = variables.token_field(*token_field_id, None);
-                    let (s, value) = match token_field.attach {
-                        TokenFieldAttach::NoAttach(value_fmt) => {
-                            self.parse_value(value_fmt.signed, s)?
-                        }
-                        TokenFieldAttach::Varnode(attach_varnode_id) => {
-                            let attach_varnode = self.attach_varnode(attach_varnode_id);
-                            self.parse_attach_varnode(attach_varnode, s)?
-                        }
-                        TokenFieldAttach::Literal(_attach_literal_id) => todo!(),
-                        TokenFieldAttach::Number(_print_base, _attach_number_id) => todo!(),
-                    };
-                    let size = token_field_bv.get_size();
-                    let in_range = if token_field.raw_value_is_signed() {
-                        let high = value.checked_shr(size - 1).unwrap_or(value >> 63);
-                        high == 0 || high == -1
-                    } else {
-                        (value as u64).checked_shr(size).unwrap_or(0) == 0
-                    };
-                    if !in_range {
-                        log::trace!("Immidiate out of range {} {}", size, value);
-                        return nom::combinator::fail(s);
-                    }
-                    let const_bv =
-                        variables.build_u64_const(value as u64, token_field_bv.get_size());
-                    variables.eq(token_field_bv._eq(&const_bv));
-                    s
-                }
-                DisplayElement::InstStart(_inst_start) => todo!(),
-                DisplayElement::InstNext(_inst_next) => todo!(),
-                DisplayElement::Table(table_id) => {
-                    let table = self.table(*table_id);
-                    log::trace!("TABLE: {:?}/{:?} {:?}", table.name(), table_id, s);
-                    let (s, table_constraints) =
-                        self.assemble_table(table, variables.constraints.clone(), s)?;
-                    variables.merge(table_constraints);
-                    s
-                }
-                DisplayElement::Disassembly(variable_id) => {
-                    let variable = constructor.pattern.disassembly_var(*variable_id);
-                    log::trace!("DISASSEMBLY: {:?} {:?}", variable.name(), s);
-                    let (s, value) = self.parse_value(true, s)?;
-                    let var = variables.variable(*variable_id);
-                    let const_bv = variables.build_u64_const(value as u64, var.get_size());
-                    variables.eq(var._eq(&const_bv));
-                    s
-                }
-                DisplayElement::Literal(lit) => {
-                    log::trace!("LITERAL: {:?} {:?}", lit, s);
-                    nom::bytes::complete::tag(lit.as_str())(s)?.0
-                }
-                DisplayElement::Space => {
-                    log::trace!("SPACE: {:?}", s);
-                    nom::character::complete::space1(s)?.0
-                }
-            };
-        }
-
-        if variables.check() {
-            Ok((s, variables.constraints))
-        } else {
-            log::trace!("Constraint check failed, Eqs: {:#?}", variables.eqs);
-            nom::combinator::fail(s)
-        }
-    }
-
-    pub fn parse_value<'a>(&self, signed: bool, s: &'a str) -> IResult<&'a str, i64> {
-        //TODO: labels?
-        let (s, sign) = if signed {
-            if let Some(s) = s.strip_prefix('-') {
-                (s, true)
-            } else {
-                (s, false)
+            states = states
+                .into_iter()
+                .flat_map(|(s, variables)| {
+                    self.assemble_display_element(constructor, elem, variables, s)
+                })
+                .collect();
+            if states.is_empty() {
+                return vec![];
             }
-        } else {
-            (s, false)
-        };
-        let (s, value) = alt((parse_hex, parse_dec))(s)?;
-        let value = if sign { -(value as i64) } else { value as i64 };
-        Ok((s, value))
+        }
+
+        states
+            .into_iter()
+            .filter_map(|(s, variables)| {
+                if variables.check() {
+                    Some((s, variables.constraints))
+                } else {
+                    log::trace!("Constraint check failed, Eqs: {:#?}", variables.eqs);
+                    None
+                }
+            })
+            .collect()
     }
 
+    fn assemble_display_element<'a, 'asm>(
+        &'asm self,
+        constructor: &'asm Constructor,
+        elem: &'asm DisplayElement,
+        mut variables: Variables<'asm>,
+        s: &'a str,
+    ) -> Parses<'a, Variables<'asm>> {
+        match elem {
+            DisplayElement::Varnode(_varnode_id) => todo!(),
+            DisplayElement::Context(_context_id) => todo!(),
+            DisplayElement::TokenField(token_field_id) => {
+                let token_field = self.token_field(*token_field_id);
+                log::trace!("TOKEN_FIELD: {:?} {:?}", token_field.name(), s);
+                let token_field_bv = variables.token_field(*token_field_id, None);
+                let values = match token_field.attach {
+                    TokenFieldAttach::NoAttach(value_fmt) => {
+                        self.parse_value(value_fmt.signed, s).into_iter().collect()
+                    }
+                    TokenFieldAttach::Varnode(attach_varnode_id) => {
+                        let attach_varnode = self.attach_varnode(attach_varnode_id);
+                        self.parse_attach_varnode(attach_varnode, s)
+                    }
+                    TokenFieldAttach::Literal(_attach_literal_id) => todo!(),
+                    TokenFieldAttach::Number(_print_base, _attach_number_id) => todo!(),
+                };
+                let size = token_field_bv.get_size();
+                values
+                    .into_iter()
+                    .filter_map(|(s, value)| {
+                        let in_range = if token_field.raw_value_is_signed() {
+                            let high = value.checked_shr(size - 1).unwrap_or(value >> 63);
+                            high == 0 || high == -1
+                        } else {
+                            (value as u64).checked_shr(size).unwrap_or(0) == 0
+                        };
+                        if !in_range {
+                            log::trace!("Immidiate out of range {} {}", size, value);
+                            return None;
+                        }
+                        let mut variables = variables.clone();
+                        let const_bv = variables.build_u64_const(value as u64, size);
+                        variables.eq(token_field_bv._eq(&const_bv));
+                        Some((s, variables))
+                    })
+                    .collect()
+            }
+            DisplayElement::InstStart(_inst_start) => todo!(),
+            DisplayElement::InstNext(_inst_next) => todo!(),
+            DisplayElement::Table(table_id) => {
+                let table = self.table(*table_id);
+                log::trace!("TABLE: {:?}/{:?} {:?}", table.name(), table_id, s);
+                self.assemble_table(table, variables.constraints.clone(), s)
+                    .into_iter()
+                    .map(|(s, table_constraints)| {
+                        let mut variables = variables.clone();
+                        variables.merge(table_constraints);
+                        (s, variables)
+                    })
+                    .collect()
+            }
+            DisplayElement::Disassembly(variable_id) => {
+                let variable = constructor.pattern.disassembly_var(*variable_id);
+                log::trace!("DISASSEMBLY: {:?} {:?}", variable.name(), s);
+                let Some((s, value)) = self.parse_value(true, s) else {
+                    return vec![];
+                };
+                let var = variables.variable(*variable_id);
+                let const_bv = variables.build_u64_const(value as u64, var.get_size());
+                variables.eq(var._eq(&const_bv));
+                vec![(s, variables)]
+            }
+            DisplayElement::Literal(lit) => {
+                log::trace!("LITERAL: {:?} {:?}", lit, s);
+                parse_literal(lit, s)
+                    .map(|s| (s, variables))
+                    .into_iter()
+                    .collect()
+            }
+            DisplayElement::Space => {
+                log::trace!("SPACE: {:?}", s);
+                parse_space1(s)
+                    .map(|s| (s, variables))
+                    .into_iter()
+                    .collect()
+            }
+        }
+    }
+
+    pub fn parse_value<'a>(&self, signed: bool, s: &'a str) -> Option<(&'a str, i64)> {
+        //TODO: labels?
+        let (s, sign) = match s.strip_prefix('-') {
+            Some(s) if signed => (s, true),
+            _ => (s, false),
+        };
+        let (s, value) = parse_hex(s).or_else(|| parse_dec(s))?;
+        let value = if sign { -(value as i64) } else { value as i64 };
+        Some((s, value))
+    }
+
+    /// Every register name in the attach list that prefixes `s`, e.g. both `r1` and `r10`,
+    /// longest match first
     pub fn parse_attach_varnode<'a>(
         &self,
         attach_varnode: &AttachVarnode,
         s: &'a str,
-    ) -> IResult<&'a str, i64> {
-        let mut attach_varnodes = attach_varnode
+    ) -> Parses<'a, i64> {
+        let mut parses = attach_varnode
             .0
             .iter()
-            .map(|(value, id)| (*value, self.varnode(*id)))
-            .collect::<Vec<_>>();
-        attach_varnodes.sort_by(|(_, v1), (_, v2)| v2.name().cmp(v1.name()));
-        for (value, varnode) in attach_varnodes.into_iter() {
-            if let Some(s) = s.strip_prefix(varnode.name()) {
-                return Ok((s, value as i64));
-            }
-        }
-        nom::combinator::fail(s)
+            .filter_map(|(value, id)| {
+                let s = s.strip_prefix(self.varnode(*id).name())?;
+                Some((s, *value as i64))
+            })
+            .collect::<Parses<'a, i64>>();
+        parses.sort_by_key(|(rest, _)| rest.len());
+        parses
     }
 }
 
