@@ -1,4 +1,4 @@
-use sleigh_rs::{execution::VariableId, varnode::Varnode, SpaceId};
+use sleigh_rs::{varnode::Varnode, SpaceId};
 
 #[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct Address(pub u64);
@@ -37,51 +37,5 @@ impl std::convert::From<&Varnode> for Ref {
             varnode.len_bytes.get() as usize,
             Address(varnode.address),
         )
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
-pub enum Value {
-    Int(u64),
-    Ref(Ref),
-}
-
-impl std::fmt::Debug for Value {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Int(arg0) => write!(f, "Int({:#018x})", arg0),
-            Self::Ref(arg0) => write!(f, "Ref({})", arg0),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
-pub enum Var {
-    Ref(Ref),
-    Local(VariableId),
-}
-
-impl std::fmt::Debug for Var {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ref(arg0) => write!(f, "Ref({})", arg0),
-            Self::Local(arg0) => f.debug_tuple("Local").field(arg0).finish(),
-        }
-    }
-}
-
-impl Value {
-    pub fn to_var(&self) -> Var {
-        match self {
-            Value::Int(address) => Var::Ref(Ref(SpaceId(0), 4, Address(*address))), // fixme: Default memory space is 0???
-            Value::Ref(x) => Var::Ref(*x),
-        }
-    }
-
-    pub fn to_u64(&self) -> u64 {
-        match self {
-            Value::Int(x) => *x,
-            Value::Ref(x) => x.2 .0,
-        }
     }
 }
