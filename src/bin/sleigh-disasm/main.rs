@@ -12,6 +12,10 @@ struct Args {
     address: u64,
 
     code: PathBuf,
+
+    /// Print each instruction's p-code below it
+    #[clap(short, long)]
+    pcode: bool,
 }
 
 fn main() -> Result<()> {
@@ -31,6 +35,16 @@ fn main() -> Result<()> {
 
     while let Ok(instruction) = disassembler.disassemble(pc, Context, cursor) {
         println!("{:#010x}: {}", pc, instruction);
+        if args.pcode {
+            match &instruction.pcode {
+                Ok(ops) => {
+                    for op in ops.iter() {
+                        println!("            {}", op.display(&sleigh));
+                    }
+                }
+                Err(err) => println!("            <{}>", err),
+            }
+        }
         pc += instruction.len as u64;
         cursor = &cursor[instruction.len..];
     }
