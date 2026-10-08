@@ -404,17 +404,17 @@ impl InstructionAssembler {
                         TokenFieldAttach::Literal(_attach_literal_id) => todo!(),
                         TokenFieldAttach::Number(_print_base, _attach_number_id) => todo!(),
                     };
-                    let ivalue = (value as isize) >> token_field_bv.get_size();
-                    if ivalue != 0 && ivalue != -1 {
-                        log::trace!(
-                            "Immidiate out of range {} {} {}",
-                            token_field_bv.get_size(),
-                            value,
-                            ivalue
-                        );
+                    let size = token_field_bv.get_size();
+                    let in_range = if token_field.raw_value_is_signed() {
+                        let high = value.checked_shr(size - 1).unwrap_or(value >> 63);
+                        high == 0 || high == -1
+                    } else {
+                        (value as u64).checked_shr(size).unwrap_or(0) == 0
+                    };
+                    if !in_range {
+                        log::trace!("Immidiate out of range {} {}", size, value);
                         return nom::combinator::fail(s);
                     }
-                    // TODO: check value bits
                     let const_bv =
                         variables.build_u64_const(value as u64, token_field_bv.get_size());
                     variables.eq(token_field_bv._eq(&const_bv));
@@ -497,6 +497,7 @@ impl InstructionAssembler {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::disassembler::{Context, Disassembler};
     use std::path::Path;
 
     fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>, &str)]) {
@@ -532,27 +533,245 @@ mod test {
     #[test]
     pub fn test_vliw_assemble() {
         #[rustfmt::skip]
-        run_tests(
-            "examples/vliw.slaspec",
-            &[
-                ( "{ unk.0x0 r1, r2, 0x1234 ; unk.0xa r5, r1, 0x1234 ; unk.0xb r10, r11, 0 }", vec![0x50, 0x04, 0x4a, 0x28, 0x56, 0xa5, 0x92, 0x34], "",),
-                ( "{ unk.0x0 r1, r2, 0xffffffff87654321 }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21], "",),
-            ],
-        );
+        run_tests("examples/vliw.slaspec", &[
+            ("{ unk.0x0 r1, r2, 0x1234 ; unk.0xa r5, r1, 0x1234 ; unk.0xb r10, r11, 0 }", vec![0x50, 0x04, 0x4a, 0x28, 0x56, 0xa5, 0x92, 0x34], ""),
+            ("{ unk.0x0 r1, r2, 0xffffffff87654321 }", vec![0xc0, 0x04, 0x40, 0x00, 0x87, 0x65, 0x43, 0x21], ""),
+        ]);
     }
 
     #[test]
     pub fn test_risc_assemble() {
         #[rustfmt::skip]
-        run_tests(
-            "examples/risc.slaspec",
-            &[
-                ("xor r2, r15, 0xffff", vec![0x2f, 0x90, 0xff, 0xff], ""),
-                ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
-                ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
-                ("xor r4, r5, 0x23450000", vec![0x2a, 0xa2, 0x23, 0x45], ""),
-                ("and r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x03], ""),
-            ],
+        run_tests("examples/risc.slaspec", &[
+            ("xor r2, r15, 0xffff", vec![0x2f, 0x90, 0xff, 0xff], ""),
+            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
+            ("add r4, r5, 0x1234", vec![0x02, 0xa0, 0x12, 0x34], ""),
+            ("xor r4, r5, 0x23450000", vec![0x2a, 0xa2, 0x23, 0x45], ""),
+            ("and r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x03], ""),
+        ]);
+    }
+
+    fn load(slaspec_path: impl AsRef<Path>) -> InstructionAssembler {
+        let _ = env_logger::try_init();
+        let sleigh = sleigh_rs::file_to_sleigh(slaspec_path.as_ref()).unwrap_or_else(|_| {
+            panic!("Could not load slaspec: {:?}", slaspec_path.as_ref());
+        });
+        InstructionAssembler::new(sleigh)
+    }
+
+    fn assemble(assembler: &InstructionAssembler, input: &str) -> Option<(String, Vec<u8>)> {
+        let (rest, constraints) = assembler.assemble_instruction(input).ok()?;
+        let bytes = constraints.to_bytes()?;
+        Some((rest.to_string(), bytes))
+    }
+
+    fn disassemble(assembler: &InstructionAssembler, bytes: &[u8]) -> Option<String> {
+        let disassembler = Disassembler::new(assembler);
+        let instruction = disassembler.disassemble(0, Context, bytes).ok()?;
+        Some(instruction.to_string())
+    }
+
+    fn assert_encodes(assembler: &InstructionAssembler, tests: &[(&str, Vec<u8>)]) {
+        let mut failures = vec![];
+        for (input, expected_bytes) in tests.iter() {
+            match assemble(assembler, input) {
+                Some((rest, bytes)) if rest.is_empty() && bytes == *expected_bytes => {}
+                result => failures.push(format!(
+                    "{:?}: expected {:02x?}, got {:02x?}",
+                    input, expected_bytes, result
+                )),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    fn assert_rejects(assembler: &InstructionAssembler, inputs: &[&str]) {
+        let mut failures = vec![];
+        for input in inputs.iter() {
+            if let Some(result) = assemble(assembler, input) {
+                failures.push(format!(
+                    "{:?}: expected rejection, got {:02x?}",
+                    input, result
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    fn assert_roundtrips(assembler: &InstructionAssembler, len: usize, count: usize) {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut failures = vec![];
+        let mut checked = 0;
+        for _ in 0..count {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let bytes = &seed.to_be_bytes()[..len];
+            let Some(text) = disassemble(assembler, bytes) else {
+                continue;
+            };
+            checked += 1;
+            let reassembled = assemble(assembler, &text);
+            let redisassembled = reassembled
+                .as_ref()
+                .and_then(|(_, bytes)| disassemble(assembler, bytes));
+            if redisassembled.as_deref() != Some(text.as_str()) {
+                failures.push(format!(
+                    "{:02x?} {:?} -> {:02x?} -> {:?}",
+                    bytes, text, reassembled, redisassembled
+                ));
+            }
+        }
+        assert!(checked > 0, "no generated word disassembled");
+        assert!(
+            failures.is_empty(),
+            "{} of {} round trips failed, first 10:\n{}",
+            failures.len(),
+            checked,
+            failures[..failures.len().min(10)].join("\n")
         );
+    }
+
+    #[test]
+    fn risc_unsigned_immediate() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("sub r0, r0, 0x0", vec![0x08, 0x00, 0x00, 0x00]),
+            ("or r15, r15, 0xffff", vec![0x17, 0xf8, 0xff, 0xff]),
+            ("add r1, r2, 12", vec![0x01, 0x08, 0x00, 0x0c]),
+        ]);
+    }
+
+    #[test]
+    fn risc_signed_immediate() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("add r1, r2, -1", vec![0x01, 0x0c, 0xff, 0xff]),
+            ("add r1, r2, -0x100", vec![0x01, 0x0c, 0xff, 0x00]),
+            ("add r1, r2, -0x8000", vec![0x01, 0x0c, 0x80, 0x00]),
+        ]);
+    }
+
+    #[test]
+    fn risc_shifted_immediate() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("add r1, r2, 0x10000", vec![0x01, 0x0a, 0x00, 0x01]),
+            ("add r1, r2, 0xffff0000", vec![0x01, 0x0a, 0xff, 0xff]),
+            ("add r1, r2, 0x123400", vec![0x01, 0x0e, 0x12, 0x34]),
+        ]);
+    }
+
+    #[test]
+    fn risc_negative_shifted_immediate() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("add r1, r2, -0x10000", vec![0x01, 0x0e, 0xff, 0x00]),
+        ]);
+    }
+
+    #[test]
+    fn risc_all_ones_immediate() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("add r1, r2, 0xffffffffffffffff", vec![0x01, 0x0c, 0xff, 0xff]),
+        ]);
+    }
+
+    #[test]
+    fn risc_register_operands() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("add r0, r0, r0", vec![0xf8, 0x00, 0x00, 0x00]),
+            ("xor r15, r14, r13", vec![0xff, 0x7e, 0x80, 0x04]),
+            ("sub r1, r10, r15", vec![0xfd, 0x0f, 0x80, 0x01]),
+        ]);
+    }
+
+    #[test]
+    fn risc_unknown_opcodes() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("unk.0x7 r3, r4, 0x1", vec![0x3a, 0x18, 0x00, 0x01]),
+            ("unk.0x20 r1, r2, r3", vec![0xf9, 0x09, 0x80, 0x20]),
+        ]);
+    }
+
+    #[test]
+    fn risc_rejects_unencodable() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "",
+            "mul r1, r2, r3",
+            "add r16, r1, r2",
+            "add r1, r2",
+            "add r1, r2,",
+            "add r1, r2, foo",
+            "add r1, r2, 0x10001",
+            "add r1, r2, 0x100000000",
+            "unk.0x20 r1, r2, 0x5",
+        ]);
+    }
+
+    #[test]
+    fn risc_rejects_signed_out_of_range() {
+        let asm = load("examples/risc.slaspec");
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "add r1, r2, -0x8001",
+        ]);
+    }
+
+    #[test]
+    fn risc_returns_remaining_input() {
+        let asm = load("examples/risc.slaspec");
+        let (rest, bytes) = assemble(&asm, "and r1, r2, r3 ; next").unwrap();
+        assert_eq!(rest, " ; next");
+        assert_eq!(bytes, vec![0xf9, 0x09, 0x80, 0x03]);
+
+        let (rest, bytes) = assemble(&asm, "add r4, r5, 0x1234\n").unwrap();
+        assert_eq!(rest, "\n");
+        assert_eq!(bytes, vec![0x02, 0xa0, 0x12, 0x34]);
+    }
+
+    #[test]
+    fn risc_roundtrip() {
+        let asm = load("examples/risc.slaspec");
+        assert_roundtrips(&asm, 4, 500);
+    }
+
+    #[test]
+    fn vliw_four_slot_bundle() {
+        let asm = load("examples/vliw.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("{ unk.0x1 r2, r3, 0 ; unk.0x2 r4, r5, 0 ; unk.0x3 r6, r7, 0 ; unk.0x4 r8, r9 }", vec![0x00, 0x88, 0x62, 0x21, 0x46, 0x63, 0x91, 0x09]),
+        ]);
+    }
+
+    #[test]
+    fn vliw_rejects_unencodable() {
+        let asm = load("examples/vliw.slaspec");
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "{ unk.0x1 r2, r3, 0x5 ; unk.0x2 r4, r5, 0 ; unk.0x3 r6, r7, 0 ; unk.0x4 r8, r9 }",
+            "{ unk.0x0 r32, r1, 0 }",
+            "{ unk.0x20 r1, r2, 0 }",
+            "{ unk.0x0 r1, r2, 0x1 ",
+        ]);
+    }
+
+    #[test]
+    fn vliw_roundtrip() {
+        let asm = load("examples/vliw.slaspec");
+        assert_roundtrips(&asm, 8, 300);
     }
 }
