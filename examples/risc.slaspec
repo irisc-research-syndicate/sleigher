@@ -26,21 +26,21 @@ attach variables [ rs rd rt ] [
     r8 r9 r10 r11 r12 r13 r14 r15
 ];
 
-IMM16: uimm16 is imm16_sx=0 & imm16_hi=0 & uimm16 { }
-IMM16: simm16 is imm16_sx=1 & imm16_hi=0 & simm16 { }
-IMM16: calc is imm16_sx=0 & imm16_hi=1 & uimm16 [ calc = uimm16 << 16; ] { }
-IMM16: calc is imm16_sx=1 & imm16_hi=1 & simm16 [ calc = simm16 << 8; ] { }
+IMM16: uimm16 is imm16_sx=0 & imm16_hi=0 & uimm16 { export *[const]:4 uimm16; }
+IMM16: simm16 is imm16_sx=1 & imm16_hi=0 & simm16 { export *[const]:4 simm16; }
+IMM16: calc is imm16_sx=0 & imm16_hi=1 & uimm16 [ calc = uimm16 << 16; ] { export *[const]:4 calc; }
+IMM16: calc is imm16_sx=1 & imm16_hi=1 & simm16 [ calc = simm16 << 8; ] { export *[const]:4 calc; }
 
 :unk.^op rd, rs, IMM16 is op & rd & rs & IMM16 { }
-:add rd, rs, IMM16 is op=0 & rd & rs & IMM16 { }
-:sub rd, rs, IMM16 is op=1 & rd & rs & IMM16 { }
-:or rd, rs, IMM16 is op=2 & rd & rs & IMM16 { }
-:and rd, rs, IMM16 is op=4 & rd & rs & IMM16 { }
-:xor rd, rs, IMM16 is op=5 & rd & rs & IMM16 { }
+:add rd, rs, IMM16 is op=0 & rd & rs & IMM16 { rd = rs + IMM16; }
+:sub rd, rs, IMM16 is op=1 & rd & rs & IMM16 { rd = rs - IMM16; }
+:or rd, rs, IMM16 is op=2 & rd & rs & IMM16 { rd = rs | IMM16; }
+:and rd, rs, IMM16 is op=4 & rd & rs & IMM16 { rd = rs & IMM16; }
+:xor rd, rs, IMM16 is op=5 & rd & rs & IMM16 { rd = rs ^ IMM16; }
 
 :unk.^funct rd, rs, rt is op=31 & funct & rd & rs & rt { }
-:add rd, rs, rt is op=31 & funct=0 & rd & rs & rt & funct { }
-:sub rd, rs, rt is op=31 & funct=1 & rd & rs & rt & funct { }
-:or rd, rs, rt  is op=31 & funct=2 & rd & rs & rt & funct { }
-:and rd, rs, rt is op=31 & funct=3 & rd & rs & rt & funct { }
-:xor rd, rs, rt is op=31 & funct=4 & rd & rs & rt & funct { }
+:add rd, rs, rt is op=31 & funct=0 & rd & rs & rt & funct { rd = rs + rt; }
+:sub rd, rs, rt is op=31 & funct=1 & rd & rs & rt & funct { rd = rs - rt; }
+:or rd, rs, rt  is op=31 & funct=2 & rd & rs & rt & funct { rd = rs | rt; }
+:and rd, rs, rt is op=31 & funct=3 & rd & rs & rt & funct { rd = rs & rt; }
+:xor rd, rs, rt is op=31 & funct=4 & rd & rs & rt & funct { rd = rs ^ rt; }

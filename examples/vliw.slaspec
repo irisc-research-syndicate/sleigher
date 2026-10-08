@@ -45,24 +45,42 @@ attach variables [ op0_rd op0_rs op1_rd op1_rs op2_rd op2_rs op3_rd op3_rs ] [
     r24 r25 r26 r27 r28 r29 r30 r31
 ];
 
-OP_CONST: 0 is fmt=0 { }
-OP_CONST: fmt1_const is fmt=1 & fmt1_const { }
-OP_CONST: fmt2_const is fmt=2 & fmt2_const { }
-OP_CONST: fmt3_const is fmt=3 & fmt3_const { }
+OP_CONST: 0 is fmt=0 { export 0:4; }
+OP_CONST: fmt1_const is fmt=1 & fmt1_const { export *[const]:4 fmt1_const; }
+OP_CONST: fmt2_const is fmt=2 & fmt2_const { export *[const]:4 fmt2_const; }
+OP_CONST: fmt3_const is fmt=3 & fmt3_const { export *[const]:4 fmt3_const; }
 
-OP1_CONST: OP_CONST is op1_const_zero=0 & OP_CONST { }
-OP1_CONST: 0 is op1_const_zero=1 { }
+OP1_CONST: OP_CONST is op1_const_zero=0 & OP_CONST { export OP_CONST; }
+OP1_CONST: 0 is op1_const_zero=1 { export 0:4; }
 
-OP2_CONST: OP_CONST is op2_const_zero=0 & OP_CONST { }
-OP2_CONST: 0 is op2_const_zero=1 { }
+OP2_CONST: OP_CONST is op2_const_zero=0 & OP_CONST { export OP_CONST; }
+OP2_CONST: 0 is op2_const_zero=1 { export 0:4; }
 
 OP0:"unk."^op0 op0_rd, op0_rs, OP_CONST is op0 & op0_rd & op0_rs & OP_CONST { }
+OP0:"add" op0_rd, op0_rs, OP_CONST is op0=0x10 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs + OP_CONST; }
+OP0:"sub" op0_rd, op0_rs, OP_CONST is op0=0x11 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs - OP_CONST; }
+OP0:"and" op0_rd, op0_rs, OP_CONST is op0=0x12 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs & OP_CONST; }
+OP0:"or" op0_rd, op0_rs, OP_CONST is op0=0x13 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs | OP_CONST; }
+OP0:"xor" op0_rd, op0_rs, OP_CONST is op0=0x14 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs ^ OP_CONST; }
 
 OP1:"unk."^op1 op1_rd, op1_rs, OP1_CONST is op1 & op1_rd & op1_rs & OP1_CONST { }
+OP1:"add" op1_rd, op1_rs, OP1_CONST is op1=0x10 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs + OP1_CONST; }
+OP1:"sub" op1_rd, op1_rs, OP1_CONST is op1=0x11 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs - OP1_CONST; }
+OP1:"and" op1_rd, op1_rs, OP1_CONST is op1=0x12 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs & OP1_CONST; }
+OP1:"or" op1_rd, op1_rs, OP1_CONST is op1=0x13 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs | OP1_CONST; }
+OP1:"xor" op1_rd, op1_rs, OP1_CONST is op1=0x14 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs ^ OP1_CONST; }
 
 OP2:"unk."^op2 op2_rd, op2_rs, OP2_CONST is op2 & op2_rd & op2_rs & OP2_CONST { }
+OP2:"add" op2_rd, op2_rs, OP2_CONST is op2=0x10 & op2_rd & op2_rs & OP2_CONST { op2_rd = op2_rs + OP2_CONST; }
+OP2:"sub" op2_rd, op2_rs, OP2_CONST is op2=0x11 & op2_rd & op2_rs & OP2_CONST { op2_rd = op2_rs - OP2_CONST; }
+OP2:"and" op2_rd, op2_rs, OP2_CONST is op2=0x12 & op2_rd & op2_rs & OP2_CONST { op2_rd = op2_rs & OP2_CONST; }
+OP2:"or" op2_rd, op2_rs, OP2_CONST is op2=0x13 & op2_rd & op2_rs & OP2_CONST { op2_rd = op2_rs | OP2_CONST; }
+OP2:"xor" op2_rd, op2_rs, OP2_CONST is op2=0x14 & op2_rd & op2_rs & OP2_CONST { op2_rd = op2_rs ^ OP2_CONST; }
 
 OP3:"unk."^op3 op3_rd, op3_rs is op3 & op3_rd & op3_rs { }
+OP3:"mov" op3_rd, op3_rs is op3=0x10 & op3_rd & op3_rs { op3_rd = op3_rs; }
+OP3:"add" op3_rd, op3_rs is op3=0x11 & op3_rd & op3_rs { op3_rd = op3_rd + op3_rs; }
+OP3:"sub" op3_rd, op3_rs is op3=0x12 & op3_rd & op3_rs { op3_rd = op3_rd - op3_rs; }
 
 :"{" OP0 ";" OP1 ";" OP2 ";" OP3 "}" is fmt=0 & OP0 & OP1 & OP2 & OP3 {
     build OP0;
