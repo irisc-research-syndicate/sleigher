@@ -10,7 +10,7 @@ use sleigh_rs::disassembly::{
     Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId, WriteScope,
 };
 use sleigh_rs::display::DisplayElement;
-use sleigh_rs::meaning::{AttachVarnode, Meaning};
+use sleigh_rs::meaning::{AttachNumber, AttachVarnode, Meaning};
 use sleigh_rs::pattern::{CmpOp, Verification};
 use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{ContextId, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
@@ -20,7 +20,7 @@ use anyhow::{anyhow, bail};
 
 use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
-use crate::value::parse_number;
+use crate::value::{parse_number, parse_number_exact};
 
 /// Labels a program defines: resolved to an address, or `None` while their address is unknown
 pub type Labels = BTreeMap<String, Option<u64>>;
@@ -109,6 +109,33 @@ impl std::error::Error for AsmError {}
 
 fn parse_literal<'a>(lit: &str, s: &'a str) -> Option<&'a str> {
     s.strip_prefix(lit)
+}
+
+/// Every index whose name prefixes `s`, e.g. both `r1` and `r10`, longest match first.
+/// Indices that share a name each give a parse.
+fn parse_attach_names<'a, 'n>(
+    names: impl Iterator<Item = (usize, &'n str)>,
+    s: &'a str,
+) -> Parses<'a, i64> {
+    let mut parses = names
+        .filter_map(|(index, name)| Some((s.strip_prefix(name)?, index as i64)))
+        .collect::<Parses<'a, i64>>();
+    parses.sort_by_key(|(rest, _)| rest.len());
+    parses
+}
+
+/// Every index whose number in the attach list is the decimal or hex number that starts `s`.
+/// Indices that share a number each give a parse.
+fn parse_attach_number<'a>(attach_number: &AttachNumber, s: &'a str) -> Parses<'a, i64> {
+    let Some((s, operand)) = parse_number_exact(true, s) else {
+        return vec![];
+    };
+    attach_number
+        .0
+        .iter()
+        .filter(|(_, number)| number.signed_super() == operand)
+        .map(|(index, _)| (s, *index as i64))
+        .collect()
 }
 
 fn parse_space1(s: &str) -> Option<&str> {
@@ -1139,29 +1166,35 @@ impl InstructionAssembler {
         mut variables: Variables<'asm>,
         s: &'a str,
     ) -> Parses<'a, Variables<'asm>> {
-        match meaning {
+        let indices = match meaning {
             Meaning::NoAttach(value_fmt) => {
                 let Some((s, operand)) = variables.parse_operand(value_fmt.signed, s) else {
                     return vec![];
                 };
                 // This rejects operands that do not fit the value
                 variables.eq(value._eq(&operand));
-                vec![(s, variables)]
+                return vec![(s, variables)];
             }
             Meaning::Varnode(attach_varnode_id) => {
-                let attach_varnode = self.attach_varnode(attach_varnode_id);
-                self.parse_attach_varnode(attach_varnode, s)
-                    .into_iter()
-                    .map(|(s, index)| {
-                        let mut variables = variables.clone();
-                        let index = variables.build_i64_const(index, 64);
-                        variables.eq(value._eq(&index));
-                        (s, variables)
-                    })
-                    .collect()
+                self.parse_attach_varnode(self.attach_varnode(attach_varnode_id), s)
             }
-            Meaning::Literal(_) | Meaning::Number(..) => todo!(),
-        }
+            Meaning::Literal(attach_literal_id) => {
+                let names = self.attach_literal(attach_literal_id).0.iter();
+                parse_attach_names(names.map(|(index, name)| (*index, name.as_str())), s)
+            }
+            Meaning::Number(_, attach_number_id) => {
+                parse_attach_number(self.attach_number(attach_number_id), s)
+            }
+        };
+        indices
+            .into_iter()
+            .map(|(s, index)| {
+                let mut variables = variables.clone();
+                let index = variables.build_i64_const(index, 64);
+                variables.eq(value._eq(&index));
+                (s, variables)
+            })
+            .collect()
     }
 
     /// Every register name in the attach list that prefixes `s`, e.g. both `r1` and `r10`,
@@ -1171,16 +1204,11 @@ impl InstructionAssembler {
         attach_varnode: &AttachVarnode,
         s: &'a str,
     ) -> Parses<'a, i64> {
-        let mut parses = attach_varnode
+        let names = attach_varnode
             .0
             .iter()
-            .filter_map(|(value, id)| {
-                let s = s.strip_prefix(self.varnode(*id).name())?;
-                Some((s, *value as i64))
-            })
-            .collect::<Parses<'a, i64>>();
-        parses.sort_by_key(|(rest, _)| rest.len());
-        parses
+            .map(|(index, id)| (*index, self.varnode(*id).name()));
+        parse_attach_names(names, s)
     }
 }
 
@@ -1917,6 +1945,20 @@ mod test {
             .expect("Constraints failed to produce bytes"))
     }
 
+    fn assert_context_cases(assembler: &InstructionAssembler, tests: &[ContextCase]) {
+        let mut failures = vec![];
+        for (input, values, expected) in tests {
+            let result = assemble_in(assembler, input, values);
+            if result != *expected {
+                failures.push(format!(
+                    "{:?} in {:?}: expected {:?}, got {:?}",
+                    input, values, expected, result
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     #[test]
     fn context_assemble() {
         let asm = load("examples/context.slaspec");
@@ -1943,17 +1985,7 @@ mod test {
             ("inc r7", &[("bank", 1)], Ok(vec![0x00, 0x00, 0x00, 0x08])),
             ("inc r6", &[("bank", 1)], Err(AsmError::NoMatch)),
         ];
-        let mut failures = vec![];
-        for (input, values, expected) in tests {
-            let result = assemble_in(&asm, input, values);
-            if result != *expected {
-                failures.push(format!(
-                    "{:?} in {:?}: expected {:?}, got {:?}",
-                    input, values, expected, result
-                ));
-            }
-        }
-        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+        assert_context_cases(&asm, tests);
     }
 
     /// Program assembly follows the context from line to line like the emulator does
@@ -1985,5 +2017,57 @@ mod test {
             .assemble_program_in_context("sub r1, r1, 0x2", 0x1000, &mode1)
             .unwrap();
         assert_eq!(program.bytes, vec![0x02, 0x00, 0x11, 0x01]);
+    }
+
+    #[test]
+    fn attach_names_and_values() {
+        let asm = load("examples/attach.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("b.eq 0x5", vec![0x10, 0x05]),
+            ("b.le 0x5", vec![0x13, 0x05]),
+            ("b.l 0x5", vec![0x16, 0x05]),
+            ("shl r1, -0x2", vec![0x24, 0x80]),
+            ("shl r3, -1", vec![0x2d, 0x00]),
+            ("shl r0, 0x4", vec![0x23, 0x00]),
+            ("shl r0, 0", vec![0x21, 0x80]),
+            ("lds r0, 0x10", vec![0x30, 0x40]),
+            ("lds r2, 8", vec![0x38, 0x30]),
+        ]);
+        // Indices that share a name or number are distinct encodings
+        #[rustfmt::skip]
+        assert_ambiguous(&asm, &[
+            ("b.al 0x5", 2),
+            ("lds r0, 0x1", 2),
+        ]);
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "b.xx 0x5",
+            "b.lee 0x5",
+            "shl r0, 0x3",
+            "shl r0, -0x3",
+            "lds r0, 0x3",
+            "lds r0, -0x1",
+        ]);
+    }
+
+    #[test]
+    fn attach_roundtrip() {
+        let asm = load("examples/attach.slaspec");
+        assert_roundtrips(&asm, 2, 300);
+    }
+
+    #[test]
+    fn attach_names_on_context() {
+        let asm = load("examples/attach.slaspec");
+        let none: &[(&str, i64)] = &[];
+        #[rustfmt::skip]
+        let tests: &[ContextCase] = &[
+            ("ld.b r1", none, Ok(vec![0x64, 0x00])),
+            ("ld.w r1", &[("size", 2)], Ok(vec![0x64, 0x00])),
+            ("ld.w r1", none, Err(AsmError::NoMatch)),
+            ("ld.x r1", none, Err(AsmError::NoMatch)),
+        ];
+        assert_context_cases(&asm, tests);
     }
 }

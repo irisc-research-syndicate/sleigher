@@ -1,0 +1,45 @@
+# Token fields and context variables displayed through attach names and attach values:
+# - a name used by more than one index (al) and a name that prefixes another (l, le)
+# - signed values (shl) and a value used by more than one index (lds), printed in hex and
+#   parsed in either base
+# - a context variable with attached names (ld)
+#
+#   [op:4] [cond:4] [imm8:8]               b.<cond> imm8
+#   [op:4] [reg:2] [amt:3] [scale:3] [..]  shl/lds/ld
+
+define endian=big;
+define alignment=1;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [ r0 r1 r2 r3 ];
+define register offset=0x100 size=4 contextreg;
+
+define context contextreg
+    size=(0, 1)
+;
+
+define token instr(16)
+    op=(12, 15)
+    cond=(8, 11)
+    imm8=(0, 7)
+    reg=(10, 11)
+    amt=(7, 9)
+    scale=(4, 6)
+    pad=(0, 3)
+;
+
+attach variables [ reg ] [ r0 r1 r2 r3 ];
+attach names [ cond ] [
+    "eq" "ne" "lt" "le" "gt" "ge" "l" "al"
+    "al" "cs" "cc" "mi" "pl" "vs" "vc" "hi"
+];
+attach values [ amt ] [ -4 -2 -1 0 1 2 4 8 ];
+attach values [ scale ] [ 1 2 4 8 16 1 32 64 ];
+attach names [ size ] [ "b" "h" "w" "d" ];
+
+:b.^cond imm8 is op=1 & cond & imm8 { }
+:shl reg, amt is op=2 & reg & amt { }
+:lds reg, scale is op=3 & reg & scale { }
+:ld.^size reg is op=6 & reg { }
