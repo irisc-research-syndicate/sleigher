@@ -6,7 +6,9 @@ use sleigh_rs::{Endian, Sleigh, SpaceId, UserFunctionId};
 
 use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
-use crate::pcode::{size_mask, BranchTarget, OpCode, PcodeOp, Varnode, VarnodeSpace};
+use crate::pcode::{
+    size_mask, BranchTarget, DisplayVarnode, OpCode, PcodeOp, Varnode, VarnodeSpace,
+};
 use crate::space::{HashSpace, MemoryRegion};
 use crate::value::{Address, Ref};
 
@@ -279,23 +281,32 @@ impl PcodeExecutor<'_> {
         Ok(inst_next)
     }
 
-    /// Where a branch op's target goes
-    fn target(op: &PcodeOp) -> Result<Flow> {
-        Ok(
-            match op.branch_target().context("branch without a target")? {
-                BranchTarget::Relative(offset) => Flow::Relative(offset),
-                BranchTarget::Address(_, address) => Flow::Address(address),
-            },
-        )
+    /// Where a branch op's target goes, which has to be in the code space
+    fn target(&self, op: &PcodeOp) -> Result<Flow> {
+        match op.branch_target().context("branch without a target")? {
+            BranchTarget::Relative(offset) => Ok(Flow::Relative(offset)),
+            BranchTarget::Address(VarnodeSpace::Space(space), address)
+                if space == self.sleigh.default_space() =>
+            {
+                Ok(Flow::Address(address))
+            }
+            BranchTarget::Address(..) => bail!(
+                "branch to {} outside the code space",
+                DisplayVarnode {
+                    varnode: &op.inputs[0],
+                    sleigh: self.sleigh
+                }
+            ),
+        }
     }
 
     fn execute_op(&mut self, op: &PcodeOp) -> Result<Flow> {
         use OpCode::*;
         let flow = match op.opcode {
-            Branch | Call => Self::target(op)?,
+            Branch | Call => self.target(op)?,
             CBranch => {
                 if self.input(op, 1)? != 0 {
-                    Self::target(op)?
+                    self.target(op)?
                 } else {
                     Flow::Next
                 }
@@ -1168,5 +1179,26 @@ mod test {
         assert_eq!(get_reg(&mut cpu, "r1"), 0xffffffff);
         // Each bne step runs its delay slot, which is never stepped on its own
         assert_eq!(steps, 2 + 5 * 2);
+    }
+
+    #[test]
+    fn branch_targets() {
+        let sleigh = load("examples/flow.slaspec");
+        // jd [r0] goes to the value of r0, not to where r0 is
+        let mut cpu = new_cpu(&sleigh, &[0x00, 0x00, 0x00, 0x0d]);
+        cpu.state
+            .write_ref(reg_ref(&cpu, "r0"), &0x1234u32.to_le_bytes())
+            .unwrap();
+        cpu.step().unwrap();
+        assert_eq!(cpu.state.pc, 0x1234);
+
+        // jio 0x200 goes to the io space, which holds no code
+        let mut cpu = new_cpu(&sleigh, &[0x00, 0x02, 0x00, 0x06]);
+        let err = cpu.step().unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("outside the code space"),
+            "{:#}",
+            err
+        );
     }
 }

@@ -9,6 +9,7 @@ define space io type=ram_space size=4;
 define space register type=register_space size=4;
 
 define register offset=0x00 size=4 [ r0 r1 lr ];
+define ram offset=0x40 size=4 [ vec ];
 
 define token instr(32)
     op=(24, 31)
@@ -20,6 +21,9 @@ attach variables [ rsel ] [ r0 _ ];
 
 Dest: imm16 is imm16 { export *:4 imm16; }
 IoDest: imm16 is imm16 { export *[io]:4 imm16; }
+# Memory at the address in r0 or in vec
+DynR: "[r0]" is imm16 { export *:4 r0; }
+DynV: "[vec]" is imm16 { export *:4 vec; }
 
 :nop is op=0 { }
 :jmp Dest is op=1 & Dest { goto Dest; }
@@ -36,3 +40,7 @@ IoDest: imm16 is imm16 { export *[io]:4 imm16; }
 :skipz is op=11 { if (r0 == 0) goto inst_next; }
 # Not lifted with rsel=1, which has no register
 :bad is op=12 & rsel { rsel = 0; }
+# Through memory at a dynamic address, branching to the value of r0 or vec
+:jd DynR is op=13 & DynR { goto DynR; }
+:calld DynR is op=14 & DynR { call DynR; }
+:jv DynV is op=15 & DynV { goto DynV; }

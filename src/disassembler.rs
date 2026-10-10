@@ -1262,6 +1262,10 @@ mod test {
             (9, "callz 0x200", &[0x104, 0x200]),
             (10, "loop", &[]),
             (11, "skipz", &[0x104]),
+            // Through memory at a dynamic address, not to where the address is kept
+            (13, "jd [r0]", &[]),
+            (14, "calld [r0]", &[0x104]),
+            (15, "jv [vec]", &[]),
         ];
         for (op, text, flows) in tests {
             let instruction = decode(*op, 0x200);

@@ -833,7 +833,7 @@ impl<'s> Lifter<'s> {
         let addr_size = self.sleigh.addr_bytes().get() as u32;
         // A direct branch goes to the address the destination names, an indirect one to the
         // value it holds
-        let target = if cpu_branch.direct {
+        let (target, direct) = if cpu_branch.direct {
             match &cpu_branch.dst {
                 Expr::Value(ExprElement::Value {
                     value: ExprValue::Table(table_id),
@@ -841,19 +841,25 @@ impl<'s> Lifter<'s> {
                 }) => {
                     let handle = self.table_export(scope, *table_id)?;
                     match (handle.fixed_address(self.sleigh), handle) {
-                        (Some((space, offset)), _) => Varnode {
-                            space: VarnodeSpace::Space(space),
-                            offset,
-                            size: addr_size,
-                        },
-                        (None, Handle::Pointer { addr, .. }) => addr,
-                        (None, Handle::Direct(varnode)) => varnode,
+                        (Some((space, offset)), _) => {
+                            let target = Varnode {
+                                space: VarnodeSpace::Space(space),
+                                offset,
+                                size: addr_size,
+                            };
+                            (target, true)
+                        }
+                        // The address of memory at a dynamic address is that address, so it is
+                        // branched to indirectly. Ghidra loads through the pointer and branches
+                        // to the temporary instead, which likewise gives no flow target
+                        (None, Handle::Pointer { addr, .. }) => (addr, false),
+                        (None, Handle::Direct(varnode)) => (varnode, true),
                     }
                 }
-                dst => self.expr(scope, dst, Some(addr_size))?,
+                dst => (self.expr(scope, dst, Some(addr_size))?, true),
             }
         } else {
-            self.expr(scope, &cpu_branch.dst, Some(addr_size))?
+            (self.expr(scope, &cpu_branch.dst, Some(addr_size))?, false)
         };
         let target = if target.is_const() {
             Varnode {
@@ -864,7 +870,7 @@ impl<'s> Lifter<'s> {
         } else {
             target
         };
-        let is_address = matches!(target.space, VarnodeSpace::Space(_)) && cpu_branch.direct;
+        let is_address = matches!(target.space, VarnodeSpace::Space(_)) && direct;
 
         let opcode = match (cpu_branch.call, is_address) {
             (BranchCall::Goto, true) => OpCode::Branch,
@@ -1663,5 +1669,18 @@ mod test {
                 "delay slot at 0x1001: empty".to_string()
             ))
         );
+    }
+
+    /// A direct branch to memory at a dynamic address goes to the address, indirectly
+    #[test]
+    fn dynamic_branch_pcode() {
+        let sleigh = load("examples/flow.slaspec");
+        #[rustfmt::skip]
+        assert_lifts(&sleigh, &[
+            (vec![0x00, 0x00, 0x00, 0x0d], "jd [r0]", &["BRANCHIND r0"]),
+            (vec![0x00, 0x00, 0x00, 0x0e], "calld [r0]", &["CALLIND r0"]),
+            (vec![0x00, 0x00, 0x00, 0x0f], "jv [vec]", &["BRANCHIND vec"]),
+            (vec![0x00, 0x20, 0x00, 0x01], "jmp 0x2000", &["BRANCH ram[0x2000]:4"]),
+        ]);
     }
 }
