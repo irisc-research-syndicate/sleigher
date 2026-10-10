@@ -59,20 +59,26 @@ impl<'sleigh> Disassembler<'sleigh> {
         let mut delay_slot_error = None;
         while fallthrough < table.inst_next + delay_slot_len {
             let offset = (fallthrough - inst_start) as usize;
-            match self.decode(fallthrough, flow, &bytes[offset..]) {
-                Ok((slot, _)) if slot.len > 0 => {
+            let address = fallthrough;
+            let err = match self.decode(address, flow, &bytes[offset..]) {
+                Ok((slot, _)) if slot.len == 0 => "empty".to_string(),
+                Ok((slot, _)) => {
+                    // A nested delay slot is still listed as in the delay slot
+                    let nested = slot.delay_slot_len() > 0;
                     fallthrough = slot.inst_next;
                     delay_slots.push(slot);
+                    if !nested {
+                        continue;
+                    }
+                    "nested delay slot".to_string()
                 }
-                result => {
-                    let err = result.map_or_else(|err| err.to_string(), |_| "empty".to_string());
-                    delay_slot_error = Some(LiftError::Invalid(format!(
-                        "delay slot at {:#x}: {}",
-                        fallthrough, err
-                    )));
-                    break;
-                }
-            }
+                Err(err) => err.to_string(),
+            };
+            delay_slot_error = Some(LiftError::Invalid(format!(
+                "delay slot at {:#x}: {}",
+                address, err
+            )));
+            break;
         }
 
         let pcode = match delay_slot_error {

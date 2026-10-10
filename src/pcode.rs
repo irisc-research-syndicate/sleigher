@@ -1357,11 +1357,18 @@ mod test {
 
         // Without the bytes after it, or with a branch in its delay slot, a branch still
         // disassembles
-        for bytes in [&jal[..4], &[0x0c, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x08, 0x00]] {
+        let nested = [0x0c, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x08, 0x00];
+        let missing = "delay slot at 0x1004: instruction: Failed to disassemble table";
+        for (bytes, err) in [
+            (&jal[..4], missing),
+            (&nested, "delay slot at 0x1004: nested delay slot"),
+        ] {
             let (text, pcode) = lift_text(&sleigh, &context, 0x1000, bytes);
             assert_eq!(text, "jal 0x2000");
-            assert!(matches!(pcode, Err(LiftError::Invalid(_))), "{:?}", pcode);
+            assert_eq!(pcode, Err(LiftError::Invalid(err.to_string())));
         }
+        let instruction = disassembler.disassemble(0x1000, &context, &nested).unwrap();
+        assert_eq!(instruction.fallthrough(), 0x1008);
     }
 
     #[test]
