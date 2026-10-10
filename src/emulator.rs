@@ -792,6 +792,45 @@ mod test {
         assert_eq!(cpu.state.pc, BASE);
     }
 
+    /// Partial writes through a pointer keep the bytes they do not select, in either byte order
+    fn assert_partial_writes(sleigh: &Sleigh) {
+        let regs: &[(&str, u64)] = &[("r0", 0xaabbccdd), ("r1", 0x2000)];
+        let mem: &[(u64, u32)] = &[(0x2000, 0x11223344), (0x2004, 0x55667788)];
+        #[rustfmt::skip]
+        assert_executes(sleigh, &[
+            ("sth [r1], r0", vec![0x03, 0x01], regs, mem, &[], &[(0x2000, 0x1122ccdd), (0x2004, 0x55667788)]),
+            ("stbits [r1], r0", vec![0x04, 0x01], regs, mem, &[], &[(0x2000, 0x11223dd4), (0x2004, 0x55667788)]),
+            ("stmid [r1], r0", vec![0x05, 0x01], regs, mem, &[], &[(0x2000, 0x11ccdd44), (0x2004, 0x55667788)]),
+        ]);
+    }
+
+    #[test]
+    fn partial_writes_little_endian() {
+        assert_partial_writes(&load("examples/pcode.slaspec"));
+    }
+
+    #[test]
+    fn partial_writes_big_endian() {
+        let spec = std::fs::read_to_string("examples/pcode.slaspec")
+            .unwrap()
+            .replace("define endian=little;", "define endian=big;");
+        let path =
+            std::env::temp_dir().join(format!("sleigher-pcode-be-{}.slaspec", std::process::id()));
+        // Removes the spec even if loading it panics
+        struct TempFile(std::path::PathBuf);
+        impl Drop for TempFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        std::fs::write(&path, spec).unwrap();
+        let file = TempFile(path);
+        let sleigh = load(&file.0);
+        drop(file);
+        assert_eq!(sleigh.endian(), Endian::Big);
+        assert_partial_writes(&sleigh);
+    }
+
     #[test]
     fn belt_drops() {
         let sleigh = load("examples/belt.slaspec");

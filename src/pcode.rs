@@ -319,6 +319,23 @@ fn unsupported<T>(what: impl std::fmt::Debug) -> LiftResult<T> {
     Err(LiftError::Unsupported(format!("{:?}", what)))
 }
 
+/// The bits of a `bits` wide value a partial write op selects, all of them without one
+fn assignment_bits(op: &Option<AssignmentOp>, bits: u64) -> LiftResult<std::ops::Range<u64>> {
+    let range = match op {
+        None => 0..bits,
+        Some(AssignmentOp::TakeLsb(bytes)) => 0..8 * bytes.get(),
+        Some(AssignmentOp::TrunkLsb(bytes)) => 8 * bytes..bits,
+        Some(AssignmentOp::BitRange(range)) => range.clone(),
+    };
+    if range.start >= range.end || range.end > bits {
+        return Err(LiftError::Invalid(format!(
+            "{:?} is outside of {} bits",
+            op, bits
+        )));
+    }
+    Ok(range)
+}
+
 fn bits_to_bytes(bits: u64) -> u32 {
     bits.div_ceil(8).max(1) as u32
 }
@@ -507,6 +524,18 @@ impl<'s> Lifter<'s> {
             size,
             ..varnode
         })
+    }
+
+    /// `addr` advanced by `offset` bytes
+    fn offset_addr(&mut self, addr: Varnode, offset: u32) -> Varnode {
+        if offset == 0 {
+            addr
+        } else if addr.is_const() {
+            Varnode::constant(addr.offset.wrapping_add(offset as u64), addr.size)
+        } else {
+            let offset = Varnode::constant(offset as u64, addr.size);
+            self.op(OpCode::IntAdd, addr.size, vec![addr, offset])
+        }
     }
 
     fn lift_table(
@@ -813,13 +842,9 @@ impl<'s> Lifter<'s> {
         self.resize(masked, size)
     }
 
-    /// Write bits `range` of `target` with the low bits of `value`
-    fn write_bits(
-        &mut self,
-        target: Varnode,
-        range: std::ops::Range<u64>,
-        value: Varnode,
-    ) -> LiftResult<()> {
+    /// Write bits `range` of `target`, as `assignment_bits` checked them, with the low bits
+    /// of `value`
+    fn write_bits(&mut self, target: Varnode, range: std::ops::Range<u64>, value: Varnode) {
         let size = target.size;
         let len = range.end - range.start;
         let field_mask = if len >= 64 { u64::MAX } else { (1 << len) - 1 };
@@ -841,7 +866,6 @@ impl<'s> Lifter<'s> {
             vec![target, Varnode::constant(!mask & size_mask(size), size)],
         );
         self.emit(OpCode::IntOr, Some(target), vec![old_bits, new_bits]);
-        Ok(())
     }
 
     /// Write `value` to `target`, through a partial write op if any. `first_op` is where the
@@ -853,19 +877,16 @@ impl<'s> Lifter<'s> {
         value: Varnode,
         first_op: usize,
     ) -> LiftResult<()> {
-        let target = match op {
-            None => target,
-            Some(AssignmentOp::TakeLsb(bytes)) => {
-                self.sub_varnode(target, 0, bytes.get() as u32)?
-            }
-            Some(AssignmentOp::TrunkLsb(bytes)) => {
-                let bytes = *bytes as u32;
-                self.sub_varnode(target, bytes, target.size.saturating_sub(bytes))?
-            }
-            Some(AssignmentOp::BitRange(range)) => {
-                return self.write_bits(target, range.clone(), value)
-            }
-        };
+        let bits = assignment_bits(op, 8 * target.size as u64)?;
+        if let Some(AssignmentOp::BitRange(_)) = op {
+            self.write_bits(target, bits, value);
+            return Ok(());
+        }
+        let (offset, len) = (
+            (bits.start / 8) as u32,
+            ((bits.end - bits.start) / 8) as u32,
+        );
+        let target = self.sub_varnode(target, offset, len)?;
         let value = self.resize(value, target.size);
         let computed_here = self.ops.len() > first_op;
         if let Some(last) = self.ops.last_mut() {
@@ -884,14 +905,14 @@ impl<'s> Lifter<'s> {
                 value: AssignmentWriteVariable::Bitrange(bitrange_id),
                 op,
             } => {
-                if op.is_some() {
-                    return unsupported(op);
-                }
                 let bitrange = self.sleigh.bitrange(*bitrange_id);
                 let target = self.register(bitrange.varnode);
-                let range = bitrange.bits.start()..bitrange.bits.end().get();
+                // A partial write op selects bits inside the bitrange
+                let start = bitrange.bits.start();
+                let range = assignment_bits(op, bitrange.bits.len().get())?;
                 let value = self.expr(scope, &assignment.right, None)?;
-                self.write_bits(target, range, value)
+                self.write_bits(target, start + range.start..start + range.end, value);
+                Ok(())
             }
             AssignmentWrite::Variable { value, op } => {
                 let target = self.write_target(scope, value)?;
@@ -916,12 +937,28 @@ impl<'s> Lifter<'s> {
                         self.write(target, op, value, first_op)
                     }
                     Handle::Pointer { space, addr, size } => {
-                        if op.is_some() {
-                            return unsupported(op);
-                        }
-                        let value = self.expr(scope, &assignment.right, Some(size))?;
-                        let value = self.resize(value, size);
                         let space = Varnode::constant(space.0 as u64, 4);
+                        let bits = assignment_bits(op, 8 * size as u64)?;
+                        if let Some(AssignmentOp::BitRange(_)) = op {
+                            // Load the old value, modify the bits, store it back
+                            let value = self.expr(scope, &assignment.right, Some(size))?;
+                            let old = self.op(OpCode::Load, size, vec![space, addr]);
+                            self.write_bits(old, bits, value);
+                            self.emit(OpCode::Store, None, vec![space, addr, old]);
+                            return Ok(());
+                        }
+                        // As in Ghidra, other ops store just the bytes they select
+                        let (offset, len) = (
+                            (bits.start / 8) as u32,
+                            ((bits.end - bits.start) / 8) as u32,
+                        );
+                        let value = self.expr(scope, &assignment.right, Some(len))?;
+                        let value = self.resize(value, len);
+                        let offset = match self.sleigh.endian() {
+                            Endian::Big => size - offset - len,
+                            Endian::Little => offset,
+                        };
+                        let addr = self.offset_addr(addr, offset);
                         self.emit(OpCode::Store, None, vec![space, addr, value]);
                         Ok(())
                     }
@@ -1369,6 +1406,22 @@ mod test {
         }
         let instruction = disassembler.disassemble(0x1000, &context, &nested).unwrap();
         assert_eq!(instruction.fallthrough(), 0x1008);
+    }
+
+    #[test]
+    fn partial_writes_pcode() {
+        let sleigh = load("examples/pcode.slaspec");
+        #[rustfmt::skip]
+        assert_lifts(&sleigh, &[
+            (vec![0x01, 0x02], "sethi r2", &["$U0:4 = INT_RIGHT r2, 0x0:4", "$U8:4 = INT_AND $U0:4, 0xff:4", "$U10:1 = SUBPIECE $U8:4, 0x0:4", "$U18:4 = INT_ZEXT $U10:1", "$U20:4 = INT_LEFT $U18:4, 0x10:4", "$U28:4 = INT_AND $U20:4, 0xff0000:4", "$U30:4 = INT_AND flags, 0xff00ffff:4", "flags = INT_OR $U30:4, $U28:4"]),
+            (vec![0x02, 0x02], "setbits r2", &["$U0:4 = INT_RIGHT r2, 0x0:4", "$U8:4 = INT_AND $U0:4, 0xf:4", "$U10:1 = SUBPIECE $U8:4, 0x0:4", "$U18:4 = INT_ZEXT $U10:1", "$U20:4 = INT_LEFT $U18:4, 0x14:4", "$U28:4 = INT_AND $U20:4, 0xf00000:4", "$U30:4 = INT_AND flags, 0xff0fffff:4", "flags = INT_OR $U30:4, $U28:4"]),
+            (vec![0x03, 0x01], "sth [r1], r0", &["$U0:4 = INT_RIGHT r0, 0x0:4", "$U8:4 = INT_AND $U0:4, 0xffff:4", "$U10:2 = SUBPIECE $U8:4, 0x0:4", "STORE ram, r1, $U10:2"]),
+            (vec![0x04, 0x01], "stbits [r1], r0", &["$U0:4 = INT_RIGHT r0, 0x0:4", "$U8:4 = INT_AND $U0:4, 0xff:4", "$U10:1 = SUBPIECE $U8:4, 0x0:4", "$U18:4 = LOAD ram, r1", "$U20:4 = INT_ZEXT $U10:1", "$U28:4 = INT_LEFT $U20:4, 0x4:4", "$U30:4 = INT_AND $U28:4, 0xff0:4", "$U38:4 = INT_AND $U18:4, 0xfffff00f:4", "$U18:4 = INT_OR $U38:4, $U30:4", "STORE ram, r1, $U18:4"]),
+            (vec![0x05, 0x01], "stmid [r1], r0", &["$U0:4 = INT_RIGHT r0, 0x0:4", "$U8:4 = INT_AND $U0:4, 0xffff:4", "$U10:2 = SUBPIECE $U8:4, 0x0:4", "$U18:4 = LOAD ram, r1", "$U20:4 = INT_ZEXT $U10:2", "$U28:4 = INT_LEFT $U20:4, 0x8:4", "$U30:4 = INT_AND $U28:4, 0xffff00:4", "$U38:4 = INT_AND $U18:4, 0xff0000ff:4", "$U18:4 = INT_OR $U38:4, $U30:4", "STORE ram, r1, $U18:4"]),
+        ]);
+        let (text, pcode) = lift_text(&sleigh, &Context::new(&sleigh), 0x1000, &[0x06, 0x01]);
+        assert_eq!(text, "stbad [r1], r0");
+        assert!(matches!(pcode, Err(LiftError::Invalid(_))), "{:?}", pcode);
     }
 
     #[test]

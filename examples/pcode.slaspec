@@ -1,0 +1,37 @@
+# Semantics constructs the p-code lifter handles specially, little endian.
+#
+#   [opcode] [operand byte] [imm8]?
+#
+# operand byte: reg=(0,1)
+#   0x01..0x02 partial writes to a bitrange
+#   0x03..0x06 partial writes to memory a subtable exports, 0x06 out of its bounds
+
+define endian=little;
+define alignment=1;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [ r0 r1 r2 r3 ];
+define register offset=0x10 size=4 [ flags ];
+
+define bitrange hi=flags[16,16];
+
+define token opbyte(8)
+    opcode=(0, 7)
+;
+
+define token regbyte(8)
+    reg=(0, 1)
+;
+
+attach variables [ reg ] [ r0 r1 r2 r3 ];
+
+MEM: [reg] is reg { export *[ram]:4 reg; }
+
+:sethi reg is opcode=0x01; reg { hi:1 = reg; }
+:setbits reg is opcode=0x02; reg { hi[4,4] = reg; }
+:sth MEM, r0 is opcode=0x03; MEM & r0 { MEM:2 = r0; }
+:stbits MEM, r0 is opcode=0x04; MEM & r0 { MEM[4,8] = r0; }
+:stmid MEM, r0 is opcode=0x05; MEM & r0 { MEM[8,16] = r0; }
+:stbad MEM, r0 is opcode=0x06; MEM & r0 { MEM[30,8] = r0; }
