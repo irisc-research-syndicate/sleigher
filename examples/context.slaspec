@@ -9,7 +9,11 @@
 #   bank   selects the register `inc` works on through an attach.
 #
 # `jm1` jumps and switches mode to 1 at its destination with a globalset to
-# that address.
+# that address. `jt1` and `jr1` do the same with a globalset to the table that
+# exports the destination, absolute or relative to inst_next, and `ms1` to the
+# SRC table, which commits only where SRC exports a constant, not a register.
+# `re1` reassigns its globalset address afterwards, which Ghidra rejects; the
+# commit goes to the address at the globalset.
 
 define endian=little;
 define alignment=4;
@@ -59,3 +63,10 @@ SRC: "#"^imm16 is width=1 & imm16 { export *[const]:4 imm16; }
 Dest: imm16 is imm16 { export *:4 imm16; }
 :jmp Dest is op=9 & Dest { goto Dest; }
 :jm1 Dest is op=10 & Dest & imm16 [ target = imm16; mode=1; globalset(target, mode); ] { goto Dest; }
+:jt1 Dest is op=11 & Dest [ mode=1; globalset(Dest, mode); ] { goto Dest; }
+
+Rel: reloc is imm16 [ reloc = inst_next + imm16; ] { export *:4 reloc; }
+:jr1 Rel is op=12 & Rel [ mode=1; globalset(Rel, mode); ] { goto Rel; }
+
+:ms1 SRC is op=13 & imm_flag & SRC [ width=imm_flag; mode=1; globalset(SRC, mode); ] { }
+:re1 is op=14 & imm16 [ t = imm16; mode=1; globalset(t, mode); t = 0; ] { }

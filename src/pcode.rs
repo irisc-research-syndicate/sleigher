@@ -375,6 +375,19 @@ enum Handle {
     },
 }
 
+impl Handle {
+    /// Where memory at a constant address is, the address cut to the spec's address size
+    fn fixed_address(&self, sleigh: &Sleigh) -> Option<(SpaceId, u64)> {
+        match self {
+            Handle::Pointer { space, addr, .. } if addr.is_const() => Some((
+                *space,
+                addr.offset & size_mask(sleigh.addr_bytes().get() as u32),
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// Lifting state of one constructor
 struct Scope<'t> {
     table: &'t DisassembledTable<'t>,
@@ -411,6 +424,34 @@ pub fn lift<'s>(
     let mut lifter = Lifter::new(table.disassembler.sleigh, delay_slots);
     lifter.lift_table(table, inst_next)?;
     lifter.finish()
+}
+
+/// The address a table exports, as `globalset` takes it: memory at a constant address in the
+/// code space, or a constant. Ghidra's C++ libsla moves commits to a constant into the code
+/// space, while those to other spaces, a register say, have no effect on decoding. Ghidra's
+/// Java parser differs: it takes the export's offset as a code address whatever its space.
+///
+/// The table's whole semantics are lifted to find its export, so a table whose semantics
+/// cannot be lifted has no address either.
+pub fn export_address(table: &DisassembledTable) -> Result<u64, LiftError> {
+    let sleigh = table.disassembler.sleigh;
+    let export = Lifter::new(sleigh, &[]).lift_table(table, table.inst_next)?;
+    match export {
+        Some(Handle::Direct(varnode)) if varnode.is_const() => {
+            Ok(varnode.offset & size_mask(sleigh.addr_bytes().get() as u32))
+        }
+        Some(handle) => match handle.fixed_address(sleigh) {
+            Some((space, address)) if space == sleigh.default_space() => Ok(address),
+            _ => Err(LiftError::Invalid(format!(
+                "table {} exports no address in the code space",
+                table.table.name()
+            ))),
+        },
+        None => Err(LiftError::Invalid(format!(
+            "table {} has no export",
+            table.table.name()
+        ))),
+    }
 }
 
 struct Lifter<'s> {
@@ -797,15 +838,18 @@ impl<'s> Lifter<'s> {
                 Expr::Value(ExprElement::Value {
                     value: ExprValue::Table(table_id),
                     ..
-                }) => match self.table_export(scope, *table_id)? {
-                    Handle::Pointer { space, addr, .. } if addr.is_const() => Varnode {
-                        space: VarnodeSpace::Space(space),
-                        offset: addr.offset & size_mask(addr_size),
-                        size: addr_size,
-                    },
-                    Handle::Pointer { addr, .. } => addr,
-                    Handle::Direct(varnode) => varnode,
-                },
+                }) => {
+                    let handle = self.table_export(scope, *table_id)?;
+                    match (handle.fixed_address(self.sleigh), handle) {
+                        (Some((space, offset)), _) => Varnode {
+                            space: VarnodeSpace::Space(space),
+                            offset,
+                            size: addr_size,
+                        },
+                        (None, Handle::Pointer { addr, .. }) => addr,
+                        (None, Handle::Direct(varnode)) => varnode,
+                    }
+                }
                 dst => self.expr(scope, dst, Some(addr_size))?,
             }
         } else {

@@ -320,6 +320,15 @@ impl<'sleigh> std::fmt::Display for DisassembledInstruction<'sleigh> {
     }
 }
 
+/// Where a `globalset` commits to
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitTarget {
+    /// An address known when the `globalset` runs
+    Address(u64),
+    /// The address an operand table exports, known once the whole instruction is decoded
+    Table(TableId),
+}
+
 #[derive(Debug, Clone)]
 pub struct DisassembledTable<'sleigh> {
     pub disassembler: &'sleigh Disassembler<'sleigh>,
@@ -333,7 +342,7 @@ pub struct DisassembledTable<'sleigh> {
     /// The context once the whole instruction is decoded
     pub context: Context,
     /// The `globalset`s of this constructor, the values are taken from the final context
-    pub globalsets: Vec<(u64, ContextId)>,
+    pub globalsets: Vec<(CommitTarget, ContextId)>,
     pub len: usize,
     pub bytes: Vec<u8>,
 }
@@ -640,17 +649,32 @@ impl<'sleigh> DisassembledTable<'sleigh> {
 
     /// The `globalset`s of this table and its subtables
     fn commits(&self, commits: &mut Vec<ContextCommit>) {
-        commits.extend(
-            self.globalsets
-                .iter()
-                .map(|&(address, context)| ContextCommit {
+        for (target, context) in self.globalsets.iter() {
+            match self.commit_address(*target) {
+                Ok(address) => commits.push(ContextCommit {
                     address,
-                    context,
-                    value: self.context.get(self, context),
+                    context: *context,
+                    value: self.context.get(self, *context),
                 }),
-        );
+                Err(err) => log::warn!("{}: globalset skipped: {}", self.table.name(), err),
+            }
+        }
         for subtable in self.tables.values() {
             subtable.commits(commits);
+        }
+    }
+
+    /// Where a `globalset` commits to. A table names the address it exports, as libsla does,
+    /// which may depend on `inst_next`, so it is only known once the instruction is decoded.
+    fn commit_address(&self, target: CommitTarget) -> Result<u64, LiftError> {
+        match target {
+            CommitTarget::Address(address) => Ok(address),
+            CommitTarget::Table(table_id) => {
+                let table = self.tables.get(&table_id).ok_or_else(|| {
+                    LiftError::Invalid(format!("table {} is not an operand", table_id.0))
+                })?;
+                crate::pcode::export_address(table)
+            }
         }
     }
 
@@ -664,20 +688,16 @@ impl<'sleigh> DisassembledTable<'sleigh> {
         for assertion in assertions {
             match assertion {
                 Assertation::GlobalSet(global_set) => {
-                    let address = match global_set.address {
-                        AddrScope::Integer(address) => address,
-                        AddrScope::InstStart(_) => self.inst_start,
-                        AddrScope::InstNext(_) => self.inst_next,
-                        AddrScope::Local(variable_id) => self.variables[&variable_id] as u64,
-                        AddrScope::Table(_) => {
-                            log::warn!(
-                                "{}: globalset to a table address is not supported",
-                                self.table.name()
-                            );
-                            continue;
+                    let target = match global_set.address {
+                        AddrScope::Integer(address) => CommitTarget::Address(address),
+                        AddrScope::InstStart(_) => CommitTarget::Address(self.inst_start),
+                        AddrScope::InstNext(_) => CommitTarget::Address(self.inst_next),
+                        AddrScope::Local(variable_id) => {
+                            CommitTarget::Address(self.variables[&variable_id] as u64)
                         }
+                        AddrScope::Table(table_id) => CommitTarget::Table(table_id),
                     };
-                    self.globalsets.push((address, global_set.context));
+                    self.globalsets.push((target, global_set.context));
                 }
                 Assertation::Assignment(assignment) => {
                     let Some(value) = self.evaluate_expr(&assignment.right, context, bytes) else {
@@ -1146,6 +1166,15 @@ mod test {
             (vec![0x05, 0x00, 0x12, 0x01], vec![]),
             (vec![0x00, 0x00, 0x00, 0x02], vec![ContextCommit { address: 0x104, context: id("mode"), value: 1 }]),
             (vec![0x02, 0x00, 0x00, 0x04], vec![ContextCommit { address: 0x104, context: id("shift"), value: 2 }]),
+            (vec![0x40, 0x12, 0x00, 0x0a], vec![ContextCommit { address: 0x1240, context: id("mode"), value: 1 }]),
+            // To the address a table exports, which may depend on inst_next
+            (vec![0x40, 0x12, 0x00, 0x0b], vec![ContextCommit { address: 0x1240, context: id("mode"), value: 1 }]),
+            (vec![0x10, 0x00, 0x00, 0x0c], vec![ContextCommit { address: 0x114, context: id("mode"), value: 1 }]),
+            // An exported constant is a code address, an exported register is not
+            (vec![0x00, 0x02, 0x08, 0x0d], vec![ContextCommit { address: 0x200, context: id("mode"), value: 1 }]),
+            (vec![0x00, 0x00, 0x01, 0x0d], vec![]),
+            // A local is taken when the globalset runs
+            (vec![0x34, 0x12, 0x00, 0x0e], vec![ContextCommit { address: 0x1234, context: id("mode"), value: 1 }]),
         ];
         for (bytes, commits) in tests {
             assert_eq!(decode(&bytes).commits, commits, "{:02x?}", bytes);
@@ -1193,6 +1222,15 @@ mod test {
             (0x108, "sub r1, r2, 0x5".to_string()),
             (0x10c, "jm1 0x104".to_string()),
         ]);
+
+        // jt1 commits to its destination through the Dest table
+        let mut code = code;
+        code[15] = 0x0b;
+        let instructions = disasm
+            .disassemble_flow(0x100, &code, 0x100, &context)
+            .unwrap();
+        assert_eq!(instructions[&0x10c].to_string(), "jt1 0x104");
+        assert_eq!(instructions[&0x104].to_string(), "sub r1, r2, 0x5");
     }
 
     /// A little endian instruction of the flow example
