@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context as _, Result};
 use clap::Parser;
-use sleigher::assembler::{InstructionAssembler, Labels};
+use sleigher::assembler::{Commits, InstructionAssembler, Labels};
 use sleigher::context::Context;
 
 fn parse_int(s: &str) -> std::result::Result<u64, std::num::ParseIntError> {
@@ -35,6 +35,11 @@ struct Cli {
     /// Start from a context variable value, as name=value; may be repeated
     #[arg(short, long)]
     context: Vec<String>,
+
+    /// Assemble each line with what any line commits to it with globalset, as Ghidra keeps
+    /// the context by address, instead of only what the lines before it commit
+    #[arg(long, requires = "file")]
+    all_commits: bool,
 }
 
 pub fn main() -> Result<()> {
@@ -50,7 +55,12 @@ pub fn main() -> Result<()> {
     if let Some(path) = &args.file {
         let source =
             std::fs::read_to_string(path).with_context(|| format!("Could not read {:?}", path))?;
-        let program = assembler.assemble_program_in_context(&source, args.base, &context)?;
+        let commits = match args.all_commits {
+            true => Commits::All,
+            false => Commits::Earlier,
+        };
+        let program =
+            assembler.assemble_program_in_context(&source, args.base, &context, commits)?;
 
         for line in program.lines.iter() {
             let bytes = line

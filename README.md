@@ -20,6 +20,7 @@ In the emulator this matches Ghidra's, which carries the context along execution
 
 `sleigh-disasm --flow` follows control flow from the start address instead, keeping the context by address as Ghidra's disassembler does: an address is decoded with the context that flowed to it first plus what `globalset`s committed to it, so a `globalset` to a branch destination is seen even where a linear sweep would have passed it already.
 Each address is decoded once, so a commit to an address decoded earlier is not seen there, nor further along its flow.
+`sleigh-asm --all-commits` likewise assembles each line with what any line commits to it, not only the lines before it, while the context still flows on in line order.
 
 Delay slots follow Ghidra: an instruction's p-code includes that of the instructions in its delay slot at its `delayslot`, and `inst_next` in its p-code is the address after them.
 

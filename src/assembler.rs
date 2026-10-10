@@ -16,9 +16,9 @@ use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{ContextId, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context as _};
 
-use crate::context::{Context, ContextFlow};
+use crate::context::{Context, ContextCommit, ContextFlow};
 use crate::disassembler::{warn_unsupported, Disassembler};
 use crate::value::{parse_number, parse_number_exact};
 
@@ -29,6 +29,17 @@ const NO_LABELS: &Labels = &BTreeMap::new();
 
 /// Passes over a program before label addresses have to stop changing
 const MAX_PASSES: usize = 16;
+
+/// Which `globalset` commits a program line is assembled with
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Commits {
+    /// What the lines before it commit, as if the lines ran in order
+    #[default]
+    Earlier,
+    /// What any line commits, as Ghidra keeps context by address. Passes repeat until the
+    /// commits settle too, and a line that does not assemble only fails once they have.
+    All,
+}
 
 /// One source line of an assembled program that holds an instruction
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -912,18 +923,19 @@ impl InstructionAssembler {
     /// resolve the labels, require exactly one encoding per instruction and repeat until the
     /// label addresses stop changing.
     pub fn assemble_program(&self, source: &str, base: u64) -> anyhow::Result<Program> {
-        self.assemble_program_in_context(source, base, &Context::new(self))
+        self.assemble_program_in_context(source, base, &Context::new(self), Commits::Earlier)
     }
 
     /// Like `assemble_program`, starting from `context`. The context flows from line to line,
-    /// with the values `globalset`s commit, as the emulator would execute the lines in order:
-    /// commits to earlier lines are not seen. While labels are unresolved, commits to a label
-    /// may go astray.
+    /// with the values `globalset`s commit, as the emulator would execute the lines in order.
+    /// `commits` says whether a line also sees what later lines commit to it. While labels are
+    /// unresolved, commits to a label may go astray.
     pub fn assemble_program_in_context(
         &self,
         source: &str,
         base: u64,
         context: &Context,
+        commits: Commits,
     ) -> anyhow::Result<Program> {
         let source_lines = source
             .lines()
@@ -947,12 +959,21 @@ impl InstructionAssembler {
             }
         }
 
+        let all_commits = commits == Commits::All;
+        let mut previous_commits = vec![];
+        let mut previous_lens = vec![];
+        let mut last_failure = None;
         for pass in 0..MAX_PASSES {
             let resolved = pass > 0;
             let mut address = base;
             let mut addresses = Labels::new();
             let mut lines = vec![];
             let mut flow = ContextFlow::new(context.clone());
+            if all_commits {
+                flow.commit(&previous_commits);
+            }
+            let mut pass_commits = vec![];
+            let mut failure = None;
             for line in source_lines.iter() {
                 for name in line.labels.iter() {
                     addresses.insert(name.to_string(), Some(address));
@@ -960,43 +981,23 @@ impl InstructionAssembler {
                 let Some(text) = line.instruction else {
                     continue;
                 };
-                let error = |err: &dyn std::fmt::Display| {
-                    anyhow!("line {}: {:?}: {}", line.line_no, text, err)
-                };
                 let context = flow.at(self, address);
-                let bytes = if resolved {
-                    let constraints = self
-                        .assemble_instruction_at(text, address, &context, &labels)
-                        .map_err(|err| error(&err))?;
-                    constraints
-                        .to_bytes()
-                        .ok_or_else(|| error(&"constraints produced no bytes"))?
-                } else {
-                    // Labels are unknown, so only take the shortest candidate
-                    let shortest = self
-                        .assemble_candidates_at(text, address, &context, &labels)
-                        .into_iter()
-                        .filter(|(rest, _)| rest.trim_end().is_empty())
-                        .map(|(_, candidate)| candidate)
-                        .min_by_key(|candidate| candidate.len_bytes())
-                        .ok_or_else(|| error(&AsmError::NoMatch))?;
-                    match self.has_globalset {
-                        true => shortest
-                            .to_bytes()
-                            .ok_or_else(|| error(&"constraints produced no bytes"))?,
-                        false => vec![0; shortest.len_bytes() as usize],
+                let assembled = self
+                    .assemble_line(text, address, &context, &labels, resolved)
+                    .map_err(|err| anyhow!("line {}: {:?}: {}", line.line_no, text, err));
+                let (bytes, commits) = match assembled {
+                    Ok(assembled) => assembled,
+                    // What later lines commit may make it assemble in the next pass; until
+                    // then it keeps its length, so the labels after it stay put
+                    Err(err) if all_commits => {
+                        failure.get_or_insert(err);
+                        let len = previous_lens.get(lines.len()).copied().unwrap_or(0);
+                        (vec![0; len], vec![])
                     }
-                };
-                // What the instruction commits is read back from its encoding
-                let commits = match self.has_globalset {
-                    true => self
-                        .disassembler()
-                        .disassemble(address, &context, &bytes)
-                        .map(|instruction| instruction.commits)
-                        .map_err(|err| error(&err))?,
-                    false => vec![],
+                    Err(err) => return Err(err),
                 };
                 flow.advance(self, context, &commits);
+                pass_commits.extend(commits);
                 lines.push(Line {
                     line_no: line.line_no,
                     address,
@@ -1006,20 +1007,81 @@ impl InstructionAssembler {
                 address += lines.last().unwrap().bytes.len() as u64;
             }
 
-            if resolved && addresses == labels {
-                return Ok(Program {
-                    base,
-                    bytes: lines.iter().flat_map(|line| line.bytes.clone()).collect(),
-                    labels: labels
-                        .into_iter()
-                        .map(|(name, address)| (name, address.unwrap()))
-                        .collect(),
-                    lines,
-                });
+            let settled = resolved
+                && addresses == labels
+                && (!all_commits || pass_commits == previous_commits);
+            match (failure, settled) {
+                (Some(err), true) => return Err(err),
+                (None, true) => {
+                    return Ok(Program {
+                        base,
+                        bytes: lines.iter().flat_map(|line| line.bytes.clone()).collect(),
+                        labels: labels
+                            .into_iter()
+                            .map(|(name, address)| (name, address.unwrap()))
+                            .collect(),
+                        lines,
+                    })
+                }
+                (failure, false) => last_failure = failure,
             }
             labels = addresses;
+            // The unresolved pass commits to wrong addresses
+            if resolved {
+                previous_commits = pass_commits;
+            }
+            previous_lens = lines.iter().map(|line| line.bytes.len()).collect();
         }
-        bail!("label addresses did not settle after {} passes", MAX_PASSES)
+        let unsettled = format!(
+            "label addresses or commits did not settle after {} passes",
+            MAX_PASSES
+        );
+        Err(match last_failure {
+            Some(err) => err.context(unsettled),
+            None => anyhow!(unsettled),
+        })
+    }
+
+    /// The bytes of one program line and what they commit. Without resolved labels, only the
+    /// shortest candidate is taken.
+    fn assemble_line(
+        &self,
+        text: &str,
+        address: u64,
+        context: &Context,
+        labels: &Labels,
+        resolved: bool,
+    ) -> anyhow::Result<(Vec<u8>, Vec<ContextCommit>)> {
+        let bytes = if resolved {
+            let constraints = self.assemble_instruction_at(text, address, context, labels)?;
+            constraints
+                .to_bytes()
+                .context("constraints produced no bytes")?
+        } else {
+            let shortest = self
+                .assemble_candidates_at(text, address, context, labels)
+                .into_iter()
+                .filter(|(rest, _)| rest.trim_end().is_empty())
+                .map(|(_, candidate)| candidate)
+                .min_by_key(|candidate| candidate.len_bytes())
+                .ok_or(AsmError::NoMatch)?;
+            match self.has_globalset {
+                true => shortest
+                    .to_bytes()
+                    .context("constraints produced no bytes")?,
+                false => vec![0; shortest.len_bytes() as usize],
+            }
+        };
+        // What the instruction commits is read back from its encoding
+        let commits = match self.has_globalset {
+            true => {
+                self.disassembler()
+                    .disassemble(address, context, &bytes)?
+                    .commits
+            }
+            false => vec![],
+        };
+        Ok((bytes, commits))
     }
 
     /// A disassembler for the spec, without warning about it again like `Disassembler::new`
@@ -2177,7 +2239,7 @@ mod test {
 
         let mode1 = Context::from_values(&asm, &[("mode", 1)]).unwrap();
         let program = asm
-            .assemble_program_in_context("sub r1, r1, 0x2", 0x1000, &mode1)
+            .assemble_program_in_context("sub r1, r1, 0x2", 0x1000, &mode1, Commits::Earlier)
             .unwrap();
         assert_eq!(program.bytes, vec![0x02, 0x00, 0x11, 0x01]);
     }
@@ -2252,5 +2314,43 @@ mod test {
             ("ld.x r1", none, Err(AsmError::NoMatch)),
         ];
         assert_context_cases(&asm, tests);
+    }
+
+    /// `jm1` switches mode at a label before it
+    #[test]
+    fn context_program_all_commits() {
+        let asm = load("examples/context.slaspec");
+        let context = Context::new(&asm);
+        let assemble = |source, base, commits| {
+            asm.assemble_program_in_context(source, base, &context, commits)
+        };
+        let source = "
+                jmp end
+            top:
+                sub r1, r1, 0x2
+            end:
+                jm1 top
+        ";
+        assert!(assemble(source, 0x1000, Commits::Earlier).is_err());
+        let program = assemble(source, 0x1000, Commits::All).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(program.bytes, vec![
+            0x08, 0x10, 0x00, 0x09,
+            0x02, 0x00, 0x11, 0x01,
+            0x04, 0x10, 0x00, 0x0a,
+        ]);
+
+        // The unresolved first pass commits to the wrong address, here the jm1 itself
+        let source = "add r1, r1, 0x1\na:\njm1 a";
+        for commits in [Commits::Earlier, Commits::All] {
+            let program = assemble(source, 0x0, commits).unwrap();
+            assert_eq!(program.bytes[4..], [0x04, 0x00, 0x00, 0x0a]);
+        }
+
+        // A line that never assembles is reported once the commits settle
+        assert!(assemble("sub r1, r1, 0x2", 0x1000, Commits::All).is_err());
+        let source = "jm1 a\nsub r1, r1, 0x1\na:\nmov r2, r3";
+        let err = assemble(source, 0x0, Commits::All).unwrap_err();
+        assert!(err.to_string().starts_with("line 2:"), "{}", err);
     }
 }
