@@ -1236,6 +1236,25 @@ mod test {
     }
 
     #[test]
+    fn wide_bitranges() {
+        let sleigh = load("examples/wide.slaspec");
+        let n = |value: u64| BigInt::from_u64(value, 64);
+        let p = |bit: u64| n(1) << bit;
+        let ones = || BigInt::ones(64);
+        // Bits outside the range keep their value, also above bit 64
+        #[rustfmt::skip]
+        assert_executes_wide(&sleigh, &[
+            ("vsetb z0", vec![0x1c, 0x00], vec![("z0", ones())], vec![("z0", ones() ^ (n(0xa5) << 8))]),
+            ("vsetn z0", vec![0x1d, 0x00], vec![("z0", ones())], vec![("z0", ones() ^ (n(0xe) << 100))]),
+            ("vsetn z0", vec![0x1d, 0x00], vec![("z0", n(0))], vec![("z0", p(100))]),
+            ("vins z0, r1", vec![0x1e, 0x04], vec![("z0", ones()), ("r1", n(0x12345678))], vec![("z0", ones() ^ (n(0xedcba987) << 200))]),
+            ("vlow x0, z1", vec![0x1f, 0x04], vec![("z1", ones())], vec![("x0", ones())]),
+            ("vmid x0, z1", vec![0x20, 0x04], vec![("z1", ones())], vec![("x0", p(100) - n(1))]),
+            ("vmid x0, z1", vec![0x20, 0x04], vec![("z1", (p(99) + n(1)) << 300)], vec![("x0", p(99) + n(1))]),
+        ]);
+    }
+
+    #[test]
     fn wide_memory() {
         let sleigh = load("examples/wide.slaspec");
         #[rustfmt::skip]

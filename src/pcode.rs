@@ -954,6 +954,22 @@ impl<'s> Lifter<'s> {
     /// Bits `range` of `input`, as a value of `size` bytes
     fn read_bits(&mut self, input: Varnode, range: std::ops::Range<u64>, size: u32) -> Varnode {
         let len = range.end - range.start;
+        if len > 64 {
+            // Too wide for a constant mask: shift the bits above the field out, then the field
+            // down
+            let bits = 8 * input.size as u64;
+            let high = self.op(
+                OpCode::IntLeft,
+                input.size,
+                vec![input, Varnode::constant(bits - range.end, 4)],
+            );
+            let field = self.op(
+                OpCode::IntRight,
+                input.size,
+                vec![high, Varnode::constant(bits - len, 4)],
+            );
+            return self.resize(field, size);
+        }
         let mask = if len >= 64 { u64::MAX } else { (1 << len) - 1 };
         let shifted = self.op(
             OpCode::IntRight,
@@ -973,6 +989,9 @@ impl<'s> Lifter<'s> {
     fn write_bits(&mut self, target: Varnode, range: std::ops::Range<u64>, value: Varnode) {
         let size = target.size;
         let len = range.end - range.start;
+        if size > 8 {
+            return self.write_wide_bits(target, range, value);
+        }
         let field_mask = if len >= 64 { u64::MAX } else { (1 << len) - 1 };
         let mask = (field_mask << range.start) & size_mask(size);
         let value = self.resize(value, size);
@@ -991,6 +1010,26 @@ impl<'s> Lifter<'s> {
             size,
             vec![target, Varnode::constant(!mask & size_mask(size), size)],
         );
+        self.emit(OpCode::IntOr, Some(target), vec![old_bits, new_bits]);
+    }
+
+    /// `write_bits` for targets wider than a constant: the mask is computed from all ones
+    fn write_wide_bits(&mut self, target: Varnode, range: std::ops::Range<u64>, value: Varnode) {
+        let size = target.size;
+        let bits = 8 * size as u64;
+        let ones = self.op(OpCode::IntNegate, size, vec![Varnode::constant(0, size)]);
+        let field_mask = self.op(
+            OpCode::IntRight,
+            size,
+            vec![ones, Varnode::constant(bits - (range.end - range.start), 4)],
+        );
+        let start = Varnode::constant(range.start, 4);
+        let mask = self.op(OpCode::IntLeft, size, vec![field_mask, start]);
+        let value = self.resize(value, size);
+        let shifted = self.op(OpCode::IntLeft, size, vec![value, start]);
+        let new_bits = self.op(OpCode::IntAnd, size, vec![shifted, mask]);
+        let keep_mask = self.op(OpCode::IntNegate, size, vec![mask]);
+        let old_bits = self.op(OpCode::IntAnd, size, vec![target, keep_mask]);
         self.emit(OpCode::IntOr, Some(target), vec![old_bits, new_bits]);
     }
 

@@ -56,3 +56,8 @@ attach variables [ ra rb rc ] [ r0 r1 r2 r3 ];
 :vst [ra], zb is op=0x19; ra & zb { *:64 ra = zb; }
 :vones za is op=0x1a; za { za = ~0; }
 :vdec za is op=0x1b; za { za = za + -1; }
+:vsetb za is op=0x1c; za { za[8,8] = 0x5a; }
+:vsetn za is op=0x1d; za { za[100,4] = 1; }
+:vins za, rb is op=0x1e; za & rb { za[200,32] = rb; }
+:vlow xa, zb is op=0x1f; xa & zb { local t:16 = zb[0,128]; xa = t; }
+:vmid xa, zb is op=0x20; xa & zb { xa = zb[300,100]; }
