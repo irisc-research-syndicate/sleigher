@@ -1474,7 +1474,7 @@ mod test {
 
     #[test]
     fn context_pcode() {
-        let sleigh = load("examples/context.slaspec");
+        let sleigh = load("tests/specs/context.slaspec");
         let mut context = Context::new(&sleigh);
         context.set(&sleigh, Context::id(&sleigh, "shift").unwrap(), 2);
         #[rustfmt::skip]
@@ -1538,7 +1538,7 @@ mod test {
 
     #[test]
     fn layout_pcode() {
-        let sleigh = load("examples/layout.slaspec");
+        let sleigh = load("tests/specs/layout.slaspec");
         #[rustfmt::skip]
         assert_lifts(&sleigh, &[
             (vec![0x01, 0x02, 0x05], "ldi 0x5, r2", &["r2 = COPY 0x5:4"]),
@@ -1549,7 +1549,7 @@ mod test {
 
     #[test]
     fn delay_slot_pcode() {
-        let sleigh = load("examples/delay.slaspec");
+        let sleigh = load("tests/specs/delay.slaspec");
         // The delay slot's p-code runs at delayslot, inst_next is past it and the branch's
         // commit reaches it
         #[rustfmt::skip]
@@ -1567,7 +1567,7 @@ mod test {
 
     #[test]
     fn delay_slot_instructions() {
-        let sleigh = load("examples/delay.slaspec");
+        let sleigh = load("tests/specs/delay.slaspec");
         let disassembler = Disassembler::new(&sleigh);
         let context = Context::new(&sleigh);
         let jal = [0x0c, 0x00, 0x08, 0x00, 0x04, 0x03, 0x00, 0x00];
@@ -1599,7 +1599,7 @@ mod test {
 
     #[test]
     fn partial_writes_pcode() {
-        let sleigh = load("examples/pcode.slaspec");
+        let sleigh = load("tests/specs/pcode.slaspec");
         #[rustfmt::skip]
         assert_lifts(&sleigh, &[
             (vec![0x01, 0x02], "sethi r2", &["$U0:4 = INT_RIGHT r2, 0x0:4", "$U8:4 = INT_AND $U0:4, 0xff:4", "$U10:1 = SUBPIECE $U8:4, 0x0:4", "$U18:4 = INT_ZEXT $U10:1", "$U20:4 = INT_LEFT $U18:4, 0x10:4", "$U28:4 = INT_AND $U20:4, 0xff0000:4", "$U30:4 = INT_AND flags, 0xff00ffff:4", "flags = INT_OR $U30:4, $U28:4"]),
@@ -1615,7 +1615,7 @@ mod test {
 
     #[test]
     fn references_pcode() {
-        let sleigh = load("examples/pcode.slaspec");
+        let sleigh = load("tests/specs/pcode.slaspec");
         #[rustfmt::skip]
         assert_lifts(&sleigh, &[
             (vec![0x07, 0x2a], "lea r0, 0x2a", &["r0 = COPY 0x2a:4"]),
@@ -1629,7 +1629,7 @@ mod test {
 
     #[test]
     fn attached_numbers_pcode() {
-        let sleigh = load("examples/pcode.slaspec");
+        let sleigh = load("tests/specs/pcode.slaspec");
         #[rustfmt::skip]
         assert_lifts(&sleigh, &[
             (vec![0x0d, 0x01], "adds r0, 0x8", &["r0 = INT_ADD r0, 0x8:4"]),
@@ -1642,7 +1642,7 @@ mod test {
         use sleigh_rs::execution::{ExprCPool, ExprNew};
         // sleigh-rs cannot size `newobject` and `cpool` yet and panics on specs using them, so
         // build them by hand from the operands of `r0 = r0 + sel`
-        let sleigh = load("examples/pcode.slaspec");
+        let sleigh = load("tests/specs/pcode.slaspec");
         let disassembler = Disassembler::new(&sleigh);
         let instruction = disassembler
             .disassemble(0x1000, &Context::new(&sleigh), &[0x0d, 0x01])
@@ -1735,7 +1735,7 @@ mod test {
     /// A direct branch to memory at a dynamic address goes to the address, indirectly
     #[test]
     fn dynamic_branch_pcode() {
-        let sleigh = load("examples/flow.slaspec");
+        let sleigh = load("tests/specs/flow.slaspec");
         #[rustfmt::skip]
         assert_lifts(&sleigh, &[
             (vec![0x00, 0x00, 0x00, 0x0d], "jd [r0]", &["BRANCHIND r0"]),

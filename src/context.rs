@@ -178,7 +178,7 @@ mod test {
     use super::*;
 
     fn load() -> Sleigh {
-        sleigh_rs::file_to_sleigh("examples/context.slaspec".as_ref()).unwrap()
+        sleigh_rs::file_to_sleigh("tests/specs/context.slaspec".as_ref()).unwrap()
     }
 
     fn id(sleigh: &Sleigh, name: &str) -> ContextId {

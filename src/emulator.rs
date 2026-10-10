@@ -917,12 +917,12 @@ mod test {
 
     #[test]
     fn partial_writes_little_endian() {
-        assert_partial_writes(&load("examples/pcode.slaspec"));
+        assert_partial_writes(&load("tests/specs/pcode.slaspec"));
     }
 
     #[test]
     fn partial_writes_big_endian() {
-        let spec = std::fs::read_to_string("examples/pcode.slaspec")
+        let spec = std::fs::read_to_string("tests/specs/pcode.slaspec")
             .unwrap()
             .replace("define endian=little;", "define endian=big;");
         let path =
@@ -1219,7 +1219,7 @@ mod test {
 
     #[test]
     fn wide_registers() {
-        let sleigh = load("examples/wide.slaspec");
+        let sleigh = load("tests/specs/wide.slaspec");
         let n = |value: u64| BigInt::from_u64(value, 64);
         let p = |bit: u64| n(1) << bit;
         let ones = || BigInt::ones(64);
@@ -1259,7 +1259,7 @@ mod test {
 
     #[test]
     fn wide_bitranges() {
-        let sleigh = load("examples/wide.slaspec");
+        let sleigh = load("tests/specs/wide.slaspec");
         let n = |value: u64| BigInt::from_u64(value, 64);
         let p = |bit: u64| n(1) << bit;
         let ones = || BigInt::ones(64);
@@ -1278,7 +1278,7 @@ mod test {
 
     #[test]
     fn wide_memory() {
-        let sleigh = load("examples/wide.slaspec");
+        let sleigh = load("tests/specs/wide.slaspec");
         #[rustfmt::skip]
         let mut cpu = new_cpu(&sleigh, &[
             0x19, 0x04, // vst [r0], z1
@@ -1299,7 +1299,7 @@ mod test {
 
     #[test]
     fn float_ops() {
-        let sleigh = load("examples/float.slaspec");
+        let sleigh = load("tests/specs/float.slaspec");
         let n = |value: u64| BigInt::from_u64(value, 16);
         let d = |value: f64| BigInt::from_u64(value.to_bits(), 8);
         let s = |value: f32| BigInt::from_u64(value.to_bits() as u64, 4);
@@ -1363,7 +1363,7 @@ mod test {
 
     #[test]
     fn float_extended_and_half() {
-        let sleigh = load("examples/float.slaspec");
+        let sleigh = load("tests/specs/float.slaspec");
         let n = |value: u64| BigInt::from_u64(value, 16);
         let d = |value: f64| BigInt::from_u64(value.to_bits(), 8);
         let t = |value: f64| float::from_f64(value, 10).unwrap();
@@ -1398,7 +1398,7 @@ mod test {
 
     #[test]
     fn context_flow() {
-        let sleigh = load("examples/context.slaspec");
+        let sleigh = load("tests/specs/context.slaspec");
         let id = |name| Context::id(&sleigh, name).unwrap();
         #[rustfmt::skip]
         let program = [
@@ -1423,7 +1423,7 @@ mod test {
 
     #[test]
     fn context_initial() {
-        let sleigh = load("examples/context.slaspec");
+        let sleigh = load("tests/specs/context.slaspec");
         // add r1, r1, 0x5 decodes as sub in mode 1
         let mut cpu = new_cpu(&sleigh, &[0x05, 0x00, 0x11, 0x01]);
         cpu.context
@@ -1447,7 +1447,7 @@ mod test {
 
     #[test]
     fn delay_slot_branches() {
-        let sleigh = load("examples/delay.slaspec");
+        let sleigh = load("tests/specs/delay.slaspec");
         // The delay slot runs before the branch takes effect, but after its operands are read
         #[rustfmt::skip]
         assert_executes(&sleigh, &[
@@ -1467,7 +1467,7 @@ mod test {
 
     #[test]
     fn delay_slot_runs_once() {
-        let sleigh = load("examples/delay.slaspec");
+        let sleigh = load("tests/specs/delay.slaspec");
         #[rustfmt::skip]
         let mut cpu = new_cpu(&sleigh, &[
             0x10, 0x00, 0x00, 0x02, // 0x1000: beq r0, r0, 0x100c
@@ -1498,10 +1498,11 @@ mod test {
                     addi r1, r1, -0x1   // delay slot, also on the way out
             end:
         ";
-        let assembler = crate::assembler::InstructionAssembler::new(load("examples/delay.slaspec"));
+        let assembler =
+            crate::assembler::InstructionAssembler::new(load("tests/specs/delay.slaspec"));
         let program = assembler.assemble_program(source, BASE).unwrap();
 
-        let sleigh = load("examples/delay.slaspec");
+        let sleigh = load("tests/specs/delay.slaspec");
         let mut cpu = new_cpu(&sleigh, &program.bytes);
         let mut steps = 0;
         while cpu.state.pc != program.labels["end"] {
@@ -1521,7 +1522,7 @@ mod test {
 
     #[test]
     fn branch_targets() {
-        let sleigh = load("examples/flow.slaspec");
+        let sleigh = load("tests/specs/flow.slaspec");
         // jd [r0] goes to the value of r0, not to where r0 is
         let mut cpu = new_cpu(&sleigh, &[0x00, 0x00, 0x00, 0x0d]);
         cpu.state

@@ -1017,7 +1017,7 @@ mod test {
     #[test]
     fn test_layout_disassemble() {
         #[rustfmt::skip]
-        run_tests("examples/layout.slaspec", &[
+        run_tests("tests/specs/layout.slaspec", &[
             ("ldi 0x5, r2", vec![0x01, 0x02, 0x05]),
             ("mov r1, r2", vec![0x02, 0x01, 0x02]),
             ("mov r1, #0x7", vec![0x02, 0x01, 0x80, 0x07]),
@@ -1046,7 +1046,7 @@ mod test {
 
     #[test]
     fn test_context_disassemble() {
-        let path = "examples/context.slaspec";
+        let path = "tests/specs/context.slaspec";
         #[rustfmt::skip]
         run_tests(path, &[
             ("add r1, r2, 0x5", vec![0x05, 0x00, 0x12, 0x01]),
@@ -1072,7 +1072,7 @@ mod test {
 
     #[test]
     fn test_subpattern_disassemble() {
-        let path = "examples/subpattern.slaspec";
+        let path = "tests/specs/subpattern.slaspec";
         #[rustfmt::skip]
         run_tests(path, &[
             ("nop", vec![0x00, 0x00]),
@@ -1127,7 +1127,7 @@ mod test {
 
     #[test]
     fn test_solver_undefined_expressions() {
-        let path = "examples/solver.slaspec";
+        let path = "tests/specs/solver.slaspec";
         #[rustfmt::skip]
         run_tests(path, &[
             ("div r1, 0x80", vec![0xdb, 0x00, 0x00, 0x02]),
@@ -1152,7 +1152,7 @@ mod test {
 
     #[test]
     fn test_context_commits() {
-        let sleigh = load("examples/context.slaspec");
+        let sleigh = load("tests/specs/context.slaspec");
         let disasm = Disassembler::new(&sleigh);
         let id = |name| Context::id(&sleigh, name).unwrap();
         let decode = |bytes: &[u8]| {
@@ -1189,7 +1189,7 @@ mod test {
     /// `jm1` at the end commits mode=1 to its destination, which a linear sweep has passed
     #[test]
     fn test_context_flow() {
-        let sleigh = load("examples/context.slaspec");
+        let sleigh = load("tests/specs/context.slaspec");
         let disasm = Disassembler::new(&sleigh);
         #[rustfmt::skip]
         let code = [
@@ -1240,7 +1240,7 @@ mod test {
 
     #[test]
     fn test_flows() {
-        let sleigh = load("examples/flow.slaspec");
+        let sleigh = load("tests/specs/flow.slaspec");
         let disasm = Disassembler::new(&sleigh);
         let decode = |op, imm16| {
             disasm
@@ -1284,7 +1284,7 @@ mod test {
 
     #[test]
     fn test_disassemble_flow() {
-        let sleigh = load("examples/flow.slaspec");
+        let sleigh = load("tests/specs/flow.slaspec");
         let disasm = Disassembler::new(&sleigh);
         let code = [
             flow_instruction(2, 0x10c), // 0x100: call 0x10c
@@ -1305,7 +1305,7 @@ mod test {
     /// Delay slots are decoded with their branch, which falls through past them
     #[test]
     fn test_disassemble_flow_delay_slots() {
-        let sleigh = load("examples/delay.slaspec");
+        let sleigh = load("tests/specs/delay.slaspec");
         let disasm = Disassembler::new(&sleigh);
         let code = [
             0x08000004u32, // 0x00: j 0x10

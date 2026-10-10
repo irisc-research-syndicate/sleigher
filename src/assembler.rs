@@ -1860,7 +1860,7 @@ mod test {
 
     #[test]
     fn layout_operands_out_of_byte_order() {
-        let asm = load("examples/layout.slaspec");
+        let asm = load("tests/specs/layout.slaspec");
         // imm8 is displayed before reg, but its byte comes after
         #[rustfmt::skip]
         assert_encodes(&asm, &[
@@ -1870,7 +1870,7 @@ mod test {
 
     #[test]
     fn layout_repeated_token() {
-        let asm = load("examples/layout.slaspec");
+        let asm = load("tests/specs/layout.slaspec");
         // REG and OPND both use regbyte, at different offsets
         #[rustfmt::skip]
         assert_encodes(&asm, &[
@@ -1883,13 +1883,13 @@ mod test {
 
     #[test]
     fn layout_roundtrip() {
-        let asm = load("examples/layout.slaspec");
+        let asm = load("tests/specs/layout.slaspec");
         assert_roundtrips(&asm, 4, 5000);
     }
 
     #[test]
     fn solver_split_and_scaled_immediates() {
-        let asm = load("examples/solver.slaspec");
+        let asm = load("tests/specs/solver.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
             ("addi r1, r2, 0x5", vec![0x93, 0x00, 0x51, 0x00]),
@@ -1928,7 +1928,7 @@ mod test {
 
     #[test]
     fn solver_rotated_immediates() {
-        let asm = load("examples/solver.slaspec");
+        let asm = load("tests/specs/solver.slaspec");
         // val = imm8 rotated right by 2 * rot; these have a single rot/imm8
         #[rustfmt::skip]
         assert_encodes(&asm, &[
@@ -1948,7 +1948,7 @@ mod test {
 
     #[test]
     fn solver_branch_offsets() {
-        let asm = load("examples/solver.slaspec");
+        let asm = load("tests/specs/solver.slaspec");
         // target = inst_start + sext(b12:b11:b10_5:b4_1:0)
         #[rustfmt::skip]
         assert_encodes_at(&asm, 0x1000, &[
@@ -1976,7 +1976,7 @@ mod test {
 
     #[test]
     fn solver_program_with_labels() {
-        let asm = load("examples/solver.slaspec");
+        let asm = load("tests/specs/solver.slaspec");
         let source = "
             loop:   addi r1, r1, -0x1
                     beq r1, r0, done
@@ -1995,7 +1995,7 @@ mod test {
 
     #[test]
     fn solver_undefined_expressions() {
-        let asm = load("examples/solver.slaspec");
+        let asm = load("tests/specs/solver.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
             ("div r1, 0x80", vec![0xdb, 0x00, 0x00, 0x02]),
@@ -2043,7 +2043,7 @@ mod test {
 
     #[test]
     fn solver_roundtrip() {
-        let asm = load("examples/solver.slaspec");
+        let asm = load("tests/specs/solver.slaspec");
         assert_roundtrips(&asm, 4, 4000);
     }
 
@@ -2115,7 +2115,7 @@ mod test {
 
     #[test]
     fn subpattern_encodings() {
-        let asm = load("examples/subpattern.slaspec");
+        let asm = load("tests/specs/subpattern.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
             ("inc r3", vec![0x33, 0x00]),
@@ -2150,7 +2150,7 @@ mod test {
 
     #[test]
     fn subpattern_roundtrip() {
-        let asm = load("examples/subpattern.slaspec");
+        let asm = load("tests/specs/subpattern.slaspec");
         assert_roundtrips(&asm, 4, 400);
     }
 
@@ -2186,7 +2186,7 @@ mod test {
 
     #[test]
     fn context_assemble() {
-        let asm = load("examples/context.slaspec");
+        let asm = load("tests/specs/context.slaspec");
         let none: &[(&str, i64)] = &[];
         #[rustfmt::skip]
         let tests: &[ContextCase] = &[
@@ -2216,7 +2216,7 @@ mod test {
     /// Program assembly follows the context from line to line like the emulator does
     #[test]
     fn context_program() {
-        let asm = load("examples/context.slaspec");
+        let asm = load("tests/specs/context.slaspec");
         let source = "
             add r1, r1, 0x5
             mode1
@@ -2246,7 +2246,7 @@ mod test {
 
     #[test]
     fn attach_names_and_values() {
-        let asm = load("examples/attach.slaspec");
+        let asm = load("tests/specs/attach.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
             ("b.eq 0x5", vec![0x10, 0x05]),
@@ -2278,7 +2278,7 @@ mod test {
 
     #[test]
     fn varnode_display() {
-        let asm = load("examples/attach.slaspec");
+        let asm = load("tests/specs/attach.slaspec");
         #[rustfmt::skip]
         assert_encodes(&asm, &[
             ("mov acc, r1", vec![0x44, 0x00]),
@@ -2298,13 +2298,13 @@ mod test {
 
     #[test]
     fn attach_roundtrip() {
-        let asm = load("examples/attach.slaspec");
+        let asm = load("tests/specs/attach.slaspec");
         assert_roundtrips(&asm, 2, 300);
     }
 
     #[test]
     fn attach_names_on_context() {
-        let asm = load("examples/attach.slaspec");
+        let asm = load("tests/specs/attach.slaspec");
         let none: &[(&str, i64)] = &[];
         #[rustfmt::skip]
         let tests: &[ContextCase] = &[
@@ -2319,7 +2319,7 @@ mod test {
     /// `jm1` switches mode at a label before it
     #[test]
     fn context_program_all_commits() {
-        let asm = load("examples/context.slaspec");
+        let asm = load("tests/specs/context.slaspec");
         let context = Context::new(&asm);
         let assemble = |source, base, commits| {
             asm.assemble_program_in_context(source, base, &context, commits)
