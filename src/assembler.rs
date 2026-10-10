@@ -1635,6 +1635,114 @@ mod test {
     }
 
     #[test]
+    fn solver_split_and_scaled_immediates() {
+        let asm = load("examples/solver.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("addi r1, r2, 0x5", vec![0x93, 0x00, 0x51, 0x00]),
+            ("addi r1, r2, -0x1", vec![0x93, 0x00, 0xf1, 0xff]),
+            ("addi r1, r2, -0x800", vec![0x93, 0x00, 0x01, 0x80]),
+            // off = (imm_hi << 5) | imm_lo
+            ("sw r2, -0x4(r1)", vec![0x23, 0xae, 0x20, 0xfe]),
+            ("sw r3, 0x7ff(r4)", vec![0xa3, 0x2f, 0x32, 0x7e]),
+            ("sw r3, -0x800(r4)", vec![0x23, 0x20, 0x32, 0x80]),
+            // disp = d8 * 4 + 8
+            ("ldx r1, 0x8(r2)", vec![0x83, 0x30, 0x01, 0x00]),
+            ("ldx r1, -0x8(r2)", vec![0x83, 0x30, 0xc1, 0x0f]),
+            ("ldx r1, 0x204(r2)", vec![0x83, 0x30, 0xf1, 0x07]),
+            ("ldx r1, -0x1f8(r2)", vec![0x83, 0x30, 0x01, 0x08]),
+            // val = imm8 << (bpos * 8)
+            ("movb r1, 0x12000000", vec![0xb7, 0x10, 0x30, 0x12]),
+            ("movb r5, 0xff", vec![0xb7, 0x12, 0x00, 0xff]),
+            ("movb r1, 0x3400", vec![0xb7, 0x10, 0x10, 0x34]),
+        ]);
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "addi r1, r2, 0x800",
+            "sw r3, 0x800(r4)",
+            // not d8 * 4 + 8: misaligned, then out of range
+            "ldx r1, 0x9(r2)",
+            "ldx r1, 0x208(r2)",
+            // not one byte shifted by whole bytes
+            "movb r1, 0x1234",
+            "movb r1, 0x100000000",
+        ]);
+    }
+
+    #[test]
+    fn solver_rotated_immediates() {
+        let asm = load("examples/solver.slaspec");
+        // val = imm8 rotated right by 2 * rot; these have a single rot/imm8
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("orri r1, r2, 0xab000000", vec![0x8b, 0x60, 0x41, 0xab]),
+            ("orri r1, r2, 0x3fc", vec![0x8b, 0x60, 0xf1, 0xff]),
+            ("orri r1, r2, 0xfc000003", vec![0x8b, 0x60, 0x31, 0xff]),
+            ("orri r1, r2, 0xff", vec![0x8b, 0x60, 0x01, 0xff]),
+        ]);
+        // 0x4 has four rot/imm8 pairs and 0x0 sixteen; whichever is found must decode back
+        for input in ["orri r1, r2, 0x4", "orri r1, r2, 0x0"] {
+            let bytes = assemble(&asm, input).unwrap();
+            assert_eq!(disassemble(&asm, &bytes).as_deref(), Some(input));
+        }
+        // Set bits spread over more than 8 rotated bits
+        assert_rejects(&asm, &["orri r1, r2, 0x101", "orri r1, r2, 0x1fe00"]);
+    }
+
+    #[test]
+    fn solver_branch_offsets() {
+        let asm = load("examples/solver.slaspec");
+        // target = inst_start + sext(b12:b11:b10_5:b4_1:0)
+        #[rustfmt::skip]
+        assert_encodes_at(&asm, 0x1000, &[
+            ("beq r1, r2, 0x1010", vec![0x63, 0x88, 0x20, 0x00]),
+            ("beq r1, r2, 0xff0", vec![0xe3, 0x88, 0x20, 0xfe]),
+            ("beq r1, r2, 0x1ffe", vec![0xe3, 0x8f, 0x20, 0x7e]),
+            ("beq r1, r2, 0x0", vec![0x63, 0x80, 0x20, 0x80]),
+        ]);
+        // Out of range forwards (+4096), odd, and out of range backwards (-4098)
+        #[rustfmt::skip]
+        let rejects = [
+            ("beq r1, r2, 0x2000", 0x1000),
+            ("beq r1, r2, 0x1011", 0x1000),
+            ("beq r1, r2, 0x1ffe", 0x3000),
+        ];
+        for (input, address) in rejects {
+            assert_eq!(
+                assemble_at(&asm, input, address),
+                Err(AsmError::NoMatch),
+                "{}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn solver_program_with_labels() {
+        let asm = load("examples/solver.slaspec");
+        let source = "
+            loop:   addi r1, r1, -0x1
+                    beq r1, r0, done
+                    beq r0, r0, loop
+            done:   movb r2, 0xff00
+        ";
+        let program = asm.assemble_program(source, 0x1000).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(program.bytes, vec![
+            0x93, 0x80, 0xf0, 0xff, // addi r1, r1, -0x1
+            0x63, 0x84, 0x00, 0x00, // beq r1, r0, 0x100c
+            0xe3, 0x0c, 0x00, 0xfe, // beq r0, r0, 0x1000
+            0x37, 0x11, 0x10, 0xff, // movb r2, 0xff00
+        ]);
+    }
+
+    #[test]
+    fn solver_roundtrip() {
+        let asm = load("examples/solver.slaspec");
+        assert_roundtrips(&asm, 4, 4000);
+    }
+
+    #[test]
     fn vliw_ambiguous_zero_constants() {
         let asm = load("examples/vliw.slaspec");
         // A 0 in slots 1 and 2 is either the shared constant or the op1/op2_const_zero literal

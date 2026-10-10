@@ -1,0 +1,79 @@
+# Encodings that make the assembler solve for field values: every immediate is
+# computed from its fields by a disassembly action, so assembling one means
+# inverting that arithmetic. RISC-V flavoured, little endian.
+#
+#   addi rd, rs1, imm       plain signed 12-bit field (baseline)
+#   sw   rs2, off(rs1)      off is split over two fields
+#   beq  rs1, rs2, target   pc relative, offset bits scattered over four fields
+#   orri rd, rs1, val       val is imm8 rotated right by 2*rot, often several ways
+#   ldx  rd, disp(rs1)      disp = d8 * 4 + 8, only aligned values encode
+#   movb rd, val            val is imm8 shifted up by a whole number of bytes
+
+define endian=little;
+define alignment=4;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [
+    r0  r1  r2  r3  r4  r5  r6  r7
+    r8  r9  r10 r11 r12 r13 r14 r15
+    r16 r17 r18 r19 r20 r21 r22 r23
+    r24 r25 r26 r27 r28 r29 r30 r31
+];
+
+define token instr(32)
+    op=(0, 6)
+    rd=(7, 11)
+    funct3=(12, 14)
+    rs1=(15, 19)
+    rs2=(20, 24)
+
+    imm12=(20, 31) signed
+
+    imm_lo=(7, 11)
+    imm_hi=(25, 31) signed
+
+    b11=(7, 7)
+    b4_1=(8, 11)
+    b10_5=(25, 30)
+    b12=(31, 31) signed
+
+    rot=(20, 23)
+    bpos=(20, 21)
+    imm8=(24, 31)
+
+    d8=(20, 27) signed
+;
+
+attach variables [ rd rs1 rs2 ] [
+    r0  r1  r2  r3  r4  r5  r6  r7
+    r8  r9  r10 r11 r12 r13 r14 r15
+    r16 r17 r18 r19 r20 r21 r22 r23
+    r24 r25 r26 r27 r28 r29 r30 r31
+];
+
+BRANCH: target is b12 & b11 & b10_5 & b4_1
+    [ target = inst_start + ((b12 << 12) | (b11 << 11) | (b10_5 << 5) | (b4_1 << 1)); ]
+    { export *:4 target; }
+
+:addi rd, rs1, imm12 is op=0x13 & funct3=0 & rd & rs1 & imm12 { rd = rs1 + imm12; }
+
+:sw rs2, off(rs1) is op=0x23 & funct3=2 & rs1 & rs2 & imm_hi & imm_lo
+    [ off = (imm_hi << 5) | imm_lo; ]
+    { *:4 (rs1 + off) = rs2; }
+
+:beq rs1, rs2, BRANCH is op=0x63 & funct3=0 & rs1 & rs2 & BRANCH
+    { if (rs1 == rs2) goto BRANCH; }
+
+:orri rd, rs1, val is op=0x0b & funct3=6 & rd & rs1 & rot & imm8
+    [ val = ((imm8 << (32 - rot * 2)) | (imm8 >> (rot * 2))) & 0xffffffff; ]
+    { rd = rs1 | val; }
+
+:ldx rd, disp(rs1) is op=0x03 & funct3=3 & rd & rs1 & d8
+    [ disp = d8 * 4 + 8; ]
+    { rd = *:4 (rs1 + disp); }
+
+:movb rd, val is op=0x37 & funct3=1 & rd & bpos & imm8
+    [ val = imm8 << (bpos * 8); ]
+    { rd = val; }
