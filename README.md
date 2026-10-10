@@ -14,12 +14,14 @@ This project consists of 4 primary parts: A library `sleigher`, and 3 tools `sle
 
 The 3 tools should be considered example code for using the library as well as being simple but moderately powerful tools for working with Sleigh.
 
+Context variables are supported, and each tool takes initial values with `--context name=value`.
+Unlike Ghidra, which keeps the context by address, the context flows from instruction to instruction in the order they are visited: execution order in the emulator, line order in the assembler and a linear sweep in the disassembler.
+
 
 Future work
 ===========
 - Instruction lifter to a simpler IR than raw sleigh execution semantics
 - Symbolic execution engine
 - JIT emulator for faster execution of lifted instructions
-- Context support is current unimplemented
 - Better testing, more toy examples.
 - Debugger?

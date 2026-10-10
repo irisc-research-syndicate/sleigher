@@ -9,6 +9,7 @@ use anyhow::{bail, Context as AnyhowContext, Result};
 
 use sleigh_rs::SpaceId;
 
+use sleigher::context::Context;
 use sleigher::emulator::{Cpu, State};
 use sleigher::space::{FileRegion, HashSpace, MappedSpace};
 use sleigher::value::{Address, Ref};
@@ -132,6 +133,10 @@ struct Args {
 
     #[arg(short='s', long="steps", value_parser=parse_int)]
     steps: Option<u64>,
+
+    /// Start from a context variable value, as name=value; may be repeated
+    #[arg(short = 'c', long = "context")]
+    context: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -177,6 +182,7 @@ fn main() -> Result<()> {
     }
 
     let mut cpu = Cpu::new(&sleigh, state);
+    cpu.context.next = Context::parse_values(&sleigh, &args.context)?;
 
     fn read_reg_u32(cpu: &mut Cpu, name: &str) -> u32 {
         let varnode = cpu

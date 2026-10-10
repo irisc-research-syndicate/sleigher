@@ -20,6 +20,7 @@ use anyhow::{anyhow, bail};
 
 use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
+use crate::value::parse_number;
 
 /// Labels a program defines: resolved to an address, or `None` while their address is unknown
 pub type Labels = BTreeMap<String, Option<u64>>;
@@ -113,31 +114,6 @@ fn parse_literal<'a>(lit: &str, s: &'a str) -> Option<&'a str> {
 fn parse_space1(s: &str) -> Option<&str> {
     let rest = s.trim_start_matches([' ', '\t']);
     (rest.len() < s.len()).then_some(rest)
-}
-
-fn parse_digits(s: &str, radix: u32) -> Option<(&str, u64)> {
-    let len = s.find(|c: char| !c.is_digit(radix)).unwrap_or(s.len());
-    let value = u64::from_str_radix(&s[..len], radix).ok()?;
-    Some((&s[len..], value))
-}
-
-fn parse_hex(s: &str) -> Option<(&str, u64)> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
-    parse_digits(s, 16)
-}
-
-fn parse_dec(s: &str) -> Option<(&str, u64)> {
-    parse_digits(s, 10)
-}
-
-fn parse_number(signed: bool, s: &str) -> Option<(&str, i64)> {
-    let (s, sign) = match s.strip_prefix('-') {
-        Some(s) if signed => (s, true),
-        _ => (s, false),
-    };
-    let (s, value) = parse_hex(s).or_else(|| parse_dec(s))?;
-    let value = if sign { -(value as i64) } else { value as i64 };
-    Some((s, value))
 }
 
 /// `[A-Za-z_.][A-Za-z0-9_.]*`

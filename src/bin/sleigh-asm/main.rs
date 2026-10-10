@@ -31,6 +31,10 @@ struct Cli {
     /// Write the program's raw bytes to this file
     #[arg(short, long, requires = "file")]
     output: Option<PathBuf>,
+
+    /// Start from a context variable value, as name=value; may be repeated
+    #[arg(short, long)]
+    context: Vec<String>,
 }
 
 pub fn main() -> Result<()> {
@@ -41,11 +45,12 @@ pub fn main() -> Result<()> {
         .ok()
         .context("Could not open or parse slaspec")?;
     let assembler = InstructionAssembler::new(sleigh);
+    let context = Context::parse_values(&assembler, &args.context)?;
 
     if let Some(path) = &args.file {
         let source =
             std::fs::read_to_string(path).with_context(|| format!("Could not read {:?}", path))?;
-        let program = assembler.assemble_program(&source, args.base)?;
+        let program = assembler.assemble_program_in_context(&source, args.base, &context)?;
 
         for line in program.lines.iter() {
             let bytes = line
@@ -74,12 +79,8 @@ pub fn main() -> Result<()> {
         bail!("Give an instruction or --file");
     };
     let labels = Labels::new();
-    let constraints = assembler.assemble_instruction_at(
-        instruction,
-        args.base,
-        &Context::new(&assembler),
-        &labels,
-    )?;
+    let constraints =
+        assembler.assemble_instruction_at(instruction, args.base, &context, &labels)?;
 
     println!("tokens: {:?}", constraints.tokens);
     println!("fields: {:#?}", constraints.fields.values());

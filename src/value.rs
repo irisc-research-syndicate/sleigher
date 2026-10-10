@@ -46,3 +46,29 @@ pub fn sign_extend(value: u64, bits: u32) -> i64 {
     let shift = 64 - bits;
     ((value << shift) as i64) >> shift
 }
+
+fn parse_digits(s: &str, radix: u32) -> Option<(&str, u64)> {
+    let len = s.find(|c: char| !c.is_digit(radix)).unwrap_or(s.len());
+    let value = u64::from_str_radix(&s[..len], radix).ok()?;
+    Some((&s[len..], value))
+}
+
+fn parse_hex(s: &str) -> Option<(&str, u64)> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))?;
+    parse_digits(s, 16)
+}
+
+fn parse_dec(s: &str) -> Option<(&str, u64)> {
+    parse_digits(s, 10)
+}
+
+/// A decimal or `0x` hex number, negative only if `signed`, and the rest of `s`
+pub fn parse_number(signed: bool, s: &str) -> Option<(&str, i64)> {
+    let (s, sign) = match s.strip_prefix('-') {
+        Some(s) if signed => (s, true),
+        _ => (s, false),
+    };
+    let (s, value) = parse_hex(s).or_else(|| parse_dec(s))?;
+    let value = if sign { -(value as i64) } else { value as i64 };
+    Some((s, value))
+}

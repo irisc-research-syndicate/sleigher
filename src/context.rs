@@ -4,7 +4,7 @@ use std::ops::Range;
 use sleigh_rs::pattern::BitConstraint;
 use sleigh_rs::{ContextId, Sleigh};
 
-use crate::value::sign_extend;
+use crate::value::{parse_number, sign_extend};
 
 /// The values of a spec's context variables, packed the way sleigh-rs packs them for the
 /// context half of a constructor's bit pattern
@@ -30,6 +30,25 @@ impl Context {
             context.set(sleigh, id, *value);
         }
         Ok(context)
+    }
+
+    /// Every context variable zero except those set by `name=value` arguments, values in
+    /// decimal or `0x` hex
+    pub fn parse_values(sleigh: &Sleigh, args: &[String]) -> anyhow::Result<Self> {
+        let values = args
+            .iter()
+            .map(|arg| {
+                let (name, value) = arg
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("{:?} is not name=value", arg))?;
+                let value = match parse_number(true, value.trim()) {
+                    Some(("", value)) => value,
+                    _ => anyhow::bail!("{:?} is not a number", value),
+                };
+                Ok((name.trim(), value))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Self::from_values(sleigh, &values)
     }
 
     /// The context variable called `name`
@@ -227,5 +246,24 @@ mod test {
         assert_eq!(register.len(), 1);
         assert_eq!(immediate.len(), 1);
         assert_ne!(register, immediate);
+    }
+
+    #[test]
+    fn parse_values() {
+        let sleigh = load();
+        let values = ["mode=1", "shift=0x3", "bank = 1"].map(String::from);
+        let context = Context::parse_values(&sleigh, &values).unwrap();
+        assert_eq!(context.get(&sleigh, id(&sleigh, "mode")), 1);
+        assert_eq!(context.get(&sleigh, id(&sleigh, "shift")), 3);
+        assert_eq!(context.get(&sleigh, id(&sleigh, "bank")), 1);
+        assert_eq!(context.get(&sleigh, id(&sleigh, "width")), 0);
+
+        for bad in ["mode", "mode=x", "nope=1", "r0=1"] {
+            assert!(
+                Context::parse_values(&sleigh, &[bad.to_string()]).is_err(),
+                "{:?}",
+                bad
+            );
+        }
     }
 }
