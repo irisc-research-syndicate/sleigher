@@ -1,0 +1,74 @@
+# A Mill-like belt machine. Instructions do not name destination registers:
+# every result "drops" onto the front of the belt (b0) and pushes the older
+# values one position back, the oldest falling off the end. Operands name a
+# belt position, so the same value is b0 right after it is produced, b1 after
+# the next drop, and so on.
+#
+#   [op:4] [x:3] [y:3] [...:6]     16-bit instructions, big endian
+#
+#   con imm         drop a sign extended 12-bit constant
+#   add/sub/mul x, y
+#   eql x, y        drop 1 if x == y, else 0
+#   ld x            drop the word at address x
+#   mov x           drop a copy of x (to bring values back to the front)
+#   divu x, y       drop x / y, then x % y (two drops)
+#   st x, y         store y at address x (no drop)
+#   br x, target    branch when x != 0 (no drop)
+#   jmp target
+#   out x           user defined output (no drop)
+#   nop
+
+define endian=big;
+define alignment=2;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [ b0 b1 b2 b3 b4 b5 b6 b7 ];
+
+define pcodeop out;
+
+define token instr(16)
+    op=(12, 15)
+    x=(9, 11)
+    y=(6, 8)
+    imm12=(0, 11) signed
+    rel9=(0, 8) signed
+    rel12=(0, 11) signed
+;
+
+attach variables [ x y ] [ b0 b1 b2 b3 b4 b5 b6 b7 ];
+
+# Drop a value onto the front of the belt
+macro drop(value) {
+    b7 = b6;
+    b6 = b5;
+    b5 = b4;
+    b4 = b3;
+    b3 = b2;
+    b2 = b1;
+    b1 = b0;
+    b0 = value;
+}
+
+BTARGET: target is rel9 [ target = inst_next + rel9 * 2; ] { export *:4 target; }
+JTARGET: target is rel12 [ target = inst_next + rel12 * 2; ] { export *:4 target; }
+
+:con imm12 is op=0 & imm12 { local result:4 = imm12; drop(result); }
+:add x, y is op=1 & x & y { local result:4 = x + y; drop(result); }
+:sub x, y is op=2 & x & y { local result:4 = x - y; drop(result); }
+:mul x, y is op=3 & x & y { local result:4 = x * y; drop(result); }
+:eql x, y is op=4 & x & y { local result:4 = zext(x == y); drop(result); }
+:ld x     is op=5 & x { local result:4 = *:4 x; drop(result); }
+:st x, y  is op=6 & x & y { *:4 x = y; }
+:br x, BTARGET is op=7 & x & BTARGET { if (x != 0) goto BTARGET; }
+:jmp JTARGET   is op=8 & JTARGET { goto JTARGET; }
+:out x    is op=9 & x { out(x); }
+:mov x    is op=10 & x { local result:4 = x; drop(result); }
+:divu x, y is op=11 & x & y {
+    local quotient:4 = x / y;
+    local remainder:4 = x % y;
+    drop(quotient);
+    drop(remainder);
+}
+:nop is op=15 { }

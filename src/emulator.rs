@@ -742,4 +742,77 @@ mod test {
         );
         assert_eq!(cpu.state.pc, BASE);
     }
+
+    #[test]
+    fn belt_drops() {
+        let sleigh = load("examples/belt.slaspec");
+        // Every result drops onto b0 and pushes the belt back, b7 falls off
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("con 0x5", vec![0x00, 0x05], &[("b0", 1), ("b1", 2), ("b6", 6), ("b7", 7)], &[], &[("b0", 5), ("b1", 1), ("b2", 2), ("b7", 6)], &[]),
+            ("con -0x1", vec![0x0f, 0xff], &[], &[], &[("b0", 0xffffffff)], &[]),
+            ("add b0, b1", vec![0x10, 0x40], &[("b0", 3), ("b1", 4)], &[], &[("b0", 7), ("b1", 3), ("b2", 4)], &[]),
+            ("sub b1, b0", vec![0x22, 0x00], &[("b0", 3), ("b1", 10)], &[], &[("b0", 7), ("b1", 3), ("b2", 10)], &[]),
+            ("mul b2, b3", vec![0x34, 0xc0], &[("b2", 6), ("b3", 7)], &[], &[("b0", 42), ("b3", 6), ("b4", 7)], &[]),
+            ("eql b0, b1", vec![0x40, 0x40], &[("b0", 5), ("b1", 5)], &[], &[("b0", 1), ("b1", 5), ("b2", 5)], &[]),
+            ("eql b0, b1", vec![0x40, 0x40], &[("b0", 5), ("b1", 6)], &[], &[("b0", 0), ("b1", 5), ("b2", 6)], &[]),
+            ("mov b7", vec![0xae, 0x00], &[("b6", 0x66), ("b7", 0x77)], &[], &[("b0", 0x77), ("b7", 0x66)], &[]),
+            // Two drops: the quotient, then the remainder
+            ("divu b0, b1", vec![0xb0, 0x40], &[("b0", 17), ("b1", 5)], &[], &[("b0", 2), ("b1", 3), ("b2", 17), ("b3", 5)], &[]),
+            ("nop", vec![0xf0, 0x00], &[("b0", 1)], &[], &[("b0", 1)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn belt_memory_and_branches() {
+        let sleigh = load("examples/belt.slaspec");
+        // Stores and branches drop nothing
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("ld b0", vec![0x50, 0x00], &[("b0", 0x2000)], &[(0x2000, 0xdeadbeef)], &[("b0", 0xdeadbeef), ("b1", 0x2000)], &[]),
+            ("st b1, b0", vec![0x62, 0x00], &[("b0", 0xcafebabe), ("b1", 0x2000)], &[], &[("b0", 0xcafebabe), ("b1", 0x2000)], &[(0x2000, 0xcafebabe)]),
+            ("br b0, 0x1012", vec![0x70, 0x08], &[("b0", 1)], &[], &[("pc", 0x1012)], &[]),
+            ("br b0, 0x1012", vec![0x70, 0x08], &[("b0", 0)], &[], &[], &[]),
+            ("jmp 0xffe", vec![0x8f, 0xfe], &[], &[], &[("pc", 0xffe)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn belt_sum_loop() {
+        let source = "
+                    con 0x4         // n
+                    con 0x0         // acc; the loop keeps b0 = acc, b1 = n
+            loop:   add b0, b1      // acc + n
+                    con -0x1
+                    add b3, b0      // n - 1
+                    mov b2          // acc + n back to the front
+                    br b1, loop
+                    out b0
+            end:    nop
+        ";
+        let assembler = crate::assembler::InstructionAssembler::new(load("examples/belt.slaspec"));
+        let program = assembler.assemble_program(source, BASE).unwrap();
+
+        let sleigh = load("examples/belt.slaspec");
+        let mut cpu = new_cpu(&sleigh, &program.bytes);
+        let output = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+        let out = output.clone();
+        cpu.register_user_op("out", move |_state, args| {
+            out.borrow_mut().extend_from_slice(args);
+            Ok(None)
+        });
+
+        let mut steps = 0;
+        while cpu.state.pc != program.labels["end"] {
+            assert!(
+                steps < 100,
+                "loop did not terminate, pc = {:#x}",
+                cpu.state.pc
+            );
+            cpu.step().unwrap();
+            steps += 1;
+        }
+        assert_eq!(*output.borrow(), vec![4 + 3 + 2 + 1]);
+        assert_eq!(steps, 2 + 4 * 5 + 1);
+    }
 }

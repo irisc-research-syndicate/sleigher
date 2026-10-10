@@ -1769,4 +1769,29 @@ mod test {
         let asm = load("examples/vliw.slaspec");
         assert_roundtrips(&asm, 8, 300);
     }
+
+    #[test]
+    fn belt_encodings() {
+        let asm = load("examples/belt.slaspec");
+        #[rustfmt::skip]
+        assert_encodes_at(&asm, 0x1000, &[
+            ("con 0x4", vec![0x00, 0x04]),
+            ("con -0x1", vec![0x0f, 0xff]),
+            ("add b3, b0", vec![0x16, 0x00]),
+            ("mov b2", vec![0xa4, 0x00]),
+            ("divu b0, b1", vec![0xb0, 0x40]),
+            ("st b2, b0", vec![0x64, 0x00]),
+            ("br b1, 0xff8", vec![0x73, 0xfb]),
+            ("jmp 0xff6", vec![0x8f, 0xfa]),
+            ("out b0", vec![0x90, 0x00]),
+            ("nop", vec![0xf0, 0x00]),
+        ]);
+        assert_rejects(&asm, &["add b8, b0", "con 0x800", "mov b0, b1"]);
+    }
+
+    #[test]
+    fn belt_roundtrip() {
+        let asm = load("examples/belt.slaspec");
+        assert_roundtrips(&asm, 2, 400);
+    }
 }

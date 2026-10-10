@@ -588,6 +588,18 @@ mod test {
     }
 
     #[test]
+    fn test_belt_disassemble() {
+        #[rustfmt::skip]
+        run_tests("examples/belt.slaspec", &[
+            ("con -0x1", vec![0x0f, 0xff]),
+            ("add b0, b1", vec![0x10, 0x40]),
+            ("divu b0, b1", vec![0xb0, 0x40]),
+            ("br b1, 0xc", vec![0x72, 0x05]),
+            ("jmp 0x0", vec![0x8f, 0xff]),
+        ]);
+    }
+
+    #[test]
     fn test_layout_disassemble() {
         #[rustfmt::skip]
         run_tests("examples/layout.slaspec", &[
