@@ -200,6 +200,12 @@ fn sign_extend(value: u64, size: u32) -> i64 {
     crate::value::sign_extend(value, 8 * size.min(8))
 }
 
+/// Mask with the low `bits` bits set
+fn bit_mask(bits: u64) -> u64 {
+    1u64.checked_shl(bits.try_into().unwrap_or(u32::MAX))
+        .map_or(u64::MAX, |bit| bit - 1)
+}
+
 /// Runs the p-code of one instruction
 struct PcodeExecutor<'e> {
     sleigh: &'e Sleigh,
@@ -440,11 +446,43 @@ impl PcodeExecutor<'_> {
             BoolXor => ((a(self)? != 0) ^ (b(self)? != 0)) as u64,
             BoolAnd => ((a(self)? != 0) & (b(self)? != 0)) as u64,
             BoolOr => ((a(self)? != 0) | (b(self)? != 0)) as u64,
+            Piece => {
+                let low_bits = 8 * op.inputs[1].size;
+                a(self)?.checked_shl(low_bits).unwrap_or(0) | b(self)?
+            }
             Subpiece => a(self)?.checked_shr(8 * b(self)? as u32).unwrap_or(0),
+            PtrAdd => a(self)?.wrapping_add(b(self)?.wrapping_mul(self.input(op, 2)?)),
+            PtrSub => a(self)?.wrapping_add(b(self)?),
+            Insert => {
+                let (position, bits) = (self.input(op, 2)?, self.input(op, 3)?);
+                let position = position.try_into().unwrap_or(u32::MAX);
+                let field = bit_mask(bits).checked_shl(position).unwrap_or(0);
+                let value = b(self)?.checked_shl(position).unwrap_or(0);
+                (a(self)? & !field) | (value & field)
+            }
+            Extract => {
+                let (position, bits) = (b(self)?, self.input(op, 2)?);
+                let position = position.try_into().unwrap_or(u32::MAX);
+                a(self)?.checked_shr(position).unwrap_or(0) & bit_mask(bits)
+            }
             Popcount => a(self)?.count_ones() as u64,
             Lzcount => (a(self)?.leading_zeros() - (64 - bits as u32)) as u64,
             Branch | CBranch | BranchInd | Call | CallInd | Return | Store => {
                 unreachable!("handled by execute_op")
+            }
+            MultiEqual | Indirect | Cast => {
+                bail!(
+                    "{} is an analysis op and cannot be emulated",
+                    op.opcode.name()
+                )
+            }
+            // Their meaning comes from the runtime: segment calculations, the class constant
+            // pool and object allocation
+            SegmentOp | CPoolRef | New => {
+                bail!(
+                    "{} depends on the runtime and cannot be emulated",
+                    op.opcode.name()
+                )
             }
             opcode => bail!("{} is not supported by the emulator", opcode.name()),
         };
@@ -595,6 +633,70 @@ mod test {
             }
         }
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Run `opcode` on `inputs` with the executor directly, the output is a `size` byte unique
+    fn evaluate(sleigh: &Sleigh, opcode: OpCode, size: u32, inputs: &[Varnode]) -> Result<u64> {
+        let mut state = State::new();
+        let mut user_ops = HashMap::new();
+        let mut executor = PcodeExecutor {
+            sleigh,
+            state: &mut state,
+            user_ops: &mut user_ops,
+            uniques: HashSpace::new(),
+        };
+        let output = Varnode {
+            space: VarnodeSpace::Unique,
+            offset: 0x100,
+            size,
+        };
+        let op = PcodeOp {
+            opcode,
+            output: Some(output),
+            inputs: inputs.to_vec(),
+        };
+        executor.execute(&[op], 0)?;
+        executor.read(&output)
+    }
+
+    #[test]
+    fn hand_built_ops() {
+        let sleigh = load("examples/cisc.slaspec");
+        let c = Varnode::constant;
+        use OpCode::*;
+        #[rustfmt::skip]
+        let cases: &[(OpCode, u32, &[Varnode], u64)] = &[
+            (Piece, 4, &[c(0x1234, 2), c(0x5678, 2)], 0x12345678),
+            (Piece, 3, &[c(0xab, 1), c(0xcdef, 2)], 0xabcdef),
+            (Piece, 8, &[c(0x1, 4), c(0x2, 4)], 0x1_0000_0002),
+            (PtrAdd, 4, &[c(0x1000, 4), c(3, 4), c(8, 4)], 0x1018),
+            (PtrAdd, 4, &[c(0x1000, 4), c(0xffffffff, 4), c(4, 4)], 0xffc),
+            (PtrSub, 4, &[c(0x1000, 4), c(0x10, 4)], 0x1010),
+            (Insert, 4, &[c(0xffffffff, 4), c(0x5, 4), c(4, 4), c(3, 4)], 0xffffffdf),
+            (Insert, 4, &[c(0, 4), c(0xff, 4), c(28, 4), c(8, 4)], 0xf0000000),
+            (Extract, 4, &[c(0x12345678, 4), c(8, 4), c(12, 4)], 0x456),
+            (Extract, 4, &[c(0x80000000, 4), c(31, 4), c(1, 4)], 1),
+        ];
+        let mut failures = vec![];
+        for (opcode, size, inputs, expected) in cases {
+            match evaluate(&sleigh, *opcode, *size, inputs) {
+                Ok(value) if value == *expected => {}
+                result => failures.push(format!(
+                    "{} {:?}: {:x?}, expected {:#x}",
+                    opcode.name(),
+                    inputs,
+                    result,
+                    expected
+                )),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+
+        let err = evaluate(&sleigh, MultiEqual, 4, &[c(1, 4), c(2, 4)]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "MULTIEQUAL is an analysis op and cannot be emulated"
+        );
     }
 
     #[test]

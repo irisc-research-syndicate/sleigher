@@ -54,6 +54,9 @@ pub fn size_mask(size: u32) -> u64 {
     }
 }
 
+/// Ghidra's p-code opcodes, as in its p-code reference (current Ghidra calls EXTRACT ZPULL and
+/// adds SPULL, which are not here). The lifter emits a subset; the rest, like the decompiler's
+/// analysis ops, are for p-code built elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpCode {
     Copy,
@@ -114,11 +117,20 @@ pub enum OpCode {
     FloatCeil,
     FloatFloor,
     FloatRound,
+    MultiEqual,
+    Indirect,
+    Piece,
     Subpiece,
-    Popcount,
-    Lzcount,
+    Cast,
+    PtrAdd,
+    PtrSub,
+    SegmentOp,
     CPoolRef,
     New,
+    Insert,
+    Extract,
+    Popcount,
+    Lzcount,
 }
 
 impl OpCode {
@@ -183,11 +195,20 @@ impl OpCode {
             OpCode::FloatCeil => "CEIL",
             OpCode::FloatFloor => "FLOOR",
             OpCode::FloatRound => "ROUND",
+            OpCode::MultiEqual => "MULTIEQUAL",
+            OpCode::Indirect => "INDIRECT",
+            OpCode::Piece => "PIECE",
             OpCode::Subpiece => "SUBPIECE",
-            OpCode::Popcount => "POPCOUNT",
-            OpCode::Lzcount => "LZCOUNT",
+            OpCode::Cast => "CAST",
+            OpCode::PtrAdd => "PTRADD",
+            OpCode::PtrSub => "PTRSUB",
+            OpCode::SegmentOp => "SEGMENTOP",
             OpCode::CPoolRef => "CPOOLREF",
             OpCode::New => "NEW",
+            OpCode::Insert => "INSERT",
+            OpCode::Extract => "EXTRACT",
+            OpCode::Popcount => "POPCOUNT",
+            OpCode::Lzcount => "LZCOUNT",
         }
     }
 }
