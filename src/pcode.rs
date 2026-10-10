@@ -204,9 +204,31 @@ pub struct PcodeOp {
     pub inputs: Vec<Varnode>,
 }
 
+/// Where a direct branch op goes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchTarget {
+    /// Another op of the same instruction, this many ops on
+    Relative(i64),
+    /// The instruction at an address
+    Address(VarnodeSpace, u64),
+}
+
 impl PcodeOp {
     pub fn display<'a>(&'a self, sleigh: &'a Sleigh) -> DisplayPcodeOp<'a> {
         DisplayPcodeOp { op: self, sleigh }
+    }
+
+    /// The target of a `BRANCH`, `CBRANCH` or `CALL`: a constant is relative to the op,
+    /// anything else names an address
+    pub fn branch_target(&self) -> Option<BranchTarget> {
+        let target = match self.opcode {
+            OpCode::Branch | OpCode::CBranch | OpCode::Call => self.inputs.first()?,
+            _ => return None,
+        };
+        Some(match target.space {
+            VarnodeSpace::Const => BranchTarget::Relative(target.offset as i64),
+            space => BranchTarget::Address(space, target.offset),
+        })
     }
 }
 
@@ -282,7 +304,7 @@ impl std::fmt::Display for DisplayPcodeOp<'_> {
                         .user_function(sleigh_rs::UserFunctionId(input.offset as usize))
                         .name()
                 )?,
-                (OpCode::Branch | OpCode::CBranch, 0) if input.is_const() => {
+                (_, 0) if matches!(op.branch_target(), Some(BranchTarget::Relative(_))) => {
                     write!(f, "{:+}", input.offset as i64)?
                 }
                 _ => write!(

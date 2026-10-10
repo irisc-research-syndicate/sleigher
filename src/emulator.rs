@@ -6,7 +6,7 @@ use sleigh_rs::{Endian, Sleigh, SpaceId, UserFunctionId};
 
 use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
-use crate::pcode::{size_mask, OpCode, PcodeOp, Varnode, VarnodeSpace};
+use crate::pcode::{size_mask, BranchTarget, OpCode, PcodeOp, Varnode, VarnodeSpace};
 use crate::space::{HashSpace, MemoryRegion};
 use crate::value::{Address, Ref};
 
@@ -280,21 +280,22 @@ impl PcodeExecutor<'_> {
     }
 
     /// Where a branch op's target goes
-    fn target(&mut self, target: &Varnode) -> Flow {
-        if target.is_const() {
-            Flow::Relative(target.offset as i64)
-        } else {
-            Flow::Address(target.offset)
-        }
+    fn target(op: &PcodeOp) -> Result<Flow> {
+        Ok(
+            match op.branch_target().context("branch without a target")? {
+                BranchTarget::Relative(offset) => Flow::Relative(offset),
+                BranchTarget::Address(_, address) => Flow::Address(address),
+            },
+        )
     }
 
     fn execute_op(&mut self, op: &PcodeOp) -> Result<Flow> {
         use OpCode::*;
         let flow = match op.opcode {
-            Branch | Call => self.target(&op.inputs[0]),
+            Branch | Call => Self::target(op)?,
             CBranch => {
                 if self.input(op, 1)? != 0 {
-                    self.target(&op.inputs[0])
+                    Self::target(op)?
                 } else {
                     Flow::Next
                 }
