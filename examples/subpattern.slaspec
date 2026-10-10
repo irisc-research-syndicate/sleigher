@@ -1,0 +1,57 @@
+# Parenthesised sub-patterns, big endian, 16-bit instructions and a 16-bit
+# extension word.
+#
+#   nop    an OR of a sub-pattern (op 0 with a zero operand) and op 15
+#   mov    a sub-pattern holding an OR, ANDed with the operands
+#   inc    context comparisons in each OR branch, which context bits can't
+#          express
+#   lim    comparisons in each OR branch, which only the verifications decide
+#   ld     a sub-pattern producing the operand subtable
+#   pair   sub-patterns checking only the extension word
+#   opt    a subtable only one OR branch produces, which still has to match
+
+define endian=big;
+define alignment=2;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [
+    r0 r1 r2  r3  r4  r5  r6  r7
+    r8 r9 r10 r11 r12 r13 r14 r15
+];
+define register offset=0x100 size=4 contextreg;
+
+define context contextreg
+    level=(0, 1)
+;
+
+define token instr(16)
+    op=(12, 15)
+    rd=(8, 11)
+    rs=(4, 7)
+    sub=(0, 3)
+    imm8=(0, 7)
+;
+
+define token ext(16)
+    ext_hi=(8, 15)
+    ext_lo=(0, 7)
+;
+
+attach variables [ rd rs ] [
+    r0 r1 r2  r3  r4  r5  r6  r7
+    r8 r9 r10 r11 r12 r13 r14 r15
+];
+
+:nop is (op=0 & imm8=0) | op=15 { }
+:mov rd, rs is ((op=1 & sub=0) | (op=2 & sub=15)) & rd & rs { rd = rs; }
+:inc rd is ((level<2 & op=3) | (level>=2 & op=4)) & rd { rd = rd + 1; }
+:lim rd, imm8 is ((op=6 & imm8>=0x80) | (op=7 & imm8<0x10)) & rd & imm8 { rd = imm8; }
+
+SRC: rs is sub=0 & rs { export rs; }
+SRC: "#"^imm8 is sub=1 & imm8 { export *[const]:4 imm8; }
+:ld rd, SRC is op=5 & (rd & SRC) { rd = SRC; }
+:pair rd is op=9 & rd; (ext_hi=1 & ext_lo=2) | ext_hi=3 { }
+OPT: "+" is sub=0 { }
+:opt is op=8 & (OPT | sub=15) { }

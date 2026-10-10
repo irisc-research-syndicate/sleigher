@@ -8,9 +8,9 @@ use sleigh_rs::disassembly::{
 use sleigh_rs::display::DisplayElement;
 use sleigh_rs::execution::Statement;
 use sleigh_rs::meaning::Meaning;
-use sleigh_rs::pattern::{BitConstraint, CmpOp, Verification};
+use sleigh_rs::pattern::{BitConstraint, Block, CmpOp, ConstraintValue, Verification};
 use sleigh_rs::table::{Constructor, Table};
-use sleigh_rs::{ContextId, Endian, Number, PrintBase, Sleigh, TableId, TokenFieldId};
+use sleigh_rs::{ContextId, Endian, Number, PrintBase, Sleigh, Span, TableId, TokenFieldId};
 
 use crate::context::{Context, ContextCommit, ContextFlow};
 use crate::pcode::{LiftError, PcodeOp};
@@ -31,6 +31,7 @@ impl<'sleigh> std::ops::Deref for Disassembler<'sleigh> {
 
 impl<'sleigh> Disassembler<'sleigh> {
     pub fn new(sleigh: &'sleigh Sleigh) -> Self {
+        warn_unsupported(sleigh);
         Disassembler { sleigh }
     }
 
@@ -391,39 +392,12 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     }
                 }
 
-                for verification in block.verifications() {
-                    match verification {
-                        Verification::ContextCheck {
-                            context: context_id,
-                            op,
-                            value,
-                        } => {
-                            let context_value = context.get(disassembler, *context_id);
-                            let check_value =
-                                disasm_table.evaluate_expr(value.expr(), context, bytes);
-                            if !compare(*op, context_value, check_value) {
-                                log::trace!("{}: failed verification {}={} {:?} {}, continuing to next matcher", table.name(), disassembler.context(*context_id).name(), context_value, op, check_value);
-                                continue 'match_loop;
-                            }
-                        }
-                        Verification::TableBuild {
-                            produced_table: _,
-                            verification: _,
-                        } => {}
-                        Verification::TokenFieldCheck { field, op, value } => {
-                            let field_value = disassembler.extract_token_field(*field, bytes);
-                            let check_value =
-                                disasm_table.evaluate_expr(value.expr(), context, bytes);
-                            if !compare(*op, field_value, check_value) {
-                                log::trace!("{}: failed verification {}={} {:?} {}, continuing to next matcher", table.name(), disassembler.token_field(*field).name(), field_value, op, check_value);
-                                continue 'match_loop;
-                            }
-                        }
-                        Verification::SubPattern {
-                            location: _,
-                            pattern: _,
-                        } => todo!(),
-                    }
+                if !disasm_table.verify_block(block, context, bytes) {
+                    log::trace!(
+                        "{}: failed verification, continuing to next matcher",
+                        table.name()
+                    );
+                    continue 'match_loop;
                 }
                 if bytes.len() < block_len {
                     log::trace!(
@@ -447,6 +421,78 @@ impl<'sleigh> DisassembledTable<'sleigh> {
             return Ok(disasm_table);
         }
         bail!("{}: Failed to disassemble table", table.name());
+    }
+
+    /// Whether the bytes at the start of a block and the context pass its verifications: all
+    /// of them in an AND block, any branch in an OR block
+    fn verify_block(&self, block: &Block, context: &Context, bytes: &[u8]) -> bool {
+        match block {
+            Block::And { verifications, .. } => verifications
+                .iter()
+                .all(|verification| self.verify(verification, context, bytes)),
+            Block::Or { branches, .. } => branches
+                .iter()
+                .any(|branch| self.verify(branch, context, bytes)),
+        }
+    }
+
+    fn verify(&self, verification: &Verification, context: &Context, bytes: &[u8]) -> bool {
+        match verification {
+            Verification::ContextCheck {
+                context: context_id,
+                op,
+                value,
+            } => {
+                let name = self.context(*context_id).name();
+                let context_value = context.get(self, *context_id);
+                self.check(name, context_value, *op, value, context, bytes)
+            }
+            // Every subtable is decoded whichever OR branch matches, as in Ghidra
+            Verification::TableBuild {
+                produced_table: _,
+                verification: _,
+            } => true,
+            Verification::TokenFieldCheck { field, op, value } => {
+                let name = self.token_field(*field).name();
+                let field_value = self.extract_token_field(*field, bytes);
+                self.check(name, field_value, *op, value, context, bytes)
+            }
+            // A parenthesised pattern, verified like a block of the constructor's pattern
+            Verification::SubPattern {
+                location: _,
+                pattern,
+            } => match pattern.blocks() {
+                [block] => self.verify_block(block, context, bytes),
+                // The fields and subtables of later blocks would be read from the wrong offset,
+                // see `warn_unsupported`
+                _ => false,
+            },
+        }
+    }
+
+    /// Compare the value of `name` with a constraint value, tracing a failure
+    fn check(
+        &self,
+        name: &str,
+        value: i64,
+        op: CmpOp,
+        check: &ConstraintValue,
+        context: &Context,
+        bytes: &[u8],
+    ) -> bool {
+        let check_value = self.evaluate_expr(check.expr(), context, bytes);
+        let passed = compare(op, value, check_value);
+        if !passed {
+            log::trace!(
+                "{}: failed verification {}={} {:?} {}",
+                self.table.name(),
+                name,
+                value,
+                op,
+                check_value
+            );
+        }
+        passed
     }
 
     /// Run the actions that need `inst_next`, once the whole instruction is matched. Unlike
@@ -689,6 +735,34 @@ pub fn delay_slot_len(constructor: &Constructor) -> u64 {
         .unwrap_or(0)
 }
 
+/// Warn about the parts of a spec that never match: sub-patterns spanning several blocks
+/// with `;`
+pub fn warn_unsupported(sleigh: &Sleigh) {
+    fn visit(blocks: &[Block]) {
+        for verification in blocks.iter().flat_map(Block::verifications) {
+            if let Verification::SubPattern { location, pattern } = verification {
+                if pattern.blocks().len() > 1 {
+                    let start = match location {
+                        Span::File(span) => &span.start,
+                        Span::Macro(span) => &span.start.expansion.start,
+                    };
+                    log::warn!(
+                        "{}:{}: sub-patterns spanning several blocks with `;` are not supported",
+                        start.file.display(),
+                        start.line + 1
+                    );
+                }
+                visit(pattern.blocks());
+            }
+        }
+    }
+    for table in sleigh.tables() {
+        for constructor in table.constructors() {
+            visit(constructor.pattern.blocks());
+        }
+    }
+}
+
 fn compare(op: CmpOp, l: i64, r: i64) -> bool {
     match op {
         CmpOp::Eq => l == r,
@@ -854,6 +928,61 @@ mod test {
         run_tests_in_context(path, &[("width", 1)], &[
             ("mov r1, r2", vec![0x00, 0x00, 0x12, 0x06]),
         ]);
+    }
+
+    #[test]
+    fn test_subpattern_disassemble() {
+        let path = "examples/subpattern.slaspec";
+        #[rustfmt::skip]
+        run_tests(path, &[
+            ("nop", vec![0x00, 0x00]),
+            ("nop", vec![0xf0, 0x00]),
+            ("nop", vec![0xf1, 0x23]),
+            ("mov r1, r2", vec![0x11, 0x20]),
+            ("mov r1, r2", vec![0x21, 0x2f]),
+            ("inc r3", vec![0x33, 0x00]),
+            ("lim r1, 0x80", vec![0x61, 0x80]),
+            ("lim r1, 0xf", vec![0x71, 0x0f]),
+            ("ld r1, r2", vec![0x51, 0x20]),
+            ("ld r1, #0x21", vec![0x51, 0x21]),
+            ("pair r1", vec![0x91, 0x00, 0x01, 0x02]),
+            ("pair r1", vec![0x91, 0x00, 0x03, 0xff]),
+            ("opt", vec![0x80, 0x00]),
+        ]);
+        #[rustfmt::skip]
+        run_tests_in_context(path, &[("level", 1)], &[
+            ("inc r3", vec![0x33, 0x00]),
+        ]);
+        #[rustfmt::skip]
+        run_tests_in_context(path, &[("level", 2)], &[
+            ("inc r3", vec![0x43, 0x00]),
+        ]);
+
+        // Bytes that match no branch of the sub-patterns
+        let sleigh = load(path);
+        let disasm = Disassembler::new(&sleigh);
+        let level3 = Context::from_values(&sleigh, &[("level", 3)]).unwrap();
+        #[rustfmt::skip]
+        let rejected = [
+            (Context::new(&sleigh), vec![0x00, 0x01]),
+            (Context::new(&sleigh), vec![0x11, 0x2f]),
+            (Context::new(&sleigh), vec![0x21, 0x20]),
+            (Context::new(&sleigh), vec![0x43, 0x00]),
+            (Context::new(&sleigh), vec![0x61, 0x7f]),
+            (Context::new(&sleigh), vec![0x71, 0x10]),
+            (Context::new(&sleigh), vec![0x91, 0x00, 0x01, 0x03]),
+            // OPT has to decode whichever branch matches
+            (Context::new(&sleigh), vec![0x80, 0x0f]),
+            (Context::new(&sleigh), vec![0x80, 0x01]),
+            (level3, vec![0x33, 0x00]),
+        ];
+        for (context, bytes) in rejected {
+            assert!(
+                disasm.disassemble(0, &context, &bytes).is_err(),
+                "{:02x?}",
+                bytes
+            );
+        }
     }
 
     #[test]
