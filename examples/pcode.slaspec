@@ -7,6 +7,7 @@
 #              0x06 out of its bounds
 #   0x07..0x0c references, operand byte: imm8=(0,7), sel=(0,1), simm8=(0,7)
 #              or name=(0,1), or a 16-bit immediate
+#   0x0d       a field attached to numbers, operand byte: sel=(0,1)
 
 define endian=little;
 define alignment=1;
@@ -60,3 +61,6 @@ IMM16: "#"^imm16 is imm16 { export *[const]:2 imm16; }
 :leass r0, simm8 is opcode=0x0a; simm8 & r0 { r0 = &simm8; }
 :lean r0, name is opcode=0x0b; name & r0 { r0 = &name; }
 :leab r0, IMM16 is opcode=0x0c & r0; IMM16 { r0 = zext(&:1 IMM16); }
+
+# Reads the number sel selects
+:adds r0, sel is opcode=0x0d; sel & r0 { r0 = r0 + sel; }

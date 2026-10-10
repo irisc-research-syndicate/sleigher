@@ -1102,7 +1102,11 @@ impl<'s> Lifter<'s> {
                 scope.table.context.get(self.sleigh, context.id) as u64,
                 bits_to_bytes(context.size.get()),
             ),
-            ExprValue::IntDynamic(_) => return unsupported(value),
+            // A token field attached to numbers reads as the number it selects
+            ExprValue::IntDynamic(dynamic) => Varnode::constant(
+                self.attached_number(scope, dynamic.attach_id, dynamic.attach_value)?,
+                bits_to_bytes(dynamic.bits.get()),
+            ),
         })
     }
 
@@ -1461,6 +1465,16 @@ mod test {
             (vec![0x0a, 0xfe], "leass r0, -0x2", &["r0 = COPY 0xfffffffe:4"]),
             (vec![0x0b, 0x02], "lean r0, c", &["r0 = COPY 0x2:4"]),
             (vec![0x0c, 0x34, 0x12], "leab r0, #0x1234", &["r0 = COPY 0x34:4"]),
+        ]);
+    }
+
+    #[test]
+    fn attached_numbers_pcode() {
+        let sleigh = load("examples/pcode.slaspec");
+        #[rustfmt::skip]
+        assert_lifts(&sleigh, &[
+            (vec![0x0d, 0x01], "adds r0, 0x8", &["r0 = INT_ADD r0, 0x8:4"]),
+            (vec![0x0d, 0x02], "adds r0, -0x1", &["r0 = INT_ADD r0, 0xffffffff:4"]),
         ]);
     }
 
