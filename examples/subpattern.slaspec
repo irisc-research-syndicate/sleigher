@@ -9,6 +9,7 @@
 #   ld     a sub-pattern producing the operand subtable
 #   pair   sub-patterns checking only the extension word
 #   opt    a subtable only one OR branch produces, which still has to match
+#   far    a comparison value wider than its field, so only sub 15 matches
 
 define endian=big;
 define alignment=2;
@@ -48,6 +49,7 @@ attach variables [ rd rs ] [
 :mov rd, rs is ((op=1 & sub=0) | (op=2 & sub=15)) & rd & rs { rd = rs; }
 :inc rd is ((level<2 & op=3) | (level>=2 & op=4)) & rd { rd = rd + 1; }
 :lim rd, imm8 is ((op=6 & imm8>=0x80) | (op=7 & imm8<0x10)) & rd & imm8 { rd = imm8; }
+:far rd, sub is ((op=11 & sub>=0x13) | (op=11 & sub=15)) & rd & sub { rd = sub; }
 
 SRC: rs is sub=0 & rs { export rs; }
 SRC: "#"^imm8 is sub=1 & imm8 { export *[const]:4 imm8; }

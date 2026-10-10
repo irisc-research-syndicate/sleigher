@@ -11,7 +11,7 @@ use sleigh_rs::disassembly::{
 };
 use sleigh_rs::display::DisplayElement;
 use sleigh_rs::meaning::{AttachNumber, AttachVarnode, Meaning};
-use sleigh_rs::pattern::{CmpOp, Verification};
+use sleigh_rs::pattern::{Block, CmpOp, Verification};
 use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{ContextId, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
@@ -19,7 +19,7 @@ use z3::ast::{Ast, Bool, BV};
 use anyhow::{anyhow, bail};
 
 use crate::context::{Context, ContextFlow};
-use crate::disassembler::Disassembler;
+use crate::disassembler::{warn_unsupported, Disassembler};
 use crate::value::{parse_number, parse_number_exact};
 
 /// Labels a program defines: resolved to an address, or `None` while their address is unknown
@@ -168,19 +168,28 @@ pub type TokenKey = (usize, usize, TokenId);
 
 static NEXT_INSTANCE: AtomicUsize = AtomicUsize::new(0);
 
-/// `l op r`, comparing as the disassembler does: signed values sign extended
-fn compare<'asm>(op: CmpOp, signed: bool, l: &BV<'asm>, r: &BV<'asm>) -> Bool<'asm> {
-    match (op, signed) {
-        (CmpOp::Eq, _) => l._eq(r),
-        (CmpOp::Ne, _) => l._eq(r).not(),
-        (CmpOp::Lt, false) => l.bvult(r),
-        (CmpOp::Gt, false) => l.bvugt(r),
-        (CmpOp::Le, false) => l.bvule(r),
-        (CmpOp::Ge, false) => l.bvuge(r),
-        (CmpOp::Lt, true) => l.bvslt(r),
-        (CmpOp::Gt, true) => l.bvsgt(r),
-        (CmpOp::Le, true) => l.bvsle(r),
-        (CmpOp::Ge, true) => l.bvsge(r),
+/// Whether a verification checks a field of `token`, also inside sub-patterns
+fn checks_token(sleigh: &Sleigh, verification: &Verification, token: TokenId) -> bool {
+    match verification {
+        Verification::TokenFieldCheck { field, .. } => sleigh.token_field(*field).token == token,
+        Verification::SubPattern { pattern, .. } => pattern
+            .blocks()
+            .iter()
+            .flat_map(Block::verifications)
+            .any(|verification| checks_token(sleigh, verification, token)),
+        Verification::ContextCheck { .. } | Verification::TableBuild { .. } => false,
+    }
+}
+
+/// `l op r` on 64-bit values, signed as the disassembler compares them as i64
+fn compare<'asm>(op: CmpOp, l: &BV<'asm>, r: &BV<'asm>) -> Bool<'asm> {
+    match op {
+        CmpOp::Eq => l._eq(r),
+        CmpOp::Ne => l._eq(r).not(),
+        CmpOp::Lt => l.bvslt(r),
+        CmpOp::Gt => l.bvsgt(r),
+        CmpOp::Le => l.bvsle(r),
+        CmpOp::Ge => l.bvsge(r),
     }
 }
 
@@ -635,10 +644,10 @@ impl<'asm> Variables<'asm> {
                     .token_fields()
                     .iter()
                     .any(|produced| token_of(produced.field) == token)
-                    || block.verifications().iter().any(|verification| {
-                        matches!(verification, Verification::TokenFieldCheck { field, .. }
-                            if token_of(*field) == token)
-                    })
+                    || block
+                        .verifications()
+                        .iter()
+                        .any(|verification| checks_token(&self.asm.sleigh, verification, token))
             })
             .unwrap_or(0)
     }
@@ -668,6 +677,59 @@ impl<'asm> Variables<'asm> {
                 BV::fresh_const(&self.constraints.asm.ctx, variable.name(), 64)
             })
             .clone()
+    }
+
+    /// The condition for the encoding and `context` to pass a block's verifications: all of
+    /// them in an AND block, any branch in an OR block
+    fn verify_block(&mut self, block: &Block, context: &[BV<'asm>]) -> Bool<'asm> {
+        match block {
+            Block::And { verifications, .. } => {
+                let conditions = verifications
+                    .iter()
+                    .map(|verification| self.verify(verification, context))
+                    .collect::<Vec<_>>();
+                Bool::and(&self.asm.ctx, &conditions.iter().collect::<Vec<_>>())
+            }
+            Block::Or { branches, .. } => {
+                let conditions = branches
+                    .iter()
+                    .map(|branch| self.verify(branch, context))
+                    .collect::<Vec<_>>();
+                Bool::or(&self.asm.ctx, &conditions.iter().collect::<Vec<_>>())
+            }
+        }
+    }
+
+    fn verify(&mut self, verification: &Verification, context: &[BV<'asm>]) -> Bool<'asm> {
+        match verification {
+            Verification::ContextCheck {
+                context: context_id,
+                op,
+                value,
+            } => {
+                let value_bv = self.build_expr_bv(value.expr(), 64);
+                compare(*op, &context[context_id.0], &value_bv)
+            }
+            Verification::TableBuild {
+                produced_table: _,
+                verification: _,
+            } => Bool::from_bool(&self.asm.ctx, true),
+            Verification::TokenFieldCheck { field, op, value } => {
+                let field_bv = self.token_field(*field, Some(64));
+                let value_bv = self.build_expr_bv(value.expr(), 64);
+                compare(*op, &field_bv, &value_bv)
+            }
+            // A parenthesised pattern, verified like a block of the constructor's pattern
+            Verification::SubPattern {
+                location: _,
+                pattern,
+            } => match pattern.blocks() {
+                [block] => self.verify_block(block, context),
+                // Its later blocks would need tokens at offsets inside the outer block, see
+                // `warn_unsupported`
+                _ => Bool::from_bool(&self.asm.ctx, false),
+            },
+        }
     }
 
     /// Add disassembly action assignments as constraints
@@ -760,6 +822,7 @@ impl Deref for InstructionAssembler {
 
 impl InstructionAssembler {
     pub fn new(sleigh: Sleigh) -> Self {
+        warn_unsupported(&sleigh);
         let has_globalset = sleigh
             .tables()
             .iter()
@@ -908,7 +971,8 @@ impl InstructionAssembler {
                 };
                 // What the instruction commits is read back from its encoding
                 let commits = match self.has_globalset {
-                    true => Disassembler::new(self)
+                    true => self
+                        .disassembler()
                         .disassemble(address, &context, &bytes)
                         .map(|instruction| instruction.commits)
                         .map_err(|err| error(&err))?,
@@ -940,9 +1004,17 @@ impl InstructionAssembler {
         bail!("label addresses did not settle after {} passes", MAX_PASSES)
     }
 
+    /// A disassembler for the spec, without warning about it again like `Disassembler::new`
+    fn disassembler(&self) -> Disassembler<'_> {
+        Disassembler {
+            sleigh: &self.sleigh,
+        }
+    }
+
     fn candidate(&self, constraints: &Constraints, context: &Context) -> Candidate {
         let bytes = constraints.to_bytes().unwrap_or_default();
-        let disassembly = Disassembler::new(&self.sleigh)
+        let disassembly = self
+            .disassembler()
             .disassemble(constraints.inst_start, context, &bytes)
             .map(|instruction| instruction.to_string())
             .unwrap_or_else(|err| format!("<{}>", err));
@@ -1013,35 +1085,8 @@ impl InstructionAssembler {
         let context = variables.context.clone();
 
         for block in constructor.pattern.blocks() {
-            for verification in block.verifications() {
-                match verification {
-                    Verification::ContextCheck {
-                        context: context_id,
-                        op,
-                        value,
-                    } => {
-                        let value_bv = variables.build_expr_bv(value.expr(), 64);
-                        let signed = self.context(*context_id).is_signed();
-                        variables.eq(compare(*op, signed, &context[context_id.0], &value_bv));
-                    }
-                    Verification::TableBuild {
-                        produced_table: _,
-                        verification: _,
-                    } => {
-                        continue;
-                    }
-                    Verification::TokenFieldCheck { field, op, value } => {
-                        let field_bv = variables.token_field(*field, None);
-                        let value_bv = variables.build_expr_bv(value.expr(), field_bv.get_size());
-                        let signed = self.token_field(*field).raw_value_is_signed();
-                        variables.eq(compare(*op, signed, &field_bv, &value_bv));
-                    }
-                    Verification::SubPattern {
-                        location: _,
-                        pattern: _,
-                    } => todo!(),
-                }
-            }
+            let verified = variables.verify_block(block, &context);
+            variables.eq(verified);
             variables.assert_all(block.pre_disassembler());
             variables.assert_all(block.post_disassembler());
         }
@@ -1934,6 +1979,47 @@ mod test {
     fn belt_roundtrip() {
         let asm = load("examples/belt.slaspec");
         assert_roundtrips(&asm, 8, 400);
+    }
+
+    #[test]
+    fn subpattern_encodings() {
+        let asm = load("examples/subpattern.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("inc r3", vec![0x33, 0x00]),
+            ("lim r1, 0x80", vec![0x61, 0x80]),
+            ("lim r1, 0xf", vec![0x71, 0x0f]),
+            ("ld r1, r2", vec![0x51, 0x20]),
+            ("ld r1, #0x21", vec![0x51, 0x21]),
+            ("far r1, 0xf", vec![0xb1, 0x0f]),
+        ]);
+        #[rustfmt::skip]
+        let levels = [
+            (1, vec![0x33, 0x00]),
+            (2, vec![0x43, 0x00]),
+            (3, vec![0x43, 0x00]),
+        ];
+        for (level, bytes) in levels {
+            assert_eq!(assemble_in(&asm, "inc r3", &[("level", level)]), Ok(bytes));
+        }
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "lim r1, 0x20",
+            "ld r1, #0x2",
+            // 0x13 does not fit sub, it is not truncated to 0x3
+            "far r1, 0x3",
+        ]);
+        // Either branch of the OR will do, so only check what the bytes disassemble to
+        for input in ["nop", "mov r1, r2", "pair r1"] {
+            let bytes = assemble(&asm, input).unwrap_or_else(|err| panic!("{:?}: {}", input, err));
+            assert_eq!(disassemble(&asm, &bytes).as_deref(), Some(input));
+        }
+    }
+
+    #[test]
+    fn subpattern_roundtrip() {
+        let asm = load("examples/subpattern.slaspec");
+        assert_roundtrips(&asm, 4, 400);
     }
 
     /// (input, context values, expected encoding)
