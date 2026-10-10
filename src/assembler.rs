@@ -784,7 +784,7 @@ impl<'asm> Variables<'asm> {
                     Op::Add => expr_r + expr_l,
                     Op::Sub => expr_r - expr_l,
                     Op::Mul => expr_r * expr_l,
-                    Op::Div => expr_r.bvudiv(&expr_l),
+                    Op::Div => expr_r.bvsdiv(&expr_l),
                     Op::And => expr_r & expr_l,
                     Op::Or => expr_r | expr_l,
                     Op::Xor => expr_r ^ expr_l,
@@ -1824,6 +1824,9 @@ mod test {
             ("ldx r1, -0x8(r2)", vec![0x83, 0x30, 0xc1, 0x0f]),
             ("ldx r1, 0x204(r2)", vec![0x83, 0x30, 0xf1, 0x07]),
             ("ldx r1, -0x1f8(r2)", vec![0x83, 0x30, 0x01, 0x08]),
+            // disp = d8 * 6 / 3, a negative d8 divides signed
+            ("lds r1, 0x6(r2)", vec![0x83, 0x40, 0x31, 0x00]),
+            ("lds r1, -0x6(r2)", vec![0x83, 0x40, 0xd1, 0x0f]),
             // val = imm8 << (bpos * 8)
             ("movb r1, 0x12000000", vec![0xb7, 0x10, 0x30, 0x12]),
             ("movb r5, 0xff", vec![0xb7, 0x12, 0x00, 0xff]),
@@ -1836,6 +1839,7 @@ mod test {
             // not d8 * 4 + 8: misaligned, then out of range
             "ldx r1, 0x9(r2)",
             "ldx r1, 0x208(r2)",
+            "lds r1, -0x5(r2)",
             // not one byte shifted by whole bytes
             "movb r1, 0x1234",
             "movb r1, 0x100000000",

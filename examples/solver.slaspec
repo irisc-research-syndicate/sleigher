@@ -7,6 +7,7 @@
 #   beq  rs1, rs2, target   pc relative, offset bits scattered over four fields
 #   orri rd, rs1, val       val is imm8 rotated right by 2*rot, often several ways
 #   ldx  rd, disp(rs1)      disp = d8 * 4 + 8, only aligned values encode
+#   lds  rd, disp(rs1)      disp = d8 * 6 / 3, divided signed
 #   movb rd, val            val is imm8 shifted up by a whole number of bytes
 
 define endian=little;
@@ -72,6 +73,10 @@ BRANCH: target is b12 & b11 & b10_5 & b4_1
 
 :ldx rd, disp(rs1) is op=0x03 & funct3=3 & rd & rs1 & d8
     [ disp = d8 * 4 + 8; ]
+    { rd = *:4 (rs1 + disp); }
+
+:lds rd, disp(rs1) is op=0x03 & funct3=4 & rd & rs1 & d8
+    [ disp = d8 * 6 / 3; ]
     { rd = *:4 (rs1 + disp); }
 
 :movb rd, val is op=0x37 & funct3=1 & rd & bpos & imm8
