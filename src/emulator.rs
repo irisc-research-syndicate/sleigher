@@ -7,6 +7,7 @@ use sleigh_rs::{Endian, Sleigh, SpaceId, UserFunctionId};
 use crate::bigint::BigInt;
 use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
+use crate::float;
 use crate::pcode::{BranchTarget, DisplayVarnode, OpCode, PcodeOp, Varnode, VarnodeSpace};
 use crate::space::{HashSpace, MemoryRegion};
 use crate::value::{Address, Ref};
@@ -340,6 +341,9 @@ impl PcodeExecutor<'_> {
         let out_size = op.output.map_or(size, |output| output.size);
         let a = |executor: &mut Self| executor.input(op, 0);
         let b = |executor: &mut Self| executor.input(op, 1);
+        let fa = |executor: &mut Self| float::to_f64(&executor.input(op, 0)?);
+        let fb = |executor: &mut Self| float::to_f64(&executor.input(op, 1)?);
+        let sign_bit = || BigInt::from_u64(1, size) << (8 * size as u64 - 1);
         let value = match op.opcode {
             Copy | IntZExt => a(self)?,
             Load => {
@@ -428,6 +432,27 @@ impl PcodeExecutor<'_> {
                 let (position, bits) = (b(self)?.to_shift(), self.input(op, 2)?.to_shift());
                 (a(self)? >> position) & !(BigInt::ones(size) << bits)
             }
+            FloatEqual => BigInt::from_bool(fa(self)? == fb(self)?),
+            FloatNotEqual => BigInt::from_bool(fa(self)? != fb(self)?),
+            FloatLess => BigInt::from_bool(fa(self)? < fb(self)?),
+            FloatLessEqual => BigInt::from_bool(fa(self)? <= fb(self)?),
+            FloatNan => BigInt::from_bool(fa(self)?.is_nan()),
+            FloatAdd => float::from_f64(fa(self)? + fb(self)?, size)?,
+            FloatSub => float::from_f64(fa(self)? - fb(self)?, size)?,
+            FloatMult => float::from_f64(fa(self)? * fb(self)?, size)?,
+            FloatDiv => float::from_f64(fa(self)? / fb(self)?, size)?,
+            // The sign bit alone, which keeps NaNs and needs no rounding
+            FloatNeg => a(self)? ^ sign_bit(),
+            FloatAbs => a(self)? & !sign_bit(),
+            FloatSqrt => float::from_f64(fa(self)?.sqrt(), size)?,
+            FloatCeil => float::from_f64(fa(self)?.ceil(), size)?,
+            FloatFloor => float::from_f64(fa(self)?.floor(), size)?,
+            // Halfway cases round away from zero, like round() in FloatFormat::opRound of
+            // Ghidra's decompiler (float.cc); Ghidra's Java emulator uses floor(x + 0.5)
+            FloatRound => float::from_f64(fa(self)?.round(), size)?,
+            FloatInt2Float => float::from_int(&a(self)?, out_size)?,
+            FloatFloat2Float => float::from_f64(fa(self)?, out_size)?,
+            FloatTrunc => float::to_int(fa(self)?, out_size),
             Popcount => BigInt::from_u64(a(self)?.popcount() as u64, out_size),
             Lzcount => BigInt::from_u64(a(self)?.lzcount() as u64, out_size),
             Branch | CBranch | BranchInd | Call | CallInd | Return | Store => {
@@ -447,7 +472,6 @@ impl PcodeExecutor<'_> {
                     op.opcode.name()
                 )
             }
-            opcode => bail!("{} is not supported by the emulator", opcode.name()),
         };
         Ok(Some(value))
     }
@@ -1273,6 +1297,70 @@ mod test {
         let memory_ref = Ref(cpu.default_space(), 64, Address(0x2000));
         cpu.state.read_ref(memory_ref, &mut memory).unwrap();
         assert_eq!(memory, bytes);
+    }
+
+    #[test]
+    fn float_ops() {
+        let sleigh = load("examples/float.slaspec");
+        let n = |value: u64| BigInt::from_u64(value, 16);
+        let d = |value: f64| BigInt::from_u64(value.to_bits(), 8);
+        let s = |value: f32| BigInt::from_u64(value.to_bits() as u64, 4);
+        let nan = f64::NAN;
+        #[rustfmt::skip]
+        assert_executes_wide(&sleigh, &[
+            ("fadd.d d0, d1, d2", vec![0x01, 0x06], vec![("d1", d(1.5)), ("d2", d(2.25))], vec![("d0", d(3.75))]),
+            ("fsub.d d0, d1, d2", vec![0x02, 0x06], vec![("d1", d(1.0)), ("d2", d(3.0))], vec![("d0", d(-2.0))]),
+            ("fmul.d d0, d1, d2", vec![0x03, 0x06], vec![("d1", d(1e200)), ("d2", d(1e200))], vec![("d0", d(f64::INFINITY))]),
+            ("fdiv.d d0, d1, d2", vec![0x04, 0x06], vec![("d1", d(-1.0)), ("d2", d(0.0))], vec![("d0", d(f64::NEG_INFINITY))]),
+            ("fdiv.d d0, d1, d2", vec![0x04, 0x06], vec![("d1", d(1.0)), ("d2", d(3.0))], vec![("d0", d(1.0 / 3.0))]),
+            ("fneg.d d0, d1", vec![0x05, 0x04], vec![("d1", d(2.5))], vec![("d0", d(-2.5))]),
+            ("fneg.d d0, d1", vec![0x05, 0x04], vec![("d1", n(0x7ff8000000000123))], vec![("d0", n(0xfff8000000000123))]),
+            ("fabs.d d0, d1", vec![0x06, 0x04], vec![("d1", d(-0.0))], vec![("d0", d(0.0))]),
+            ("fabs.d d0, d1", vec![0x06, 0x04], vec![("d1", d(-3.0))], vec![("d0", d(3.0))]),
+            ("fsqrt.d d0, d1", vec![0x07, 0x04], vec![("d1", d(2.0))], vec![("d0", d(std::f64::consts::SQRT_2))]),
+            ("fceil.d d0, d1", vec![0x08, 0x04], vec![("d1", d(-1.5))], vec![("d0", d(-1.0))]),
+            ("ffloor.d d0, d1", vec![0x09, 0x04], vec![("d1", d(-1.5))], vec![("d0", d(-2.0))]),
+            ("fround.d d0, d1", vec![0x0a, 0x04], vec![("d1", d(2.5))], vec![("d0", d(3.0))]),
+            ("fround.d d0, d1", vec![0x0a, 0x04], vec![("d1", d(-2.5))], vec![("d0", d(-3.0))]),
+            ("fround.d d0, d1", vec![0x0a, 0x04], vec![("d1", d(0.49999999999999994))], vec![("d0", d(0.0))]),
+            ("feq.d r0, d1, d2", vec![0x0b, 0x06], vec![("d1", d(0.0)), ("d2", d(-0.0))], vec![("r0", n(1))]),
+            ("feq.d r0, d1, d2", vec![0x0b, 0x06], vec![("r0", n(5)), ("d1", d(nan)), ("d2", d(nan))], vec![("r0", n(0))]),
+            ("fne.d r0, d1, d2", vec![0x0c, 0x06], vec![("d1", d(nan)), ("d2", d(nan))], vec![("r0", n(1))]),
+            ("fne.d r0, d1, d2", vec![0x0c, 0x06], vec![("r0", n(5)), ("d1", d(1.0)), ("d2", d(1.0))], vec![("r0", n(0))]),
+            ("flt.d r0, d1, d2", vec![0x0d, 0x06], vec![("d1", d(1.0)), ("d2", d(2.0))], vec![("r0", n(1))]),
+            ("flt.d r0, d1, d2", vec![0x0d, 0x06], vec![("r0", n(5)), ("d1", d(nan)), ("d2", d(2.0))], vec![("r0", n(0))]),
+            ("fle.d r0, d1, d2", vec![0x0e, 0x06], vec![("d1", d(2.0)), ("d2", d(2.0))], vec![("r0", n(1))]),
+            ("fle.d r0, d1, d2", vec![0x0e, 0x06], vec![("r0", n(5)), ("d1", d(1.0)), ("d2", d(nan))], vec![("r0", n(0))]),
+            ("fnan.d r0, d1", vec![0x0f, 0x04], vec![("d1", d(nan))], vec![("r0", n(1))]),
+            ("fnan.d r0, d1", vec![0x0f, 0x04], vec![("r0", n(5)), ("d1", d(f64::INFINITY))], vec![("r0", n(0))]),
+
+            ("fadd.s s0, s1, s2", vec![0x10, 0x06], vec![("s1", s(16777216.0)), ("s2", s(1.0))], vec![("s0", s(16777216.0))]),
+            ("fadd.s s0, s1, s2", vec![0x10, 0x06], vec![("s1", s(0.1)), ("s2", s(0.2))], vec![("s0", s(0.1 + 0.2))]),
+            ("fdiv.s s0, s1, s2", vec![0x11, 0x06], vec![("s1", s(1.0)), ("s2", s(3.0))], vec![("s0", s(1.0 / 3.0))]),
+            ("fsqrt.s s0, s1", vec![0x12, 0x04], vec![("s1", s(2.0))], vec![("s0", s(std::f32::consts::SQRT_2))]),
+            ("fneg.s s0, s1", vec![0x13, 0x04], vec![("s1", s(1.0))], vec![("s0", s(-1.0))]),
+            ("fround.s s0, s1", vec![0x14, 0x04], vec![("s1", s(0.5))], vec![("s0", s(1.0))]),
+            ("flt.s r0, s1, s2", vec![0x15, 0x06], vec![("s1", s(-1.0)), ("s2", s(1.0))], vec![("r0", n(1))]),
+
+            ("fcvt.s.d s0, d1", vec![0x20, 0x04], vec![("d1", d(0.1))], vec![("s0", s(0.1))]),
+            ("fcvt.s.d s0, d1", vec![0x20, 0x04], vec![("d1", d(1e300))], vec![("s0", s(f32::INFINITY))]),
+            ("fcvt.d.s d0, s1", vec![0x21, 0x04], vec![("s1", s(0.1))], vec![("d0", d(0.1f32 as f64))]),
+            ("fcvt.d.r d0, r1", vec![0x22, 0x04], vec![("r1", n(0xfffffffb))], vec![("d0", d(-5.0))]),
+            ("fcvt.d.q d0, q1", vec![0x23, 0x04], vec![("q1", n(u64::MAX))], vec![("d0", d(-1.0))]),
+            ("fcvt.d.q d0, q1", vec![0x23, 0x04], vec![("q1", n((1 << 53) + 1))], vec![("d0", d(2f64.powi(53)))]),
+            ("fcvt.s.q s0, q1", vec![0x24, 0x04], vec![("q1", n((1 << 60) + (1 << 36) + 1))], vec![("s0", s(2f32.powi(60) + 2f32.powi(37)))]),
+            ("fcvt.d.o d0, o1", vec![0x25, 0x04], vec![("o1", n(1) << 100)], vec![("d0", d(2f64.powi(100)))]),
+            ("fcvt.d.o d0, o1", vec![0x25, 0x04], vec![("o1", BigInt::ones(16))], vec![("d0", d(-1.0))]),
+            ("fcvt.r.d r0, d1", vec![0x26, 0x04], vec![("d1", d(-2.7))], vec![("r0", n(0xfffffffe))]),
+            ("fcvt.r.d r0, d1", vec![0x26, 0x04], vec![("r0", n(5)), ("d1", d(nan))], vec![("r0", n(0))]),
+            ("fcvt.q.d q0, d1", vec![0x27, 0x04], vec![("d1", d(1e30))], vec![("q0", n(i64::MAX as u64))]),
+            ("fcvt.o.d o0, d1", vec![0x28, 0x04], vec![("d1", d(-2f64.powi(100)))], vec![("o0", -(n(1) << 100))]),
+            ("fcvt.r.s r0, s1", vec![0x29, 0x04], vec![("s1", s(3.9))], vec![("r0", n(3))]),
+        ]);
+
+        let three = BigInt::from_u64(0, 3);
+        let err = evaluate(&sleigh, OpCode::FloatAdd, 3, &[three.clone(), three]).unwrap_err();
+        assert_eq!(err.to_string(), "no 3 byte float format");
     }
 
     /// A little endian 32-bit register, the context example is little endian

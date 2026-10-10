@@ -1,0 +1,68 @@
+# Floating point, little endian: single (s), double (d) precision registers
+# and 32 (r), 64 (q) and 128-bit (o) integer registers for conversions.
+#
+#   [op] [a b c]    a=(4,5) b=(2,3) c=(0,1) pick a register
+
+define endian=little;
+define alignment=1;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x000 size=4 [ s0 s1 s2 s3 ];
+define register offset=0x020 size=8 [ d0 d1 d2 d3 ];
+define register offset=0x040 size=4 [ r0 r1 r2 r3 ];
+define register offset=0x060 size=8 [ q0 q1 q2 q3 ];
+define register offset=0x080 size=16 [ o0 o1 o2 o3 ];
+
+define token opbyte(8)
+    op=(0, 7)
+;
+
+define token operands(8)
+    sa=(4, 5) sb=(2, 3) sc=(0, 1)
+    da=(4, 5) db=(2, 3) dc=(0, 1)
+    ra=(4, 5) rb=(2, 3)
+    qa=(4, 5) qb=(2, 3)
+    oa=(4, 5) ob=(2, 3)
+;
+
+attach variables [ sa sb sc ] [ s0 s1 s2 s3 ];
+attach variables [ da db dc ] [ d0 d1 d2 d3 ];
+attach variables [ ra rb ] [ r0 r1 r2 r3 ];
+attach variables [ qa qb ] [ q0 q1 q2 q3 ];
+attach variables [ oa ob ] [ o0 o1 o2 o3 ];
+
+:fadd.d da, db, dc is op=0x01; da & db & dc { da = db f+ dc; }
+:fsub.d da, db, dc is op=0x02; da & db & dc { da = db f- dc; }
+:fmul.d da, db, dc is op=0x03; da & db & dc { da = db f* dc; }
+:fdiv.d da, db, dc is op=0x04; da & db & dc { da = db f/ dc; }
+:fneg.d da, db is op=0x05; da & db { da = f- db; }
+:fabs.d da, db is op=0x06; da & db { da = abs(db); }
+:fsqrt.d da, db is op=0x07; da & db { da = sqrt(db); }
+:fceil.d da, db is op=0x08; da & db { da = ceil(db); }
+:ffloor.d da, db is op=0x09; da & db { da = floor(db); }
+:fround.d da, db is op=0x0a; da & db { da = round(db); }
+:feq.d ra, db, dc is op=0x0b; ra & db & dc { ra = zext(db f== dc); }
+:fne.d ra, db, dc is op=0x0c; ra & db & dc { ra = zext(db f!= dc); }
+:flt.d ra, db, dc is op=0x0d; ra & db & dc { ra = zext(db f< dc); }
+:fle.d ra, db, dc is op=0x0e; ra & db & dc { ra = zext(db f<= dc); }
+:fnan.d ra, db is op=0x0f; ra & db { ra = zext(nan(db)); }
+
+:fadd.s sa, sb, sc is op=0x10; sa & sb & sc { sa = sb f+ sc; }
+:fdiv.s sa, sb, sc is op=0x11; sa & sb & sc { sa = sb f/ sc; }
+:fsqrt.s sa, sb is op=0x12; sa & sb { sa = sqrt(sb); }
+:fneg.s sa, sb is op=0x13; sa & sb { sa = f- sb; }
+:fround.s sa, sb is op=0x14; sa & sb { sa = round(sb); }
+:flt.s ra, sb, sc is op=0x15; ra & sb & sc { ra = zext(sb f< sc); }
+
+:fcvt.s.d sa, db is op=0x20; sa & db { sa = float2float(db); }
+:fcvt.d.s da, sb is op=0x21; da & sb { da = float2float(sb); }
+:fcvt.d.r da, rb is op=0x22; da & rb { da = int2float(rb); }
+:fcvt.d.q da, qb is op=0x23; da & qb { da = int2float(qb); }
+:fcvt.s.q sa, qb is op=0x24; sa & qb { sa = int2float(qb); }
+:fcvt.d.o da, ob is op=0x25; da & ob { da = int2float(ob); }
+:fcvt.r.d ra, db is op=0x26; ra & db { ra = trunc(db); }
+:fcvt.q.d qa, db is op=0x27; qa & db { qa = trunc(db); }
+:fcvt.o.d oa, db is op=0x28; oa & db { oa = trunc(db); }
+:fcvt.r.s ra, sb is op=0x29; ra & sb { ra = trunc(sb); }
