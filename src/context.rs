@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::Range;
 
 use sleigh_rs::pattern::BitConstraint;
@@ -18,6 +19,17 @@ impl Context {
         Self {
             bits: vec![false; sleigh.context_memory().memory_bits as usize],
         }
+    }
+
+    /// Every context variable zero except the named `values`
+    pub fn from_values(sleigh: &Sleigh, values: &[(&str, i64)]) -> anyhow::Result<Self> {
+        let mut context = Self::new(sleigh);
+        for (name, value) in values {
+            let id = Self::id(sleigh, name)
+                .ok_or_else(|| anyhow::anyhow!("no context variable {:?}", name))?;
+            context.set(sleigh, id, *value);
+        }
+        Ok(context)
     }
 
     /// The context variable called `name`
@@ -76,6 +88,48 @@ pub struct ContextCommit {
     pub address: u64,
     pub context: ContextId,
     pub value: i64,
+}
+
+/// The context as it flows from instruction to instruction, and the values `globalset`s
+/// committed to addresses
+#[derive(Debug, Clone)]
+pub struct ContextFlow {
+    /// The context the next instruction starts from, before the commits to its address.
+    /// Unlike Ghidra's context, which is kept by address, it follows the instructions in the
+    /// order they are visited.
+    pub next: Context,
+    commits: HashMap<u64, HashMap<ContextId, i64>>,
+}
+
+impl ContextFlow {
+    pub fn new(context: Context) -> Self {
+        Self {
+            next: context,
+            commits: HashMap::new(),
+        }
+    }
+
+    /// The context to decode the instruction at `address` with
+    pub fn at(&self, sleigh: &Sleigh, address: u64) -> Context {
+        let mut context = self.next.clone();
+        for (&id, &value) in self.commits.get(&address).into_iter().flatten() {
+            context.set(sleigh, id, value);
+        }
+        context
+    }
+
+    /// Move on from an instruction decoded with `context` that made `commits`. Its own
+    /// context changes do not flow on, only what it commits.
+    pub fn advance(&mut self, sleigh: &Sleigh, mut context: Context, commits: &[ContextCommit]) {
+        for commit in commits {
+            self.commits
+                .entry(commit.address)
+                .or_default()
+                .insert(commit.context, commit.value);
+        }
+        context.clear_noflow(sleigh);
+        self.next = context;
+    }
 }
 
 #[cfg(test)]

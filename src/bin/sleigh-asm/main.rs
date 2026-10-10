@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 use sleigher::assembler::{InstructionAssembler, Labels};
+use sleigher::context::Context;
 
 fn parse_int(s: &str) -> std::result::Result<u64, std::num::ParseIntError> {
     if let Some(s) = s.strip_prefix("0x") {
@@ -73,7 +74,12 @@ pub fn main() -> Result<()> {
         bail!("Give an instruction or --file");
     };
     let labels = Labels::new();
-    let constraints = assembler.assemble_instruction_at(instruction, args.base, &labels)?;
+    let constraints = assembler.assemble_instruction_at(
+        instruction,
+        args.base,
+        &Context::new(&assembler),
+        &labels,
+    )?;
 
     println!("tokens: {:?}", constraints.tokens);
     println!("fields: {:#?}", constraints.fields.values());

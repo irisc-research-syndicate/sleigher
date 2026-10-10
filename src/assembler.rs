@@ -10,15 +10,15 @@ use sleigh_rs::disassembly::{
     Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId, WriteScope,
 };
 use sleigh_rs::display::DisplayElement;
-use sleigh_rs::meaning::AttachVarnode;
+use sleigh_rs::meaning::{AttachVarnode, Meaning};
 use sleigh_rs::pattern::{CmpOp, Verification};
 use sleigh_rs::table::{Constructor, Table};
-use sleigh_rs::{token::TokenFieldAttach, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
+use sleigh_rs::{ContextId, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
 
 use anyhow::{anyhow, bail};
 
-use crate::context::Context;
+use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
 
 /// Labels a program defines: resolved to an address, or `None` while their address is unknown
@@ -165,6 +165,22 @@ pub type TokenKey = (usize, usize, TokenId);
 
 static NEXT_INSTANCE: AtomicUsize = AtomicUsize::new(0);
 
+/// `l op r`, comparing as the disassembler does: signed values sign extended
+fn compare<'asm>(op: CmpOp, signed: bool, l: &BV<'asm>, r: &BV<'asm>) -> Bool<'asm> {
+    match (op, signed) {
+        (CmpOp::Eq, _) => l._eq(r),
+        (CmpOp::Ne, _) => l._eq(r).not(),
+        (CmpOp::Lt, false) => l.bvult(r),
+        (CmpOp::Gt, false) => l.bvugt(r),
+        (CmpOp::Le, false) => l.bvule(r),
+        (CmpOp::Ge, false) => l.bvuge(r),
+        (CmpOp::Lt, true) => l.bvslt(r),
+        (CmpOp::Gt, true) => l.bvsgt(r),
+        (CmpOp::Le, true) => l.bvsle(r),
+        (CmpOp::Ge, true) => l.bvsge(r),
+    }
+}
+
 /// All constraints are quantifier free bit-vector formulas
 fn new_solver(ctx: &z3::Context) -> z3::Solver<'_> {
     z3::Solver::new_for_logic(ctx, "QF_BV").unwrap()
@@ -180,6 +196,11 @@ pub struct Constraints<'asm> {
 
     pub eqs: HashSet<Bool<'asm>>,
 
+    /// The value of each context variable at this point of the parse, by `ContextId`, 64 bits
+    /// wide. Context writes are applied before the constructor's display, so its subtables
+    /// see all of them, as in Ghidra; subtables pass theirs on in display order.
+    pub context: Vec<BV<'asm>>,
+
     pub inst_start: u64,
     /// Address after the instruction, tied to its length once the whole instruction is parsed
     pub inst_next: BV<'asm>,
@@ -191,13 +212,22 @@ pub struct Constraints<'asm> {
 }
 
 impl<'asm> Constraints<'asm> {
-    pub fn new(asm: &'asm InstructionAssembler, inst_start: u64, labels: &'asm Labels) -> Self {
+    pub fn new(
+        asm: &'asm InstructionAssembler,
+        inst_start: u64,
+        context: &Context,
+        labels: &'asm Labels,
+    ) -> Self {
+        let context = (0..asm.contexts().len())
+            .map(|id| BV::from_i64(&asm.ctx, context.get(asm, ContextId(id)), 64))
+            .collect();
         Self {
             asm,
             instances: BTreeMap::new(),
             tokens: BTreeMap::new(),
             fields: HashMap::new(),
             eqs: HashSet::new(),
+            context,
             inst_start,
             inst_next: BV::fresh_const(&asm.ctx, "inst_next", 64),
             checker: Rc::new(new_solver(&asm.ctx)),
@@ -356,11 +386,26 @@ impl<'asm> Constraints<'asm> {
         self.eqs.insert(eq);
     }
 
+    /// Store `value` in a context variable, which keeps as many bits as the variable has
+    pub fn set_context(&mut self, id: ContextId, value: BV<'asm>) {
+        let context = self.asm.context(id);
+        let bits = context.bitrange.bits.len().get() as u32;
+        let value = value.extract(bits - 1, 0);
+        let value = if context.is_signed() {
+            value.sign_ext(64 - bits)
+        } else {
+            value.zero_ext(64 - bits)
+        };
+        self.context[id.0] = value;
+    }
+
+    /// Take over the constraints of a subtable parsed from a clone of `self`
     pub fn merge(&mut self, other: Constraints<'asm>) {
         self.instances.extend(other.instances);
         self.tokens.extend(other.tokens);
         self.fields.extend(other.fields);
         self.eqs.extend(other.eqs);
+        self.context = other.context;
     }
 
     fn root(&self) -> Option<usize> {
@@ -626,11 +671,13 @@ impl<'asm> Variables<'asm> {
     pub fn assert_all(&mut self, assertions: &[Assertation]) {
         for assertion in assertions {
             match assertion {
-                Assertation::GlobalSet(_global_set) => todo!(),
+                // Commits do not constrain the encoding, program assembly reads them back
+                // from the disassembled bytes
+                Assertation::GlobalSet(_) => {}
                 Assertation::Assignment(assignment) => {
                     let value = self.build_expr_bv(&assignment.right, 64);
                     match assignment.left {
-                        WriteScope::Context(_context_id) => todo!(),
+                        WriteScope::Context(context_id) => self.set_context(context_id, value),
                         WriteScope::Local(variable_id) => {
                             let var = self.variable(variable_id);
                             self.eq(var._eq(&value))
@@ -649,7 +696,7 @@ impl<'asm> Variables<'asm> {
                         Number::Positive(x) => self.build_u64_const(*x, sz),
                         Number::Negative(x) => self.build_i64_const(-(*x as i64), sz),
                     },
-                    ReadScope::Context(_context_id) => todo!(),
+                    ReadScope::Context(context_id) => self.context[context_id.0].clone(),
                     ReadScope::TokenField(token_field_id) => {
                         self.token_field(*token_field_id, Some(sz))
                     }
@@ -696,6 +743,8 @@ impl<'asm> Variables<'asm> {
 pub struct InstructionAssembler {
     sleigh: Sleigh,
     ctx: z3::Context,
+    /// Whether any constructor has a `globalset`, so program assembly has to follow commits
+    has_globalset: bool,
 }
 
 impl Deref for InstructionAssembler {
@@ -708,28 +757,48 @@ impl Deref for InstructionAssembler {
 
 impl InstructionAssembler {
     pub fn new(sleigh: Sleigh) -> Self {
+        let has_globalset = sleigh
+            .tables()
+            .iter()
+            .flat_map(|table| table.constructors().iter())
+            .flat_map(|constructor| {
+                let pattern = &constructor.pattern;
+                pattern
+                    .blocks()
+                    .iter()
+                    .flat_map(|block| {
+                        block
+                            .pre_disassembler()
+                            .iter()
+                            .chain(block.post_disassembler())
+                    })
+                    .chain(pattern.disassembly_pos_match())
+            })
+            .any(|assertion| matches!(assertion, Assertation::GlobalSet(_)));
         Self {
             sleigh,
             ctx: z3::Context::new(&z3::Config::new()),
+            has_globalset,
         }
     }
 
-    /// Assemble one instruction at address 0, see `assemble_instruction_at`
+    /// Assemble one instruction at address 0 in the zero context, see `assemble_instruction_at`
     pub fn assemble_instruction<'asm>(&'asm self, s: &str) -> Result<Constraints<'asm>, AsmError> {
-        self.assemble_instruction_at(s, 0, NO_LABELS)
+        self.assemble_instruction_at(s, 0, &Context::new(self), NO_LABELS)
     }
 
-    /// Assemble one instruction at `inst_start` that must consume all of `s` (up to trailing
-    /// whitespace) and have exactly one encoding. Parses that can produce the same bytes count
-    /// as one encoding. Operands may name any of `labels`.
+    /// Assemble one instruction at `inst_start`, decoded in `context`, that must consume all of
+    /// `s` (up to trailing whitespace) and have exactly one encoding. Parses that can produce the
+    /// same bytes count as one encoding. Operands may name any of `labels`.
     pub fn assemble_instruction_at<'asm>(
         &'asm self,
         s: &str,
         inst_start: u64,
+        context: &Context,
         labels: &'asm Labels,
     ) -> Result<Constraints<'asm>, AsmError> {
         let mut encodings: Vec<Constraints<'asm>> = vec![];
-        for (rest, candidate) in self.assemble_candidates_at(s, inst_start, labels) {
+        for (rest, candidate) in self.assemble_candidates_at(s, inst_start, context, labels) {
             if !rest.trim_end().is_empty() {
                 continue;
             }
@@ -746,7 +815,7 @@ impl InstructionAssembler {
             _ => Err(AsmError::Ambiguous(
                 encodings
                     .iter()
-                    .map(|encoding| self.candidate(encoding))
+                    .map(|encoding| self.candidate(encoding, context))
                     .collect(),
             )),
         }
@@ -759,6 +828,19 @@ impl InstructionAssembler {
     /// resolve the labels, require exactly one encoding per instruction and repeat until the
     /// label addresses stop changing.
     pub fn assemble_program(&self, source: &str, base: u64) -> anyhow::Result<Program> {
+        self.assemble_program_in_context(source, base, &Context::new(self))
+    }
+
+    /// Like `assemble_program`, starting from `context`. The context flows from line to line,
+    /// with the values `globalset`s commit, as the emulator would execute the lines in order:
+    /// commits to earlier lines are not seen. While labels are unresolved, commits to a label
+    /// may go astray.
+    pub fn assemble_program_in_context(
+        &self,
+        source: &str,
+        base: u64,
+        context: &Context,
+    ) -> anyhow::Result<Program> {
         let source_lines = source
             .lines()
             .enumerate()
@@ -786,6 +868,7 @@ impl InstructionAssembler {
             let mut address = base;
             let mut addresses = Labels::new();
             let mut lines = vec![];
+            let mut flow = ContextFlow::new(context.clone());
             for line in source_lines.iter() {
                 for name in line.labels.iter() {
                     addresses.insert(name.to_string(), Some(address));
@@ -796,24 +879,39 @@ impl InstructionAssembler {
                 let error = |err: &dyn std::fmt::Display| {
                     anyhow!("line {}: {:?}: {}", line.line_no, text, err)
                 };
+                let context = flow.at(self, address);
                 let bytes = if resolved {
                     let constraints = self
-                        .assemble_instruction_at(text, address, &labels)
+                        .assemble_instruction_at(text, address, &context, &labels)
                         .map_err(|err| error(&err))?;
                     constraints
                         .to_bytes()
                         .ok_or_else(|| error(&"constraints produced no bytes"))?
                 } else {
-                    // Labels are unknown, so only take the length of the shortest candidate
-                    let len = self
-                        .assemble_candidates_at(text, address, &labels)
+                    // Labels are unknown, so only take the shortest candidate
+                    let shortest = self
+                        .assemble_candidates_at(text, address, &context, &labels)
                         .into_iter()
                         .filter(|(rest, _)| rest.trim_end().is_empty())
-                        .map(|(_, candidate)| candidate.len_bytes())
-                        .min()
+                        .map(|(_, candidate)| candidate)
+                        .min_by_key(|candidate| candidate.len_bytes())
                         .ok_or_else(|| error(&AsmError::NoMatch))?;
-                    vec![0; len as usize]
+                    match self.has_globalset {
+                        true => shortest
+                            .to_bytes()
+                            .ok_or_else(|| error(&"constraints produced no bytes"))?,
+                        false => vec![0; shortest.len_bytes() as usize],
+                    }
                 };
+                // What the instruction commits is read back from its encoding
+                let commits = match self.has_globalset {
+                    true => Disassembler::new(self)
+                        .disassemble(address, &context, &bytes)
+                        .map(|instruction| instruction.commits)
+                        .map_err(|err| error(&err))?,
+                    false => vec![],
+                };
+                flow.advance(self, context, &commits);
                 lines.push(Line {
                     line_no: line.line_no,
                     address,
@@ -839,30 +937,31 @@ impl InstructionAssembler {
         bail!("label addresses did not settle after {} passes", MAX_PASSES)
     }
 
-    fn candidate(&self, constraints: &Constraints) -> Candidate {
+    fn candidate(&self, constraints: &Constraints, context: &Context) -> Candidate {
         let bytes = constraints.to_bytes().unwrap_or_default();
         let disassembly = Disassembler::new(&self.sleigh)
-            .disassemble(constraints.inst_start, &Context::new(&self.sleigh), &bytes)
+            .disassemble(constraints.inst_start, context, &bytes)
             .map(|instruction| instruction.to_string())
             .unwrap_or_else(|err| format!("<{}>", err));
         Candidate { bytes, disassembly }
     }
 
-    /// Every way the instruction table matches a prefix of `s` at address 0
+    /// Every way the instruction table matches a prefix of `s` at address 0 in the zero context
     pub fn assemble_candidates<'a, 'asm>(&'asm self, s: &'a str) -> Parses<'a, Constraints<'asm>> {
-        self.assemble_candidates_at(s, 0, NO_LABELS)
+        self.assemble_candidates_at(s, 0, &Context::new(self), NO_LABELS)
     }
 
-    /// Every way the instruction table matches a prefix of `s` at `inst_start`. Candidates whose
-    /// constraints fail once `inst_next` is tied to their length (e.g. a branch out of range)
-    /// are dropped.
+    /// Every way the instruction table matches a prefix of `s` at `inst_start` in `context`.
+    /// Candidates whose constraints fail once `inst_next` is tied to their length (e.g. a branch
+    /// out of range) are dropped.
     pub fn assemble_candidates_at<'a, 'asm>(
         &'asm self,
         s: &'a str,
         inst_start: u64,
+        context: &Context,
         labels: &'asm Labels,
     ) -> Parses<'a, Constraints<'asm>> {
-        let constraints = Constraints::new(self, inst_start, labels);
+        let constraints = Constraints::new(self, inst_start, context, labels);
         self.assemble_table(self.table(self.instruction_table()), constraints, s, None)
             .into_iter()
             .filter_map(|(rest, mut candidate)| {
@@ -907,15 +1006,21 @@ impl InstructionAssembler {
         };
 
         let mut variables = Variables::new(constraints, constructor, parent);
+        // The constructor's own context changes come after its pattern is matched
+        let context = variables.context.clone();
 
         for block in constructor.pattern.blocks() {
             for verification in block.verifications() {
                 match verification {
                     Verification::ContextCheck {
-                        context: _,
-                        op: _,
-                        value: _,
-                    } => todo!(),
+                        context: context_id,
+                        op,
+                        value,
+                    } => {
+                        let value_bv = variables.build_expr_bv(value.expr(), 64);
+                        let signed = self.context(*context_id).is_signed();
+                        variables.eq(compare(*op, signed, &context[context_id.0], &value_bv));
+                    }
                     Verification::TableBuild {
                         produced_table: _,
                         verification: _,
@@ -925,15 +1030,8 @@ impl InstructionAssembler {
                     Verification::TokenFieldCheck { field, op, value } => {
                         let field_bv = variables.token_field(*field, None);
                         let value_bv = variables.build_expr_bv(value.expr(), field_bv.get_size());
-                        let assertion = match op {
-                            CmpOp::Eq => field_bv._eq(&value_bv),
-                            CmpOp::Ne => field_bv._eq(&value_bv).not(),
-                            CmpOp::Lt => field_bv.bvult(&value_bv),
-                            CmpOp::Gt => field_bv.bvugt(&value_bv),
-                            CmpOp::Le => field_bv.bvule(&value_bv),
-                            CmpOp::Ge => field_bv.bvuge(&value_bv),
-                        };
-                        variables.eq(assertion);
+                        let signed = self.token_field(*field).raw_value_is_signed();
+                        variables.eq(compare(*op, signed, &field_bv, &value_bv));
                     }
                     Verification::SubPattern {
                         location: _,
@@ -983,44 +1081,25 @@ impl InstructionAssembler {
     ) -> Parses<'a, Variables<'asm>> {
         match elem {
             DisplayElement::Varnode(_varnode_id) => todo!(),
-            DisplayElement::Context(_context_id) => todo!(),
+            DisplayElement::Context(context_id) => {
+                let context = self.context(*context_id);
+                log::trace!("CONTEXT: {:?} {:?}", context.name(), s);
+                let value = variables.context[context_id.0].clone();
+                self.assemble_value(context.meaning(), value, variables, s)
+            }
             DisplayElement::TokenField(token_field_id) => {
                 let token_field = self.token_field(*token_field_id);
                 log::trace!("TOKEN_FIELD: {:?} {:?}", token_field.name(), s);
                 let token_field_bv = variables.token_field(*token_field_id, None);
                 let size = token_field_bv.get_size();
-                match token_field.attach {
-                    TokenFieldAttach::NoAttach(value_fmt) => {
-                        let Some((s, value)) = variables.parse_operand(value_fmt.signed, s) else {
-                            return vec![];
-                        };
-                        // The field's value, extended to 64 bits, has to be the operand. This
-                        // rejects values that do not fit the field.
-                        let field_value = if size == 64 {
-                            token_field_bv
-                        } else if token_field.raw_value_is_signed() {
-                            token_field_bv.sign_ext(64 - size)
-                        } else {
-                            token_field_bv.zero_ext(64 - size)
-                        };
-                        variables.eq(field_value._eq(&value));
-                        vec![(s, variables)]
-                    }
-                    TokenFieldAttach::Varnode(attach_varnode_id) => {
-                        let attach_varnode = self.attach_varnode(attach_varnode_id);
-                        self.parse_attach_varnode(attach_varnode, s)
-                            .into_iter()
-                            .map(|(s, value)| {
-                                let mut variables = variables.clone();
-                                let const_bv = variables.build_u64_const(value as u64, size);
-                                variables.eq(token_field_bv._eq(&const_bv));
-                                (s, variables)
-                            })
-                            .collect()
-                    }
-                    TokenFieldAttach::Literal(_attach_literal_id) => todo!(),
-                    TokenFieldAttach::Number(_print_base, _attach_number_id) => todo!(),
-                }
+                let value = if size == 64 {
+                    token_field_bv
+                } else if token_field.raw_value_is_signed() {
+                    token_field_bv.sign_ext(64 - size)
+                } else {
+                    token_field_bv.zero_ext(64 - size)
+                };
+                self.assemble_value(token_field.meaning(), value, variables, s)
             }
             DisplayElement::InstStart(_) | DisplayElement::InstNext(_) => {
                 let Some((s, value)) = variables.parse_operand(false, s) else {
@@ -1072,6 +1151,40 @@ impl InstructionAssembler {
                     .into_iter()
                     .collect()
             }
+        }
+    }
+
+    /// Parse an operand that displays the 64-bit `value` with `meaning`, a token field or a
+    /// context variable
+    fn assemble_value<'a, 'asm>(
+        &'asm self,
+        meaning: Meaning,
+        value: BV<'asm>,
+        mut variables: Variables<'asm>,
+        s: &'a str,
+    ) -> Parses<'a, Variables<'asm>> {
+        match meaning {
+            Meaning::NoAttach(value_fmt) => {
+                let Some((s, operand)) = variables.parse_operand(value_fmt.signed, s) else {
+                    return vec![];
+                };
+                // This rejects operands that do not fit the value
+                variables.eq(value._eq(&operand));
+                vec![(s, variables)]
+            }
+            Meaning::Varnode(attach_varnode_id) => {
+                let attach_varnode = self.attach_varnode(attach_varnode_id);
+                self.parse_attach_varnode(attach_varnode, s)
+                    .into_iter()
+                    .map(|(s, index)| {
+                        let mut variables = variables.clone();
+                        let index = variables.build_i64_const(index, 64);
+                        variables.eq(value._eq(&index));
+                        (s, variables)
+                    })
+                    .collect()
+            }
+            Meaning::Literal(_) | Meaning::Number(..) => todo!(),
         }
     }
 
@@ -1168,7 +1281,8 @@ mod test {
         address: u64,
         labels: &Labels,
     ) -> Result<Vec<u8>, AsmError> {
-        let constraints = assembler.assemble_instruction_at(input, address, labels)?;
+        let constraints =
+            assembler.assemble_instruction_at(input, address, &Context::new(assembler), labels)?;
         Ok(constraints
             .to_bytes()
             .expect("Constraints failed to produce bytes"))
@@ -1809,5 +1923,91 @@ mod test {
     fn belt_roundtrip() {
         let asm = load("examples/belt.slaspec");
         assert_roundtrips(&asm, 8, 400);
+    }
+
+    /// (input, context values, expected encoding)
+    type ContextCase<'a> = (&'a str, &'a [(&'a str, i64)], Result<Vec<u8>, AsmError>);
+
+    /// Assemble at 0 starting from the context `values`
+    fn assemble_in(
+        assembler: &InstructionAssembler,
+        input: &str,
+        values: &[(&str, i64)],
+    ) -> Result<Vec<u8>, AsmError> {
+        let context = Context::from_values(assembler, values).unwrap();
+        let constraints = assembler.assemble_instruction_at(input, 0, &context, NO_LABELS)?;
+        Ok(constraints
+            .to_bytes()
+            .expect("Constraints failed to produce bytes"))
+    }
+
+    #[test]
+    fn context_assemble() {
+        let asm = load("examples/context.slaspec");
+        let none: &[(&str, i64)] = &[];
+        #[rustfmt::skip]
+        let tests: &[ContextCase] = &[
+            ("add r1, r2, 0x5", none, Ok(vec![0x05, 0x00, 0x12, 0x01])),
+            ("sub r1, r2, 0x5", none, Err(AsmError::NoMatch)),
+            ("sub r1, r2, 0x5", &[("mode", 1)], Ok(vec![0x05, 0x00, 0x12, 0x01])),
+            ("add r1, r2, 0x5", &[("mode", 1)], Err(AsmError::NoMatch)),
+            ("mode1", none, Ok(vec![0x00, 0x00, 0x00, 0x02])),
+            ("pfx 0x2", none, Ok(vec![0x02, 0x00, 0x00, 0x04])),
+            // A context operand has to be the context's value
+            ("shl r1, r2, 0x2", &[("shift", 2)], Ok(vec![0x00, 0x00, 0x12, 0x05])),
+            ("shl r1, r2, 0x2", none, Err(AsmError::NoMatch)),
+            ("lo", none, Ok(vec![0x00, 0x00, 0x00, 0x07])),
+            ("hi", none, Err(AsmError::NoMatch)),
+            ("hi", &[("shift", 3)], Ok(vec![0x00, 0x00, 0x00, 0x07])),
+            // mov's assignment picks the SRC its operand assembles as, whatever came in
+            ("mov r1, r2", none, Ok(vec![0x00, 0x00, 0x12, 0x06])),
+            ("mov r1, #0x7", none, Ok(vec![0x07, 0x00, 0x18, 0x06])),
+            ("mov r1, r2", &[("width", 1)], Ok(vec![0x00, 0x00, 0x12, 0x06])),
+            ("inc r6", none, Ok(vec![0x00, 0x00, 0x00, 0x08])),
+            ("inc r7", &[("bank", 1)], Ok(vec![0x00, 0x00, 0x00, 0x08])),
+            ("inc r6", &[("bank", 1)], Err(AsmError::NoMatch)),
+        ];
+        let mut failures = vec![];
+        for (input, values, expected) in tests {
+            let result = assemble_in(&asm, input, values);
+            if result != *expected {
+                failures.push(format!(
+                    "{:?} in {:?}: expected {:?}, got {:?}",
+                    input, values, expected, result
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Program assembly follows the context from line to line like the emulator does
+    #[test]
+    fn context_program() {
+        let asm = load("examples/context.slaspec");
+        let source = "
+            add r1, r1, 0x5
+            mode1
+            sub r1, r1, 0x2   // mode 1 from here on
+            pfx 0x2
+            shl r1, r1, 0x2   // shift only here
+            shl r1, r1, 0x0
+        ";
+        let program = asm.assemble_program(source, 0x1000).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(program.bytes, vec![
+            0x05, 0x00, 0x11, 0x01,
+            0x00, 0x00, 0x00, 0x02,
+            0x02, 0x00, 0x11, 0x01,
+            0x02, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x11, 0x05,
+            0x00, 0x00, 0x11, 0x05,
+        ]);
+        assert!(asm.assemble_program("sub r1, r1, 0x2", 0x1000).is_err());
+
+        let mode1 = Context::from_values(&asm, &[("mode", 1)]).unwrap();
+        let program = asm
+            .assemble_program_in_context("sub r1, r1, 0x2", 0x1000, &mode1)
+            .unwrap();
+        assert_eq!(program.bytes, vec![0x02, 0x00, 0x11, 0x01]);
     }
 }

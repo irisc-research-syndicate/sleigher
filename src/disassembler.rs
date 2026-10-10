@@ -616,14 +616,6 @@ mod test {
             .unwrap_or_else(|_| panic!("Could not load slaspec: {:?}", slaspec_path.as_ref()))
     }
 
-    fn context_with(sleigh: &Sleigh, values: &[(&str, i64)]) -> Context {
-        let mut context = Context::new(sleigh);
-        for (name, value) in values {
-            context.set(sleigh, Context::id(sleigh, name).unwrap(), *value);
-        }
-        context
-    }
-
     fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>)]) {
         run_tests_in_context(slaspec_path, &[], tests)
     }
@@ -636,7 +628,7 @@ mod test {
     ) {
         let slaspec = load(slaspec_path);
         let disasm = Disassembler::new(&slaspec);
-        let context = context_with(&slaspec, values);
+        let context = Context::from_values(&slaspec, values).unwrap();
         for (expected_output, input_code) in tests.iter() {
             log::info!(
                 "Disassembling {:02x?} expecting {:?}",
