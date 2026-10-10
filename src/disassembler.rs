@@ -2,14 +2,16 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 
-use sleigh_rs::disassembly::{Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId};
+use sleigh_rs::disassembly::{
+    AddrScope, Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId, WriteScope,
+};
 use sleigh_rs::display::DisplayElement;
-use sleigh_rs::pattern::{BitConstraint, Verification};
+use sleigh_rs::meaning::Meaning;
+use sleigh_rs::pattern::{BitConstraint, CmpOp, Verification};
 use sleigh_rs::table::{Constructor, Table};
-use sleigh_rs::token::TokenFieldAttach;
-use sleigh_rs::{Endian, Sleigh, TableId, TokenFieldId};
+use sleigh_rs::{ContextId, Endian, Number, PrintBase, Sleigh, TableId, TokenFieldId};
 
-use crate::context::Context;
+use crate::context::{Context, ContextCommit};
 use crate::pcode::{LiftError, PcodeOp};
 use crate::value::sign_extend;
 
@@ -37,30 +39,39 @@ impl<'sleigh> Disassembler<'sleigh> {
         context: &Context,
         bytes: &[u8],
     ) -> Result<DisassembledInstruction<'sleigh>> {
+        let mut context = context.clone();
         let table = self.disassemble_table(
             inst_start,
             self.table(self.instruction_table()),
-            context,
+            &mut context,
             bytes,
         )?;
         let pcode = crate::pcode::lift(&table);
         if let Err(err) = &pcode {
             log::debug!("Could not lift {}: {}", table, err);
         }
-        Ok(DisassembledInstruction { table, pcode })
+        let mut commits = vec![];
+        table.commits(&mut commits);
+        Ok(DisassembledInstruction {
+            table,
+            pcode,
+            commits,
+        })
     }
 
     pub fn disassemble_table(
         &'sleigh self,
         inst_start: u64,
         table: &'sleigh Table,
-        _context: &Context,
+        context: &mut Context,
         bytes: &[u8],
     ) -> Result<DisassembledTable<'sleigh>> {
-        let mut disassembled = DisassembledTable::disassemble(self, inst_start, table, bytes)?;
+        let mut disassembled =
+            DisassembledTable::disassemble(self, inst_start, table, context, bytes)?;
         // inst_next is the address of the next instruction, which is only known
         // once the whole instruction (including all subtables) has been matched.
-        disassembled.resolve(inst_start + disassembled.len as u64);
+        disassembled.resolve(inst_start + disassembled.len as u64, context);
+        disassembled.set_context(context);
         Ok(disassembled)
     }
 
@@ -109,6 +120,8 @@ pub struct DisassembledInstruction<'sleigh> {
     pub table: DisassembledTable<'sleigh>,
     /// The instruction's semantics, or why they could not be lifted
     pub pcode: Result<Vec<PcodeOp>, LiftError>,
+    /// Context the instruction sets for other addresses
+    pub commits: Vec<ContextCommit>,
 }
 
 impl<'sleigh> std::ops::Deref for DisassembledInstruction<'sleigh> {
@@ -135,9 +148,12 @@ pub struct DisassembledTable<'sleigh> {
     pub token_fields: HashMap<TokenFieldId, i64>,
     pub tables: HashMap<TableId, DisassembledTable<'sleigh>>,
     pub variables: HashMap<VariableId, i64>,
+    /// The context once the whole instruction is decoded
+    pub context: Context,
+    /// The `globalset`s of this constructor, the values are taken from the final context
+    pub globalsets: Vec<(u64, ContextId)>,
     pub len: usize,
     pub bytes: Vec<u8>,
-    pub block_offsets: Vec<usize>,
 }
 
 impl<'sleigh> std::ops::Deref for DisassembledTable<'sleigh> {
@@ -166,6 +182,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
         disassembler: &'sleigh Disassembler<'sleigh>,
         inst_start: u64,
         table: &'sleigh Table,
+        context: &mut Context,
         bytes: &[u8],
     ) -> Result<Self> {
         log::debug!("Disassembling {} table", table.name());
@@ -206,6 +223,14 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                 );
             }
 
+            if !context.matches(context_constraints) {
+                log::trace!(
+                    "{}: context bitconstraint failed to match, continuing to next matcher",
+                    table.name()
+                );
+                continue 'match_loop;
+            }
+
             for (byte_constraint, byte) in data_constraints.chunks(8).zip(bytes) {
                 for (bit, constraint) in byte_constraint.iter().enumerate() {
                     if let Some(expected_bit) = constraint.value() {
@@ -230,10 +255,14 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                 token_fields: HashMap::new(),
                 tables: HashMap::new(),
                 variables: HashMap::new(),
+                context: context.clone(),
+                globalsets: Vec::new(),
                 len: 0,
                 bytes: Vec::new(),
-                block_offsets: Vec::new(),
             };
+            // The constructor's context changes are seen by the subtables built after them,
+            // and are dropped if it does not match
+            let mut matched_context = context.clone();
 
             for block in constructor.pattern.blocks() {
                 let mut block_len = block.len().single_len().unwrap_or(block.len().min()) as usize;
@@ -244,7 +273,6 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     );
                     continue 'match_loop;
                 }
-                disasm_table.block_offsets.push(disasm_table.len);
 
                 for produced_token_field in block.token_fields() {
                     let token_field_value =
@@ -254,11 +282,21 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                         .insert(produced_token_field.field, token_field_value);
                 }
 
+                disasm_table.apply_assertions(
+                    block.pre_disassembler(),
+                    &mut matched_context,
+                    bytes,
+                );
+
                 for produced_table in block.tables() {
                     let subtable = disassembler.table(produced_table.table);
-                    if let Ok(subtable_value) =
-                        DisassembledTable::disassemble(disassembler, inst_start, subtable, bytes)
-                    {
+                    if let Ok(subtable_value) = DisassembledTable::disassemble(
+                        disassembler,
+                        inst_start,
+                        subtable,
+                        &mut matched_context,
+                        bytes,
+                    ) {
                         block_len = block_len.max(subtable_value.len);
                         disasm_table
                             .tables
@@ -276,26 +314,27 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                 for verification in block.verifications() {
                     match verification {
                         Verification::ContextCheck {
-                            context: _,
-                            op: _,
-                            value: _,
-                        } => todo!(),
+                            context: context_id,
+                            op,
+                            value,
+                        } => {
+                            let context_value = context.get(disassembler, *context_id);
+                            let check_value =
+                                disasm_table.evaluate_expr(value.expr(), context, bytes);
+                            if !compare(*op, context_value, check_value) {
+                                log::trace!("{}: failed verification {}={} {:?} {}, continuing to next matcher", table.name(), disassembler.context(*context_id).name(), context_value, op, check_value);
+                                continue 'match_loop;
+                            }
+                        }
                         Verification::TableBuild {
                             produced_table: _,
                             verification: _,
                         } => {}
                         Verification::TokenFieldCheck { field, op, value } => {
                             let field_value = disassembler.extract_token_field(*field, bytes);
-                            let check_value = disasm_table.evaluate_expr(value.expr(), bytes);
-                            let check_ok = match op {
-                                sleigh_rs::pattern::CmpOp::Eq => field_value == check_value,
-                                sleigh_rs::pattern::CmpOp::Ne => field_value != check_value,
-                                sleigh_rs::pattern::CmpOp::Lt => field_value < check_value,
-                                sleigh_rs::pattern::CmpOp::Gt => field_value > check_value,
-                                sleigh_rs::pattern::CmpOp::Le => field_value <= check_value,
-                                sleigh_rs::pattern::CmpOp::Ge => field_value >= check_value,
-                            };
-                            if !check_ok {
+                            let check_value =
+                                disasm_table.evaluate_expr(value.expr(), context, bytes);
+                            if !compare(*op, field_value, check_value) {
                                 log::trace!("{}: failed verification {}={} {:?} {}, continuing to next matcher", table.name(), disassembler.token_field(*field).name(), field_value, op, check_value);
                                 continue 'match_loop;
                             }
@@ -313,44 +352,91 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     );
                     continue 'match_loop;
                 }
+                disasm_table.apply_assertions(
+                    block.post_disassembler(),
+                    &mut matched_context,
+                    bytes,
+                );
                 disasm_table.bytes.extend_from_slice(&bytes[..block_len]);
                 disasm_table.len += block_len;
                 bytes = &bytes[block_len..];
             }
+            // A placeholder until `resolve` knows the length of the whole instruction
             disasm_table.inst_next = inst_start + disasm_table.len as u64;
+            *context = matched_context;
             return Ok(disasm_table);
         }
         bail!("{}: Failed to disassemble table", table.name());
     }
 
-    fn resolve(&mut self, inst_next: u64) {
+    /// Run the actions that need `inst_next`, once the whole instruction is matched. Unlike
+    /// Ghidra, subtables run theirs before the parent; only context written by both differs.
+    fn resolve(&mut self, inst_next: u64, context: &mut Context) {
         self.inst_next = inst_next;
         for subtable in self.tables.values_mut() {
-            subtable.resolve(inst_next);
+            subtable.resolve(inst_next, context);
         }
-
-        let constructor = self.constructor;
-        for (block, offset) in constructor
-            .pattern
-            .blocks()
-            .iter()
-            .zip(self.block_offsets.clone())
-        {
-            self.apply_assertions(block.pre_disassembler(), offset);
-            self.apply_assertions(block.post_disassembler(), offset);
-        }
-        self.apply_assertions(constructor.pattern.disassembly_pos_match(), 0);
+        let bytes = std::mem::take(&mut self.bytes);
+        self.apply_assertions(
+            self.constructor.pattern.disassembly_pos_match(),
+            context,
+            &bytes,
+        );
+        self.bytes = bytes;
     }
 
-    fn apply_assertions(&mut self, assertions: &[Assertation], offset: usize) {
+    fn set_context(&mut self, context: &Context) {
+        self.context = context.clone();
+        for subtable in self.tables.values_mut() {
+            subtable.set_context(context);
+        }
+    }
+
+    /// The `globalset`s of this table and its subtables
+    fn commits(&self, commits: &mut Vec<ContextCommit>) {
+        commits.extend(
+            self.globalsets
+                .iter()
+                .map(|&(address, context)| ContextCommit {
+                    address,
+                    context,
+                    value: self.context.get(self, context),
+                }),
+        );
+        for subtable in self.tables.values() {
+            subtable.commits(commits);
+        }
+    }
+
+    fn apply_assertions(
+        &mut self,
+        assertions: &[Assertation],
+        context: &mut Context,
+        bytes: &[u8],
+    ) {
         for assertion in assertions {
             match assertion {
-                Assertation::GlobalSet(_global_set) => todo!(),
+                Assertation::GlobalSet(global_set) => {
+                    let address = match global_set.address {
+                        AddrScope::Integer(address) => address,
+                        AddrScope::InstStart(_) => self.inst_start,
+                        AddrScope::InstNext(_) => self.inst_next,
+                        AddrScope::Local(variable_id) => self.variables[&variable_id] as u64,
+                        AddrScope::Table(_) => {
+                            log::warn!(
+                                "{}: globalset to a table address is not supported",
+                                self.table.name()
+                            );
+                            continue;
+                        }
+                    };
+                    self.globalsets.push((address, global_set.context));
+                }
                 Assertation::Assignment(assignment) => {
-                    let value = self.evaluate_expr(&assignment.right, &self.bytes[offset..]);
+                    let value = self.evaluate_expr(&assignment.right, context, bytes);
                     match assignment.left {
-                        sleigh_rs::disassembly::WriteScope::Context(_context_id) => todo!(),
-                        sleigh_rs::disassembly::WriteScope::Local(variable_id) => {
+                        WriteScope::Context(context_id) => context.set(self, context_id, value),
+                        WriteScope::Local(variable_id) => {
                             self.variables.insert(variable_id, value);
                         }
                     }
@@ -359,7 +445,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
         }
     }
 
-    pub fn evaluate_expr(&self, expr: &Expr, bytes: &[u8]) -> i64 {
+    pub fn evaluate_expr(&self, expr: &Expr, context: &Context, bytes: &[u8]) -> i64 {
         match expr {
             Expr::Value(expr_element) => match expr_element {
                 ExprElement::Value { value, location: _ } => match *value {
@@ -367,7 +453,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                         sleigh_rs::Number::Positive(x) => x as i64,
                         sleigh_rs::Number::Negative(x) => -(x as i64),
                     },
-                    ReadScope::Context(_context_id) => todo!(),
+                    ReadScope::Context(context_id) => context.get(self, context_id),
                     ReadScope::TokenField(token_field_id) => self
                         .token_fields
                         .get(&token_field_id)
@@ -380,7 +466,7 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     ReadScope::Local(variable_id) => *self.variables.get(&variable_id).unwrap(),
                 },
                 ExprElement::Op(_, op_unary, expr) => {
-                    let expr = self.evaluate_expr(expr, bytes);
+                    let expr = self.evaluate_expr(expr, context, bytes);
                     match op_unary {
                         OpUnary::Negation => !expr,
                         OpUnary::Negative => -expr,
@@ -388,8 +474,8 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                 }
             },
             Expr::Op(_span, op, expr, expr1) => {
-                let l = self.evaluate_expr(expr, bytes);
-                let r = self.evaluate_expr(expr1, bytes);
+                let l = self.evaluate_expr(expr, context, bytes);
+                let r = self.evaluate_expr(expr1, context, bytes);
                 match op {
                     Op::Add => l + r,
                     Op::Sub => l - r,
@@ -420,75 +506,18 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
                     self.disassembler.varnode(*varnode_id).name().to_string()
                 }
                 DisplayElement::Context(context_id) => {
-                    self.disassembler.context(*context_id).name().to_string()
+                    let value = self.context.get(self, *context_id);
+                    self.fmt_meaning(self.disassembler.context(*context_id).meaning(), value)
                 }
                 DisplayElement::TokenField(token_field_id) => {
                     let token_field = self.disassembler.token_field(*token_field_id);
-                    if let Some(token_field_value) = self.token_fields.get(token_field_id).cloned()
-                    {
-                        match token_field.attach {
-                            TokenFieldAttach::NoAttach(value_fmt) => match value_fmt.base {
-                                sleigh_rs::PrintBase::Dec => format!("{}", token_field_value),
-                                sleigh_rs::PrintBase::Hex => fmt_hex(token_field_value),
-                            },
-                            TokenFieldAttach::Varnode(attach_varnode_id) => {
-                                let attach_varnode =
-                                    self.disassembler.attach_varnode(attach_varnode_id);
-                                if let Some(varnode_id) =
-                                    attach_varnode.find_value(token_field_value as usize)
-                                {
-                                    let varnode = self.disassembler.varnode(varnode_id);
-                                    varnode.name().to_string()
-                                } else {
-                                    format!("<UNDEFINED ATTACHED VARNODE {}>", token_field_value)
-                                }
-                            }
-                            TokenFieldAttach::Literal(attach_literal_id) => {
-                                let attach_literal =
-                                    self.disassembler.attach_literal(attach_literal_id);
-                                if let Some(literal_str) =
-                                    attach_literal.find_value(token_field_value as usize)
-                                {
-                                    literal_str.to_string()
-                                } else {
-                                    format!("<UNDEFINED ATTACHED LITERAL {}>", token_field_value)
-                                }
-                            }
-                            TokenFieldAttach::Number(print_base, attach_number_id) => {
-                                let attach_number =
-                                    self.disassembler.attach_number(attach_number_id);
-                                if let Some(number) =
-                                    attach_number.find_value(token_field_value as usize)
-                                {
-                                    match (print_base, number) {
-                                        (
-                                            sleigh_rs::PrintBase::Dec,
-                                            sleigh_rs::Number::Positive(x),
-                                        ) => format!("{}", x),
-                                        (
-                                            sleigh_rs::PrintBase::Dec,
-                                            sleigh_rs::Number::Negative(x),
-                                        ) => format!("-{}", x),
-                                        (
-                                            sleigh_rs::PrintBase::Hex,
-                                            sleigh_rs::Number::Positive(x),
-                                        ) => format!("{:#x}", x),
-                                        (
-                                            sleigh_rs::PrintBase::Hex,
-                                            sleigh_rs::Number::Negative(x),
-                                        ) => format!("-{:#x}", x),
-                                    }
-                                } else {
-                                    format!("<UNDEFINED ATTACHED NUMBER {}>", token_field_value)
-                                }
-                            }
-                        }
-                    } else {
-                        format!(
+                    match self.token_fields.get(token_field_id) {
+                        Some(value) => self.fmt_meaning(token_field.meaning(), *value),
+                        None => format!(
                             "<UNDEFINED FIELD {}/{}>",
                             token_field.name(),
                             token_field_id.0
-                        )
+                        ),
                     }
                 }
                 DisplayElement::InstStart(_inst_start) => format!("{:x}", self.inst_start),
@@ -512,6 +541,61 @@ impl<'sleigh> std::fmt::Display for DisassembledTable<'sleigh> {
     }
 }
 
+impl<'sleigh> DisassembledTable<'sleigh> {
+    /// How a token field or context value is displayed
+    fn fmt_meaning(&self, meaning: Meaning, value: i64) -> String {
+        match meaning {
+            Meaning::NoAttach(value_fmt) => match value_fmt.base {
+                PrintBase::Dec => format!("{}", value),
+                PrintBase::Hex => fmt_hex(value),
+            },
+            Meaning::Varnode(attach_varnode_id) => {
+                match self
+                    .attach_varnode(attach_varnode_id)
+                    .find_value(value as usize)
+                {
+                    Some(varnode_id) => self.varnode(varnode_id).name().to_string(),
+                    None => format!("<UNDEFINED ATTACHED VARNODE {}>", value),
+                }
+            }
+            Meaning::Literal(attach_literal_id) => {
+                match self
+                    .attach_literal(attach_literal_id)
+                    .find_value(value as usize)
+                {
+                    Some(literal) => literal.to_string(),
+                    None => format!("<UNDEFINED ATTACHED LITERAL {}>", value),
+                }
+            }
+            Meaning::Number(print_base, attach_number_id) => {
+                match self
+                    .attach_number(attach_number_id)
+                    .find_value(value as usize)
+                {
+                    Some(number) => match (print_base, number) {
+                        (PrintBase::Dec, Number::Positive(x)) => format!("{}", x),
+                        (PrintBase::Dec, Number::Negative(x)) => format!("-{}", x),
+                        (PrintBase::Hex, Number::Positive(x)) => format!("{:#x}", x),
+                        (PrintBase::Hex, Number::Negative(x)) => format!("-{:#x}", x),
+                    },
+                    None => format!("<UNDEFINED ATTACHED NUMBER {}>", value),
+                }
+            }
+        }
+    }
+}
+
+fn compare(op: CmpOp, l: i64, r: i64) -> bool {
+    match op {
+        CmpOp::Eq => l == r,
+        CmpOp::Ne => l != r,
+        CmpOp::Lt => l < r,
+        CmpOp::Gt => l > r,
+        CmpOp::Le => l <= r,
+        CmpOp::Ge => l >= r,
+    }
+}
+
 fn fmt_hex(value: i64) -> String {
     if value < 0 {
         format!("-{:#x}", value.unsigned_abs())
@@ -525,12 +609,34 @@ mod test {
     use super::*;
     use std::path::Path;
 
-    fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>)]) {
+    fn load(slaspec_path: impl AsRef<Path>) -> Sleigh {
         let _ = env_logger::try_init();
         log::info!("Loading slaspec: {:?}", slaspec_path.as_ref());
-        let slaspec = sleigh_rs::file_to_sleigh(slaspec_path.as_ref())
-            .unwrap_or_else(|_| panic!("Could not load slaspec: {:?}", slaspec_path.as_ref()));
+        sleigh_rs::file_to_sleigh(slaspec_path.as_ref())
+            .unwrap_or_else(|_| panic!("Could not load slaspec: {:?}", slaspec_path.as_ref()))
+    }
+
+    fn context_with(sleigh: &Sleigh, values: &[(&str, i64)]) -> Context {
+        let mut context = Context::new(sleigh);
+        for (name, value) in values {
+            context.set(sleigh, Context::id(sleigh, name).unwrap(), *value);
+        }
+        context
+    }
+
+    fn run_tests(slaspec_path: impl AsRef<Path>, tests: &[(&str, Vec<u8>)]) {
+        run_tests_in_context(slaspec_path, &[], tests)
+    }
+
+    /// Like `run_tests`, starting from the context `values`
+    fn run_tests_in_context(
+        slaspec_path: impl AsRef<Path>,
+        values: &[(&str, i64)],
+        tests: &[(&str, Vec<u8>)],
+    ) {
+        let slaspec = load(slaspec_path);
         let disasm = Disassembler::new(&slaspec);
+        let context = context_with(&slaspec, values);
         for (expected_output, input_code) in tests.iter() {
             log::info!(
                 "Disassembling {:02x?} expecting {:?}",
@@ -538,7 +644,7 @@ mod test {
                 expected_output
             );
             let instruction = disasm
-                .disassemble(0x00000000, &Context::new(&slaspec), input_code)
+                .disassemble(0x00000000, &context, input_code)
                 .expect("Could not disassemble code");
             let actual_output = format!("{}", instruction);
             log::info!("Produced disassembly: {:?}", actual_output);
@@ -626,5 +732,58 @@ mod test {
             ("djnz R3, 0x0", vec![0xdb, 0xfe]),
             ("cjne A, #0x5, 0x13", vec![0xb4, 0x05, 0x10]),
         ]);
+    }
+
+    #[test]
+    fn test_context_disassemble() {
+        let path = "examples/context.slaspec";
+        #[rustfmt::skip]
+        run_tests(path, &[
+            ("add r1, r2, 0x5", vec![0x05, 0x00, 0x12, 0x01]),
+            ("mode1", vec![0x00, 0x00, 0x00, 0x02]),
+            ("pfx 0x2", vec![0x02, 0x00, 0x00, 0x04]),
+            ("shl r1, r2, 0x0", vec![0x00, 0x00, 0x12, 0x05]),
+            ("mov r1, r2", vec![0x00, 0x00, 0x12, 0x06]),
+            ("mov r1, #0x7", vec![0x07, 0x00, 0x18, 0x06]),
+            ("lo", vec![0x00, 0x00, 0x00, 0x07]),
+        ]);
+        #[rustfmt::skip]
+        run_tests_in_context(path, &[("mode", 1), ("shift", 2)], &[
+            ("sub r1, r2, 0x5", vec![0x05, 0x00, 0x12, 0x01]),
+            ("shl r1, r2, 0x2", vec![0x00, 0x00, 0x12, 0x05]),
+            ("hi", vec![0x00, 0x00, 0x00, 0x07]),
+        ]);
+        // mov's own assignment decides which SRC its subtable decodes
+        #[rustfmt::skip]
+        run_tests_in_context(path, &[("width", 1)], &[
+            ("mov r1, r2", vec![0x00, 0x00, 0x12, 0x06]),
+        ]);
+    }
+
+    #[test]
+    fn test_context_commits() {
+        let sleigh = load("examples/context.slaspec");
+        let disasm = Disassembler::new(&sleigh);
+        let id = |name| Context::id(&sleigh, name).unwrap();
+        let decode = |bytes: &[u8]| {
+            disasm
+                .disassemble(0x100, &Context::new(&sleigh), bytes)
+                .unwrap()
+        };
+
+        #[rustfmt::skip]
+        let tests = [
+            (vec![0x05, 0x00, 0x12, 0x01], vec![]),
+            (vec![0x00, 0x00, 0x00, 0x02], vec![ContextCommit { address: 0x104, context: id("mode"), value: 1 }]),
+            (vec![0x02, 0x00, 0x00, 0x04], vec![ContextCommit { address: 0x104, context: id("shift"), value: 2 }]),
+        ];
+        for (bytes, commits) in tests {
+            assert_eq!(decode(&bytes).commits, commits, "{:02x?}", bytes);
+        }
+
+        // The instruction keeps the context its constructors left behind
+        let mov = decode(&[0x07, 0x00, 0x18, 0x06]);
+        assert_eq!(mov.context.get(&sleigh, id("width")), 1);
+        assert_eq!(mov.context.get(&sleigh, id("mode")), 0);
     }
 }

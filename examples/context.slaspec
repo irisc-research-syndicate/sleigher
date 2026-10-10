@@ -3,7 +3,7 @@
 #   mode   flows: selects the meaning of op 1 (add in mode 0, sub in mode 1).
 #          `mode0`/`mode1` switch it from the next instruction on.
 #   shift  noflow: set by the `pfx` prefix for the next instruction only, read
-#          by `shl` in its display and semantics.
+#          by `shl` in its display and semantics, and compared by `lo`/`hi`.
 #   width  set by `mov` for its operand subtable, which decodes a register
 #          (width=0) or an immediate (width=1).
 
@@ -41,6 +41,8 @@ attach variables [ rd rs ] [ r0 r1 r2 r3 r4 r5 r6 r7 ];
 
 :pfx sh is op=4 & sh [ shift=sh; globalset(inst_next, shift); ] { }
 :shl rd, rs, shift is op=5 & rd & rs { rd = rs << shift; }
+:lo is op=7 & shift<2 { }
+:hi is op=7 & shift>=2 { }
 
 SRC: rs is width=0 & rs { export rs; }
 SRC: "#"^imm16 is width=1 & imm16 { export *[const]:4 imm16; }

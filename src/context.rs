@@ -61,6 +61,14 @@ impl Context {
     }
 }
 
+/// A `globalset`: from `address` on, the context variable has `value`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextCommit {
+    pub address: u64,
+    pub context: ContextId,
+    pub value: i64,
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
