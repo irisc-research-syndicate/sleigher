@@ -1,0 +1,47 @@
+# Context variables, little endian, fixed 32-bit instructions.
+#
+#   mode   flows: selects the meaning of op 1 (add in mode 0, sub in mode 1).
+#          `mode0`/`mode1` switch it from the next instruction on.
+#   shift  noflow: set by the `pfx` prefix for the next instruction only, read
+#          by `shl` in its display and semantics.
+#   width  set by `mov` for its operand subtable, which decodes a register
+#          (width=0) or an immediate (width=1).
+
+define endian=little;
+define alignment=4;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [ r0 r1 r2 r3 r4 r5 r6 r7 ];
+define register offset=0x100 size=4 contextreg;
+
+define context contextreg
+    mode=(0, 0)
+    shift=(1, 2) noflow
+    width=(3, 3) noflow
+;
+
+define token instr(32)
+    op=(24, 31)
+    rd=(20, 22)
+    imm_flag=(19, 19)
+    rs=(16, 18)
+    imm16=(0, 15)
+    sh=(0, 1)
+;
+
+attach variables [ rd rs ] [ r0 r1 r2 r3 r4 r5 r6 r7 ];
+
+:add rd, rs, imm16 is mode=0 & op=1 & rd & rs & imm16 { rd = rs + imm16; }
+:sub rd, rs, imm16 is mode=1 & op=1 & rd & rs & imm16 { rd = rs - imm16; }
+
+:mode1 is op=2 [ mode=1; globalset(inst_next, mode); ] { }
+:mode0 is op=3 [ mode=0; globalset(inst_next, mode); ] { }
+
+:pfx sh is op=4 & sh [ shift=sh; globalset(inst_next, shift); ] { }
+:shl rd, rs, shift is op=5 & rd & rs { rd = rs << shift; }
+
+SRC: rs is width=0 & rs { export rs; }
+SRC: "#"^imm16 is width=1 & imm16 { export *[const]:4 imm16; }
+:mov rd, SRC is op=6 & rd & imm_flag & SRC [ width=imm_flag; ] { rd = SRC; }

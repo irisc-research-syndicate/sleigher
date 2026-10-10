@@ -18,7 +18,8 @@ use z3::ast::{Ast, Bool, BV};
 
 use anyhow::{anyhow, bail};
 
-use crate::disassembler::{Context, Disassembler};
+use crate::context::Context;
+use crate::disassembler::Disassembler;
 
 /// Labels a program defines: resolved to an address, or `None` while their address is unknown
 pub type Labels = BTreeMap<String, Option<u64>>;
@@ -841,7 +842,7 @@ impl InstructionAssembler {
     fn candidate(&self, constraints: &Constraints) -> Candidate {
         let bytes = constraints.to_bytes().unwrap_or_default();
         let disassembly = Disassembler::new(&self.sleigh)
-            .disassemble(constraints.inst_start, Context, &bytes)
+            .disassemble(constraints.inst_start, &Context::new(&self.sleigh), &bytes)
             .map(|instruction| instruction.to_string())
             .unwrap_or_else(|err| format!("<{}>", err));
         Candidate { bytes, disassembly }
@@ -1175,7 +1176,9 @@ mod test {
 
     fn disassemble(assembler: &InstructionAssembler, bytes: &[u8]) -> Option<String> {
         let disassembler = Disassembler::new(assembler);
-        let instruction = disassembler.disassemble(0, Context, bytes).ok()?;
+        let instruction = disassembler
+            .disassemble(0, &Context::new(assembler), bytes)
+            .ok()?;
         Some(instruction.to_string())
     }
 

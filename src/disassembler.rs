@@ -9,7 +9,9 @@ use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::token::TokenFieldAttach;
 use sleigh_rs::{Endian, Sleigh, TableId, TokenFieldId};
 
+use crate::context::Context;
 use crate::pcode::{LiftError, PcodeOp};
+use crate::value::sign_extend;
 
 #[derive(Debug, Clone)]
 pub struct Disassembler<'sleigh> {
@@ -24,8 +26,6 @@ impl<'sleigh> std::ops::Deref for Disassembler<'sleigh> {
     }
 }
 
-pub struct Context;
-
 impl<'sleigh> Disassembler<'sleigh> {
     pub fn new(sleigh: &'sleigh Sleigh) -> Self {
         Disassembler { sleigh }
@@ -34,7 +34,7 @@ impl<'sleigh> Disassembler<'sleigh> {
     pub fn disassemble(
         &'sleigh self,
         inst_start: u64,
-        context: Context,
+        context: &Context,
         bytes: &[u8],
     ) -> Result<DisassembledInstruction<'sleigh>> {
         let table = self.disassemble_table(
@@ -54,7 +54,7 @@ impl<'sleigh> Disassembler<'sleigh> {
         &'sleigh self,
         inst_start: u64,
         table: &'sleigh Table,
-        _context: Context,
+        _context: &Context,
         bytes: &[u8],
     ) -> Result<DisassembledTable<'sleigh>> {
         let mut disassembled = DisassembledTable::disassemble(self, inst_start, table, bytes)?;
@@ -92,10 +92,8 @@ impl<'sleigh> Disassembler<'sleigh> {
 
         log::trace!("Token field raw: {:#x}", token_field_raw);
 
-        let token_field_value = if token_field.raw_value_is_signed()
-            && (token_field_raw & (1 << (token_field.bits.len().get() - 1)) != 0)
-        {
-            (token_field_raw as i64) - (1i64 << token_field.bits.len().get())
+        let token_field_value = if token_field.raw_value_is_signed() {
+            sign_extend(token_field_raw, token_field.bits.len().get() as u32)
         } else {
             token_field_raw as i64
         };
@@ -540,7 +538,7 @@ mod test {
                 expected_output
             );
             let instruction = disasm
-                .disassemble(0x00000000, Context, input_code)
+                .disassemble(0x00000000, &Context::new(&slaspec), input_code)
                 .expect("Could not disassemble code");
             let actual_output = format!("{}", instruction);
             log::info!("Produced disassembly: {:?}", actual_output);

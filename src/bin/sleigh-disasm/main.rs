@@ -1,5 +1,6 @@
 use anyhow::{Context as _, Result};
-use sleigher::disassembler::{Context, Disassembler};
+use sleigher::context::Context;
+use sleigher::disassembler::Disassembler;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -27,13 +28,14 @@ fn main() -> Result<()> {
         .ok()
         .context("Could not open or parse slaspec")?;
     let disassembler = Disassembler::new(&sleigh);
+    let context = Context::new(&sleigh);
 
     let code = std::fs::read(args.code)?;
 
     let mut pc = args.address;
     let mut cursor = &code[..];
 
-    while let Ok(instruction) = disassembler.disassemble(pc, Context, cursor) {
+    while let Ok(instruction) = disassembler.disassemble(pc, &context, cursor) {
         println!("{:#010x}: {}", pc, instruction);
         if args.pcode {
             match &instruction.pcode {

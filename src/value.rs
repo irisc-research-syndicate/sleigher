@@ -39,3 +39,10 @@ impl std::convert::From<&Varnode> for Ref {
         )
     }
 }
+
+/// Sign extend the low `bits` bits of `value`, 1 to 64 bits
+pub fn sign_extend(value: u64, bits: u32) -> i64 {
+    debug_assert!((1..=64).contains(&bits));
+    let shift = 64 - bits;
+    ((value << shift) as i64) >> shift
+}

@@ -12,6 +12,7 @@ use sleigh_rs::{
 };
 
 use crate::disassembler::DisassembledTable;
+use crate::value::sign_extend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VarnodeSpace {
@@ -1010,10 +1011,7 @@ impl<'s> Lifter<'s> {
             let value = input.offset;
             let folded = match op {
                 Unary::Zext(_) | Unary::TakeLsb(_) => Some(value),
-                Unary::Sext(_) => {
-                    let shift = 64 - 8 * input.size.min(8);
-                    Some((((value << shift) as i64) >> shift) as u64)
-                }
+                Unary::Sext(_) => Some(sign_extend(value, 8 * input.size.min(8)) as u64),
                 Unary::TrunkLsb { trunk, .. } => {
                     Some(value.checked_shr(8 * *trunk as u32).unwrap_or(0))
                 }
@@ -1156,7 +1154,8 @@ enum Kind {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::disassembler::{Context, Disassembler};
+    use crate::context::Context;
+    use crate::disassembler::Disassembler;
     use std::path::Path;
 
     fn load(slaspec_path: impl AsRef<Path>) -> Sleigh {
@@ -1173,7 +1172,9 @@ mod test {
         bytes: &[u8],
     ) -> (String, Result<Vec<String>, LiftError>) {
         let disassembler = Disassembler::new(sleigh);
-        let instruction = disassembler.disassemble(address, Context, bytes).unwrap();
+        let instruction = disassembler
+            .disassemble(address, &Context::new(sleigh), bytes)
+            .unwrap();
         let pcode = instruction.pcode.clone().map(|ops| {
             ops.iter()
                 .map(|op| op.display(sleigh).to_string())

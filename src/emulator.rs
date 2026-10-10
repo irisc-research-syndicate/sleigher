@@ -4,7 +4,8 @@ use anyhow::{anyhow, bail, Context as _, Result};
 
 use sleigh_rs::{Endian, Sleigh, SpaceId, UserFunctionId};
 
-use crate::disassembler::{Context, Disassembler};
+use crate::context::Context;
+use crate::disassembler::Disassembler;
 use crate::pcode::{size_mask, OpCode, PcodeOp, Varnode, VarnodeSpace};
 use crate::space::{HashSpace, MemoryRegion};
 use crate::value::{Address, Ref};
@@ -61,9 +62,11 @@ impl<'sleigh> Cpu<'sleigh> {
         let mut instruction_bytes = vec![0u8; self.max_instruction_len];
         self.fetch_instruction(&mut instruction_bytes)?;
 
-        let instruction =
-            self.disassembler
-                .disassemble(self.state.pc, Context, &instruction_bytes)?;
+        let instruction = self.disassembler.disassemble(
+            self.state.pc,
+            &Context::new(self.sleigh),
+            &instruction_bytes,
+        )?;
         log::debug!(
             "Executing {:#010x}: {}",
             instruction.inst_start,
@@ -167,8 +170,7 @@ fn write_value(
 }
 
 fn sign_extend(value: u64, size: u32) -> i64 {
-    let shift = 64 - 8 * size.min(8);
-    ((value << shift) as i64) >> shift
+    crate::value::sign_extend(value, 8 * size.min(8))
 }
 
 /// Runs the p-code of one instruction
@@ -502,7 +504,10 @@ mod test {
         let mut failures = vec![];
         for (asm, program, regs_in, mem_in, regs_out, mem_out) in tests.iter() {
             let mut cpu = new_cpu(sleigh, program);
-            match cpu.disassembler.disassemble(BASE, Context, program) {
+            match cpu
+                .disassembler
+                .disassemble(BASE, &Context::new(sleigh), program)
+            {
                 Ok(instruction) if instruction.to_string() == *asm => {}
                 result => failures.push(format!(
                     "{:?}: disassembles as {:?}",
