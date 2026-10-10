@@ -1775,23 +1775,36 @@ mod test {
         let asm = load("examples/belt.slaspec");
         #[rustfmt::skip]
         assert_encodes_at(&asm, 0x1000, &[
-            ("con 0x4", vec![0x00, 0x04]),
-            ("con -0x1", vec![0x0f, 0xff]),
-            ("add b3, b0", vec![0x16, 0x00]),
-            ("mov b2", vec![0xa4, 0x00]),
-            ("divu b0, b1", vec![0xb0, 0x40]),
-            ("st b2, b0", vec![0x64, 0x00]),
-            ("br b1, 0xff8", vec![0x73, 0xfb]),
-            ("jmp 0xff6", vec![0x8f, 0xfa]),
-            ("out b0", vec![0x90, 0x00]),
-            ("nop", vec![0xf0, 0x00]),
+            ("con 0x5", vec![0x04, 0x00, 0x00, 0x05]),
+            ("con -0x1", vec![0x04, 0x03, 0xff, 0xff]),
+            ("conw 0xedb88320", vec![0x08, 0x00, 0x00, 0x00, 0xed, 0xb8, 0x83, 0x20]),
+            ("mul b2, b3", vec![0x14, 0x8c, 0x00, 0x00]),
+            ("addi b1, -0x1", vec![0x30, 0x43, 0xff, 0xff]),
+            ("mov b15", vec![0x53, 0xc0, 0x00, 0x00]),
+            ("conform b2, b0", vec![0x54, 0x80, 0x00, 0x02]),
+            ("conform b1, b2, b0", vec![0x54, 0x48, 0x00, 0x03]),
+            ("conform b3, b0, b7, b2, b1", vec![0x54, 0xc1, 0xc8, 0x45]),
+            ("st b1, b0", vec![0x48, 0x40, 0x00, 0x00]),
+            ("br b0, 0x1014", vec![0x5c, 0x00, 0x00, 0x04]),
+            ("brz b0, 0x1014", vec![0x60, 0x00, 0x00, 0x04]),
+            ("jmp 0xffc", vec![0x64, 0x03, 0xff, 0xfe]),
+            ("out b0", vec![0x68, 0x00, 0x00, 0x00]),
+            ("nop", vec![0x00, 0x00, 0x00, 0x00]),
         ]);
-        assert_rejects(&asm, &["add b8, b0", "con 0x800", "mov b0, b1"]);
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "add b16, b0",
+            "con 0x20000",
+            "mov b0, b1",
+            "conform b0",
+            "conform b0, b1, b2, b3, b4, b5",
+            "br b0, 0x1012",
+        ]);
     }
 
     #[test]
     fn belt_roundtrip() {
         let asm = load("examples/belt.slaspec");
-        assert_roundtrips(&asm, 2, 400);
+        assert_roundtrips(&asm, 8, 400);
     }
 }

@@ -79,3 +79,6 @@ ABS32: uimm32 is uimm32 { export *:4 uimm32; }
 
 :out rd is opcode=0x20; rd { out(rd); }
 :in rd  is opcode=0x21; rd { rd = in(); }
+
+:shr rd, SRC is opcode=0x09; rd & SRC { rd = rd >> SRC; ZF = rd == 0; }
+:ldb rd, [rm] is opcode=0x0a; rd & md=1 & rm { rd = zext(*:1 rm); }

@@ -10,3 +10,6 @@ env_logger = "0.11.5"
 log = "0.4.22"
 sleigh-rs = { git = "https://github.com/irisc-research-syndicate/sleigh-rs.git", version = "0.1.5" }
 z3 = "0.12.1"
+
+[dev-dependencies]
+crc32fast = "1"

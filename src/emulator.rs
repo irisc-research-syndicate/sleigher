@@ -454,26 +454,45 @@ mod test {
             .into()
     }
 
+    /// Write `value` to `reference` in the spec's byte order
+    fn write_value(cpu: &mut Cpu, reference: Ref, value: u64) {
+        let size = reference.1;
+        let bytes = match cpu.endian() {
+            Endian::Big => value.to_be_bytes()[8 - size..].to_vec(),
+            Endian::Little => value.to_le_bytes()[..size].to_vec(),
+        };
+        cpu.state.write_ref(reference, &bytes).unwrap();
+    }
+
+    /// Read `reference` in the spec's byte order
+    fn read_value(cpu: &mut Cpu, reference: Ref) -> u64 {
+        let mut bytes = vec![0u8; reference.1];
+        cpu.state.read_ref(reference, &mut bytes).unwrap();
+        let fold = |value: u64, byte: &u8| (value << 8) | *byte as u64;
+        match cpu.endian() {
+            Endian::Big => bytes.iter().fold(0, fold),
+            Endian::Little => bytes.iter().rev().fold(0, fold),
+        }
+    }
+
     fn set_reg(cpu: &mut Cpu, name: &str, value: u64) {
         let reg = reg_ref(cpu, name);
-        cpu.state.write_ref(reg, &value.to_be_bytes()).unwrap();
+        write_value(cpu, reg, value);
     }
 
     fn get_reg(cpu: &mut Cpu, name: &str) -> u64 {
         let reg = reg_ref(cpu, name);
-        let mut bytes = [0u8; 8];
-        cpu.state.read_ref(reg, &mut bytes).unwrap();
-        u64::from_be_bytes(bytes)
+        read_value(cpu, reg)
     }
 
     fn set_mem(cpu: &mut Cpu, address: u64, value: u32) {
         let mem = Ref(cpu.default_space(), 4, Address(address));
-        cpu.state.write_ref(mem, &value.to_be_bytes()).unwrap();
+        write_value(cpu, mem, value as u64);
     }
 
     fn get_mem(cpu: &mut Cpu, address: u64) -> u32 {
         let mem = Ref(cpu.default_space(), 4, Address(address));
-        cpu.state.read_ref_u32be(mem).unwrap()
+        read_value(cpu, mem) as u32
     }
 
     /// Execute each instruction once from `BASE` and compare registers, memory and pc.
@@ -746,20 +765,29 @@ mod test {
     #[test]
     fn belt_drops() {
         let sleigh = load("examples/belt.slaspec");
-        // Every result drops onto b0 and pushes the belt back, b7 falls off
+        // Every result drops onto b0 and pushes the belt back, b15 falls off
         #[rustfmt::skip]
         assert_executes(&sleigh, &[
-            ("con 0x5", vec![0x00, 0x05], &[("b0", 1), ("b1", 2), ("b6", 6), ("b7", 7)], &[], &[("b0", 5), ("b1", 1), ("b2", 2), ("b7", 6)], &[]),
-            ("con -0x1", vec![0x0f, 0xff], &[], &[], &[("b0", 0xffffffff)], &[]),
-            ("add b0, b1", vec![0x10, 0x40], &[("b0", 3), ("b1", 4)], &[], &[("b0", 7), ("b1", 3), ("b2", 4)], &[]),
-            ("sub b1, b0", vec![0x22, 0x00], &[("b0", 3), ("b1", 10)], &[], &[("b0", 7), ("b1", 3), ("b2", 10)], &[]),
-            ("mul b2, b3", vec![0x34, 0xc0], &[("b2", 6), ("b3", 7)], &[], &[("b0", 42), ("b3", 6), ("b4", 7)], &[]),
-            ("eql b0, b1", vec![0x40, 0x40], &[("b0", 5), ("b1", 5)], &[], &[("b0", 1), ("b1", 5), ("b2", 5)], &[]),
-            ("eql b0, b1", vec![0x40, 0x40], &[("b0", 5), ("b1", 6)], &[], &[("b0", 0), ("b1", 5), ("b2", 6)], &[]),
-            ("mov b7", vec![0xae, 0x00], &[("b6", 0x66), ("b7", 0x77)], &[], &[("b0", 0x77), ("b7", 0x66)], &[]),
+            ("con 0x5", vec![0x04, 0x00, 0x00, 0x05], &[("b0", 1), ("b1", 2), ("b14", 14), ("b15", 15)], &[], &[("b0", 5), ("b1", 1), ("b2", 2), ("b15", 14)], &[]),
+            ("con -0x1", vec![0x04, 0x03, 0xff, 0xff], &[], &[], &[("b0", 0xffffffff)], &[]),
+            ("conw 0xedb88320", vec![0x08, 0x00, 0x00, 0x00, 0xed, 0xb8, 0x83, 0x20], &[("b0", 1)], &[], &[("b0", 0xedb88320), ("b1", 1)], &[]),
+            ("add b0, b1", vec![0x0c, 0x04, 0x00, 0x00], &[("b0", 3), ("b1", 4)], &[], &[("b0", 7), ("b1", 3), ("b2", 4)], &[]),
+            ("sub b1, b0", vec![0x10, 0x40, 0x00, 0x00], &[("b0", 3), ("b1", 10)], &[], &[("b0", 7), ("b1", 3), ("b2", 10)], &[]),
+            ("mul b2, b3", vec![0x14, 0x8c, 0x00, 0x00], &[("b2", 6), ("b3", 7)], &[], &[("b0", 42), ("b3", 6), ("b4", 7)], &[]),
+            ("xor b0, b1", vec![0x20, 0x04, 0x00, 0x00], &[("b0", 0xff00), ("b1", 0x0ff0)], &[], &[("b0", 0xf0f0)], &[]),
+            ("shl b0, b1", vec![0x28, 0x04, 0x00, 0x00], &[("b0", 0x3), ("b1", 4)], &[], &[("b0", 0x30)], &[]),
+            ("eql b0, b1", vec![0x2c, 0x04, 0x00, 0x00], &[("b0", 5), ("b1", 6)], &[], &[("b0", 0), ("b1", 5), ("b2", 6)], &[]),
+            ("addi b1, -0x1", vec![0x30, 0x43, 0xff, 0xff], &[("b0", 9), ("b1", 5)], &[], &[("b0", 4), ("b1", 9), ("b2", 5)], &[]),
+            ("andi b0, 0x1", vec![0x34, 0x00, 0x00, 0x01], &[("b0", 0x7)], &[], &[("b0", 1), ("b1", 0x7)], &[]),
+            ("xori b0, -0x1", vec![0x38, 0x03, 0xff, 0xff], &[("b0", 0x0f0f0f0f)], &[], &[("b0", 0xf0f0f0f0)], &[]),
+            ("shri b0, 0x4", vec![0x3c, 0x00, 0x00, 0x04], &[("b0", 0x80000000)], &[], &[("b0", 0x08000000)], &[]),
+            ("mov b15", vec![0x53, 0xc0, 0x00, 0x00], &[("b14", 0x66), ("b15", 0x77)], &[], &[("b0", 0x77), ("b15", 0x66)], &[]),
+            // conform drops copies so the listed values end up at the front, in order
+            ("conform b2, b0", vec![0x54, 0x80, 0x00, 0x02], &[("b0", 10), ("b1", 11), ("b2", 12)], &[], &[("b0", 12), ("b1", 10), ("b2", 10), ("b3", 11), ("b4", 12)], &[]),
+            ("conform b3, b0, b7, b2, b1", vec![0x54, 0xc1, 0xc8, 0x45], &[("b0", 10), ("b1", 11), ("b2", 12), ("b3", 13), ("b7", 17)], &[], &[("b0", 13), ("b1", 10), ("b2", 17), ("b3", 12), ("b4", 11), ("b5", 10)], &[]),
             // Two drops: the quotient, then the remainder
-            ("divu b0, b1", vec![0xb0, 0x40], &[("b0", 17), ("b1", 5)], &[], &[("b0", 2), ("b1", 3), ("b2", 17), ("b3", 5)], &[]),
-            ("nop", vec![0xf0, 0x00], &[("b0", 1)], &[], &[("b0", 1)], &[]),
+            ("divu b0, b1", vec![0x58, 0x04, 0x00, 0x00], &[("b0", 17), ("b1", 5)], &[], &[("b0", 2), ("b1", 3), ("b2", 17), ("b3", 5)], &[]),
+            ("nop", vec![0x00, 0x00, 0x00, 0x00], &[("b0", 1)], &[], &[("b0", 1)], &[]),
         ]);
     }
 
@@ -769,11 +797,14 @@ mod test {
         // Stores and branches drop nothing
         #[rustfmt::skip]
         assert_executes(&sleigh, &[
-            ("ld b0", vec![0x50, 0x00], &[("b0", 0x2000)], &[(0x2000, 0xdeadbeef)], &[("b0", 0xdeadbeef), ("b1", 0x2000)], &[]),
-            ("st b1, b0", vec![0x62, 0x00], &[("b0", 0xcafebabe), ("b1", 0x2000)], &[], &[("b0", 0xcafebabe), ("b1", 0x2000)], &[(0x2000, 0xcafebabe)]),
-            ("br b0, 0x1012", vec![0x70, 0x08], &[("b0", 1)], &[], &[("pc", 0x1012)], &[]),
-            ("br b0, 0x1012", vec![0x70, 0x08], &[("b0", 0)], &[], &[], &[]),
-            ("jmp 0xffe", vec![0x8f, 0xfe], &[], &[], &[("pc", 0xffe)], &[]),
+            ("ld b0", vec![0x40, 0x00, 0x00, 0x00], &[("b0", 0x2000)], &[(0x2000, 0xdeadbeef)], &[("b0", 0xdeadbeef), ("b1", 0x2000)], &[]),
+            ("ldb b0", vec![0x44, 0x00, 0x00, 0x00], &[("b0", 0x2001)], &[(0x2000, 0xdeadbeef)], &[("b0", 0xad), ("b1", 0x2001)], &[]),
+            ("st b1, b0", vec![0x48, 0x40, 0x00, 0x00], &[("b0", 0xcafebabe), ("b1", 0x2000)], &[], &[("b0", 0xcafebabe), ("b1", 0x2000)], &[(0x2000, 0xcafebabe)]),
+            ("br b0, 0x1014", vec![0x5c, 0x00, 0x00, 0x04], &[("b0", 1)], &[], &[("pc", 0x1014)], &[]),
+            ("br b0, 0x1014", vec![0x5c, 0x00, 0x00, 0x04], &[("b0", 0)], &[], &[], &[]),
+            ("brz b0, 0x1014", vec![0x60, 0x00, 0x00, 0x04], &[("b0", 0)], &[], &[("pc", 0x1014)], &[]),
+            ("brz b0, 0x1014", vec![0x60, 0x00, 0x00, 0x04], &[("b0", 1)], &[], &[], &[]),
+            ("jmp 0xffc", vec![0x64, 0x03, 0xff, 0xfe], &[], &[], &[("pc", 0xffc)], &[]),
         ]);
     }
 
@@ -783,9 +814,8 @@ mod test {
                     con 0x4         // n
                     con 0x0         // acc; the loop keeps b0 = acc, b1 = n
             loop:   add b0, b1      // acc + n
-                    con -0x1
-                    add b3, b0      // n - 1
-                    mov b2          // acc + n back to the front
+                    addi b2, -0x1   // n - 1
+                    conform b1, b0
                     br b1, loop
                     out b0
             end:    nop
@@ -813,6 +843,74 @@ mod test {
             steps += 1;
         }
         assert_eq!(*output.borrow(), vec![4 + 3 + 2 + 1]);
-        assert_eq!(steps, 2 + 4 * 5 + 1);
+        assert_eq!(steps, 2 + 4 * 4 + 1);
+    }
+
+    /// Assemble `examples/crc32/<arch>.s`, run it on several inputs and compare the result with
+    /// crc32fast. The program gets the data address in `data_reg` and its length in `len_reg`,
+    /// leaves the crc in `crc_reg` and finishes at its `end` label.
+    fn assert_crc32(arch: &str, data_reg: &str, len_reg: &str, crc_reg: &str) {
+        const DATA: u64 = 0x8000;
+        let spec = format!("examples/{}.slaspec", arch);
+        let source = std::fs::read_to_string(format!("examples/crc32/{}.s", arch)).unwrap();
+        let assembler = crate::assembler::InstructionAssembler::new(load(&spec));
+        let program = assembler.assemble_program(&source, BASE).unwrap();
+        let end = program.labels["end"];
+
+        let mut random = vec![];
+        let mut seed = 0x2545f4914f6cdd1du64;
+        for _ in 0..64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            random.push(seed as u8);
+        }
+        let inputs: [&[u8]; 4] = [b"", b"a", b"123456789", &random];
+
+        let sleigh = load(&spec);
+        for data in inputs {
+            let mut cpu = new_cpu(&sleigh, &program.bytes);
+            let data_ref = Ref(cpu.default_space(), data.len(), Address(DATA));
+            if !data.is_empty() {
+                cpu.state.write_ref(data_ref, data).unwrap();
+            }
+            set_reg(&mut cpu, data_reg, DATA);
+            set_reg(&mut cpu, len_reg, data.len() as u64);
+
+            let mut steps = 0;
+            while cpu.state.pc != end {
+                assert!(steps < 100_000, "{}: no end after {} steps", arch, steps);
+                cpu.step()
+                    .unwrap_or_else(|err| panic!("{}: {:#}", arch, err));
+                steps += 1;
+            }
+            assert_eq!(
+                get_reg(&mut cpu, crc_reg),
+                crc32fast::hash(data) as u64,
+                "{}: crc32 of {:02x?}",
+                arch,
+                data
+            );
+        }
+    }
+
+    #[test]
+    fn crc32_cisc() {
+        assert_crc32("cisc", "r1", "r2", "r0");
+    }
+
+    #[test]
+    fn crc32_risc() {
+        assert_crc32("risc", "r1", "r2", "r0");
+    }
+
+    #[test]
+    fn crc32_vliw() {
+        assert_crc32("vliw", "r1", "r2", "r3");
+    }
+
+    #[test]
+    fn crc32_belt() {
+        assert_crc32("belt", "b0", "b1", "b0");
     }
 }

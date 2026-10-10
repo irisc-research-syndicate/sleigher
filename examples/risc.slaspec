@@ -44,3 +44,10 @@ IMM16: calc is imm16_sx=1 & imm16_hi=1 & simm16 [ calc = simm16 << 8; ] { export
 :or rd, rs, rt  is op=31 & funct=2 & rd & rs & rt & funct { rd = rs | rt; }
 :and rd, rs, rt is op=31 & funct=3 & rd & rs & rt & funct { rd = rs & rt; }
 :xor rd, rs, rt is op=31 & funct=4 & rd & rs & rt & funct { rd = rs ^ rt; }
+
+REL16: target is simm16 [ target = inst_next + simm16 * 4; ] { export *:4 target; }
+
+:lbu rd, rs is op=8 & rd & rs { rd = zext(*:1 rs); }
+:bz rs, REL16 is op=9 & rs & REL16 { if (rs == 0) goto REL16; }
+:bnz rs, REL16 is op=10 & rs & REL16 { if (rs != 0) goto REL16; }
+:shr rd, rs, rt is op=31 & funct=5 & rd & rs & rt & funct { rd = rs >> rt; }

@@ -50,6 +50,9 @@ OP_CONST: fmt1_const is fmt=1 & fmt1_const { export *[const]:4 fmt1_const; }
 OP_CONST: fmt2_const is fmt=2 & fmt2_const { export *[const]:4 fmt2_const; }
 OP_CONST: fmt3_const is fmt=3 & fmt3_const { export *[const]:4 fmt3_const; }
 
+# Branch target of a single slot bundle
+BTARGET: fmt3_const is fmt3_const { export *:4 fmt3_const; }
+
 OP1_CONST: OP_CONST is op1_const_zero=0 & OP_CONST { export OP_CONST; }
 OP1_CONST: 0 is op1_const_zero=1 { export 0:4; }
 
@@ -62,6 +65,12 @@ OP0:"sub" op0_rd, op0_rs, OP_CONST is op0=0x11 & op0_rd & op0_rs & OP_CONST { op
 OP0:"and" op0_rd, op0_rs, OP_CONST is op0=0x12 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs & OP_CONST; }
 OP0:"or" op0_rd, op0_rs, OP_CONST is op0=0x13 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs | OP_CONST; }
 OP0:"xor" op0_rd, op0_rs, OP_CONST is op0=0x14 & op0_rd & op0_rs & OP_CONST { op0_rd = op0_rs ^ OP_CONST; }
+OP0:"xor" op0_rd, op0_rs is op0=0x15 & op0_rd & op0_rs { op0_rd = op0_rd ^ op0_rs; }
+OP0:"shr1" op0_rd, op0_rs is op0=0x16 & op0_rd & op0_rs { op0_rd = op0_rs >> 1; }
+OP0:"ldb" op0_rd, op0_rs is op0=0x17 & op0_rd & op0_rs { op0_rd = zext(*:1 op0_rs); }
+OP0:"neg" op0_rd, op0_rs is op0=0x18 & op0_rd & op0_rs { op0_rd = -op0_rs; }
+OP0:"bnz" op0_rd, BTARGET is op0=0x19 & fmt=3 & op0_rd & BTARGET { if (op0_rd != 0) goto BTARGET; }
+OP0:"bz" op0_rd, BTARGET is op0=0x1a & fmt=3 & op0_rd & BTARGET { if (op0_rd == 0) goto BTARGET; }
 
 OP1:"unk."^op1 op1_rd, op1_rs, OP1_CONST is op1 & op1_rd & op1_rs & OP1_CONST { }
 OP1:"add" op1_rd, op1_rs, OP1_CONST is op1=0x10 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs + OP1_CONST; }
@@ -69,6 +78,10 @@ OP1:"sub" op1_rd, op1_rs, OP1_CONST is op1=0x11 & op1_rd & op1_rs & OP1_CONST { 
 OP1:"and" op1_rd, op1_rs, OP1_CONST is op1=0x12 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs & OP1_CONST; }
 OP1:"or" op1_rd, op1_rs, OP1_CONST is op1=0x13 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs | OP1_CONST; }
 OP1:"xor" op1_rd, op1_rs, OP1_CONST is op1=0x14 & op1_rd & op1_rs & OP1_CONST { op1_rd = op1_rs ^ OP1_CONST; }
+OP1:"xor" op1_rd, op1_rs is op1=0x15 & op1_rd & op1_rs { op1_rd = op1_rd ^ op1_rs; }
+OP1:"shr1" op1_rd, op1_rs is op1=0x16 & op1_rd & op1_rs { op1_rd = op1_rs >> 1; }
+OP1:"ldb" op1_rd, op1_rs is op1=0x17 & op1_rd & op1_rs { op1_rd = zext(*:1 op1_rs); }
+OP1:"neg" op1_rd, op1_rs is op1=0x18 & op1_rd & op1_rs { op1_rd = -op1_rs; }
 
 OP2:"unk."^op2 op2_rd, op2_rs, OP2_CONST is op2 & op2_rd & op2_rs & OP2_CONST { }
 OP2:"add" op2_rd, op2_rs, OP2_CONST is op2=0x10 & op2_rd & op2_rs & OP2_CONST { op2_rd = op2_rs + OP2_CONST; }
