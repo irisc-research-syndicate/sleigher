@@ -62,13 +62,45 @@ fn parse_dec(s: &str) -> Option<(&str, u64)> {
     parse_digits(s, 10)
 }
 
-/// A decimal or `0x` hex number, negative only if `signed`, and the rest of `s`
-pub fn parse_number(signed: bool, s: &str) -> Option<(&str, i64)> {
+/// A decimal or `0x` hex number of up to 64 bits, negative only if `signed`, and the rest of `s`
+pub fn parse_number_exact(signed: bool, s: &str) -> Option<(&str, i128)> {
     let (s, sign) = match s.strip_prefix('-') {
         Some(s) if signed => (s, true),
         _ => (s, false),
     };
     let (s, value) = parse_hex(s).or_else(|| parse_dec(s))?;
-    let value = if sign { -(value as i64) } else { value as i64 };
+    let value = if sign {
+        -(value as i128)
+    } else {
+        value as i128
+    };
     Some((s, value))
+}
+
+/// Like `parse_number_exact`, wrapped to 64 bits: `0xffffffffffffffff` is -1
+pub fn parse_number(signed: bool, s: &str) -> Option<(&str, i64)> {
+    parse_number_exact(signed, s).map(|(s, value)| (s, value as i64))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn parse_number_bounds() {
+        assert_eq!(
+            parse_number(true, "-0x8000000000000000"),
+            Some(("", i64::MIN))
+        );
+        assert_eq!(parse_number(false, "0xffffffffffffffff"), Some(("", -1)));
+        assert_eq!(parse_number(false, "-1"), None);
+        assert_eq!(
+            parse_number_exact(true, "0xffffffffffffffff,"),
+            Some((",", u64::MAX as i128))
+        );
+        assert_eq!(
+            parse_number_exact(true, "-0xffffffffffffffff"),
+            Some(("", -(u64::MAX as i128)))
+        );
+    }
 }
