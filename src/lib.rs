@@ -1,4 +1,5 @@
 pub mod assembler;
+pub mod bigint;
 pub mod context;
 pub mod disassembler;
 pub mod emulator;

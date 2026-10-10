@@ -1,0 +1,58 @@
+# Wide registers, little endian: 512-bit vector registers z0-z3 with 128-bit
+# views x0-x3 of their low bytes, operated on as single integers.
+#
+#   [op] [a b c]    a=(4,5) b=(2,3) c=(0,1) pick a z, x or r register
+
+define endian=little;
+define alignment=1;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x000 size=64 [ z0 z1 z2 z3 ];
+define register offset=0x000 size=16 [
+    x0 _ _ _ x1 _ _ _ x2 _ _ _ x3 _ _ _
+];
+define register offset=0x100 size=4 [ r0 r1 r2 r3 ];
+
+define token opbyte(8)
+    op=(0, 7)
+;
+
+define token operands(8)
+    za=(4, 5) zb=(2, 3) zc=(0, 1)
+    xa=(4, 5) xb=(2, 3)
+    ra=(4, 5) rb=(2, 3) rc=(0, 1)
+;
+
+attach variables [ za zb zc ] [ z0 z1 z2 z3 ];
+attach variables [ xa xb ] [ x0 x1 x2 x3 ];
+attach variables [ ra rb rc ] [ r0 r1 r2 r3 ];
+
+:vadd za, zb, zc is op=0x01; za & zb & zc { za = zb + zc; }
+:vsub za, zb, zc is op=0x02; za & zb & zc { za = zb - zc; }
+:vmul za, zb, zc is op=0x03; za & zb & zc { za = zb * zc; }
+:vdiv za, zb, zc is op=0x04; za & zb & zc { za = zb / zc; }
+:vsdiv za, zb, zc is op=0x05; za & zb & zc { za = zb s/ zc; }
+:vsrem za, zb, zc is op=0x06; za & zb & zc { za = zb s% zc; }
+:vxor za, zb, zc is op=0x07; za & zb & zc { za = zb ^ zc; }
+:vnot za, zb is op=0x08; za & zb { za = ~zb; }
+:vneg za, zb is op=0x09; za & zb { za = -zb; }
+:vshl za, zb, rc is op=0x0a; za & zb & rc { za = zb << rc; }
+:vshr za, zb, rc is op=0x0b; za & zb & rc { za = zb >> rc; }
+:vsar za, zb, rc is op=0x0c; za & zb & rc { za = zb s>> rc; }
+:vslt ra, zb, zc is op=0x0d; ra & zb & zc { ra = zext(zb s< zc); }
+:vult ra, zb, zc is op=0x0e; ra & zb & zc { ra = zext(zb < zc); }
+:vcarry ra, zb, zc is op=0x0f; ra & zb & zc { ra = zext(carry(zb, zc)); }
+:vscarry ra, zb, zc is op=0x10; ra & zb & zc { ra = zext(scarry(zb, zc)); }
+:vsborrow ra, zb, zc is op=0x11; ra & zb & zc { ra = zext(sborrow(zb, zc)); }
+:vpopcnt ra, zb is op=0x12; ra & zb { ra = popcount(zb); }
+:vlzcnt ra, zb is op=0x13; ra & zb { ra = lzcount(zb); }
+:vzext za, xb is op=0x14; za & xb { za = zext(xb); }
+:vsext za, rb is op=0x15; za & rb { za = sext(rb); }
+:vlo xa, zb is op=0x16; xa & zb { xa = zb:16; }
+:vhi xa, zb is op=0x17; xa & zb { xa = zb(48); }
+:vld za, [rb] is op=0x18; za & rb { za = *:64 rb; }
+:vst [ra], zb is op=0x19; ra & zb { *:64 ra = zb; }
+:vones za is op=0x1a; za { za = ~0; }
+:vdec za is op=0x1b; za { za = za + -1; }

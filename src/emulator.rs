@@ -4,11 +4,10 @@ use anyhow::{anyhow, bail, Context as _, Result};
 
 use sleigh_rs::{Endian, Sleigh, SpaceId, UserFunctionId};
 
+use crate::bigint::BigInt;
 use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
-use crate::pcode::{
-    size_mask, BranchTarget, DisplayVarnode, OpCode, PcodeOp, Varnode, VarnodeSpace,
-};
+use crate::pcode::{BranchTarget, DisplayVarnode, OpCode, PcodeOp, Varnode, VarnodeSpace};
 use crate::space::{HashSpace, MemoryRegion};
 use crate::value::{Address, Ref};
 
@@ -16,8 +15,8 @@ use crate::value::{Address, Ref};
 const FALLBACK_INSTRUCTION_LEN: usize = 16;
 
 /// Handler for a user defined p-code op: gets the state and the input values, returns the
-/// output value if the op has one
-pub type UserOp = Box<dyn FnMut(&mut State, &[u64]) -> Result<Option<u64>>>;
+/// output value if the op has one, which is resized to the output
+pub type UserOp = Box<dyn FnMut(&mut State, &[BigInt]) -> Result<Option<BigInt>>>;
 
 pub struct Cpu<'sleigh> {
     pub sleigh: &'sleigh Sleigh,
@@ -65,7 +64,7 @@ impl<'sleigh> Cpu<'sleigh> {
     pub fn register_user_op(
         &mut self,
         name: &str,
-        handler: impl FnMut(&mut State, &[u64]) -> Result<Option<u64>> + 'static,
+        handler: impl FnMut(&mut State, &[BigInt]) -> Result<Option<BigInt>> + 'static,
     ) {
         self.user_ops.insert(name.to_string(), Box::new(handler));
     }
@@ -172,13 +171,17 @@ impl State {
     }
 }
 
-fn read_value(region: &dyn MemoryRegion, endian: Endian, address: u64, size: u32) -> Result<u64> {
+fn read_value(
+    region: &dyn MemoryRegion,
+    endian: Endian,
+    address: u64,
+    size: u32,
+) -> Result<BigInt> {
     let mut bytes = vec![0u8; size as usize];
     region.read(Address(address), &mut bytes)?;
-    let fold = |value: u64, byte: &u8| (value << 8) | *byte as u64;
     Ok(match endian {
-        Endian::Big => bytes.iter().fold(0, fold),
-        Endian::Little => bytes.iter().rev().fold(0, fold),
+        Endian::Big => BigInt::from_be_bytes(&bytes),
+        Endian::Little => BigInt::from_le_bytes(&bytes),
     })
 }
 
@@ -187,23 +190,14 @@ fn write_value(
     endian: Endian,
     address: u64,
     size: u32,
-    value: u64,
+    value: &BigInt,
 ) -> Result<()> {
+    let value = value.resize(size);
     let bytes = match endian {
-        Endian::Big => value.to_be_bytes()[8 - size as usize..].to_vec(),
-        Endian::Little => value.to_le_bytes()[..size as usize].to_vec(),
+        Endian::Big => value.to_be_bytes(),
+        Endian::Little => value.to_le_bytes(),
     };
     region.write(Address(address), &bytes)
-}
-
-fn sign_extend(value: u64, size: u32) -> i64 {
-    crate::value::sign_extend(value, 8 * size.min(8))
-}
-
-/// Mask with the low `bits` bits set
-fn bit_mask(bits: u64) -> u64 {
-    1u64.checked_shl(bits.try_into().unwrap_or(u32::MAX))
-        .map_or(u64::MAX, |bit| bit - 1)
 }
 
 /// Runs the p-code of one instruction
@@ -215,13 +209,10 @@ struct PcodeExecutor<'e> {
 }
 
 impl PcodeExecutor<'_> {
-    fn read(&mut self, varnode: &Varnode) -> Result<u64> {
-        if varnode.size > 8 {
-            bail!("varnode {:?} is wider than 8 bytes", varnode);
-        }
+    fn read(&mut self, varnode: &Varnode) -> Result<BigInt> {
         let endian = self.sleigh.endian();
         Ok(match varnode.space {
-            VarnodeSpace::Const => varnode.offset & size_mask(varnode.size),
+            VarnodeSpace::Const => BigInt::from_u64(varnode.offset, varnode.size),
             VarnodeSpace::Unique => {
                 read_value(&self.uniques, endian, varnode.offset, varnode.size)?
             }
@@ -234,12 +225,8 @@ impl PcodeExecutor<'_> {
         })
     }
 
-    fn write(&mut self, varnode: &Varnode, value: u64) -> Result<()> {
-        if varnode.size > 8 {
-            bail!("varnode {:?} is wider than 8 bytes", varnode);
-        }
+    fn write(&mut self, varnode: &Varnode, value: &BigInt) -> Result<()> {
         let endian = self.sleigh.endian();
-        let value = value & size_mask(varnode.size);
         match varnode.space {
             VarnodeSpace::Const => bail!("write to constant {:?}", varnode),
             VarnodeSpace::Unique => write_value(
@@ -259,7 +246,7 @@ impl PcodeExecutor<'_> {
         }
     }
 
-    fn input(&mut self, op: &PcodeOp, index: usize) -> Result<u64> {
+    fn input(&mut self, op: &PcodeOp, index: usize) -> Result<BigInt> {
         let varnode = op
             .inputs
             .get(index)
@@ -311,31 +298,30 @@ impl PcodeExecutor<'_> {
         let flow = match op.opcode {
             Branch | Call => self.target(op)?,
             CBranch => {
-                if self.input(op, 1)? != 0 {
+                if !self.input(op, 1)?.is_zero() {
                     self.target(op)?
                 } else {
                     Flow::Next
                 }
             }
-            BranchInd | CallInd | Return => Flow::Address(self.input(op, 0)?),
+            BranchInd | CallInd | Return => Flow::Address(self.input(op, 0)?.to_u64()),
             Store => {
                 let space = SpaceId(op.inputs[0].offset as usize);
-                let address = self.input(op, 1)?;
+                let address = self.input(op, 1)?.to_u64();
                 let value = self.input(op, 2)?;
-                let size = op.inputs[2].size;
                 write_value(
                     self.state.space(space).as_mut(),
                     self.sleigh.endian(),
                     address,
-                    size,
-                    value,
+                    value.size(),
+                    &value,
                 )?;
                 Flow::Next
             }
             _ => {
                 let value = self.evaluate(op)?;
                 match (&op.output, value) {
-                    (Some(output), Some(value)) => self.write(output, value)?,
+                    (Some(output), Some(value)) => self.write(output, &value)?,
                     (Some(output), None) => {
                         bail!("{} produced no value for {:?}", op.opcode.name(), output)
                     }
@@ -347,24 +333,18 @@ impl PcodeExecutor<'_> {
         Ok(flow)
     }
 
-    /// The value of an op that produces one
-    fn evaluate(&mut self, op: &PcodeOp) -> Result<Option<u64>> {
+    /// The value of an op that produces one, of any size: writing it to the output resizes it
+    fn evaluate(&mut self, op: &PcodeOp) -> Result<Option<BigInt>> {
         use OpCode::*;
-        let in_size = op
-            .inputs
-            .get(1)
-            .or(op.inputs.first())
-            .map_or(8, |input| input.size);
         let size = op.inputs.first().map_or(8, |input| input.size);
-        let bits = 8 * size as u64;
-        let mask = size_mask(size);
+        let out_size = op.output.map_or(size, |output| output.size);
         let a = |executor: &mut Self| executor.input(op, 0);
         let b = |executor: &mut Self| executor.input(op, 1);
         let value = match op.opcode {
-            Copy => a(self)?,
+            Copy | IntZExt => a(self)?,
             Load => {
                 let space = SpaceId(op.inputs[0].offset as usize);
-                let address = self.input(op, 1)?;
+                let address = self.input(op, 1)?.to_u64();
                 let output = op.output.context("LOAD without output")?;
                 read_value(
                     self.state.space(space).as_ref(),
@@ -387,86 +367,69 @@ impl PcodeExecutor<'_> {
                     .with_context(|| format!("no handler for user op {:?}", name))?;
                 return handler(self.state, &args);
             }
-            IntEqual => (a(self)? == b(self)?) as u64,
-            IntNotEqual => (a(self)? != b(self)?) as u64,
-            IntLess => (a(self)? < b(self)?) as u64,
-            IntLessEqual => (a(self)? <= b(self)?) as u64,
-            IntSLess => (sign_extend(a(self)?, size) < sign_extend(b(self)?, in_size)) as u64,
-            IntSLessEqual => (sign_extend(a(self)?, size) <= sign_extend(b(self)?, in_size)) as u64,
-            IntZExt => a(self)?,
-            IntSExt => sign_extend(a(self)?, size) as u64,
-            IntAdd => a(self)?.wrapping_add(b(self)?),
-            IntSub => a(self)?.wrapping_sub(b(self)?),
-            IntMult => a(self)?.wrapping_mul(b(self)?),
+            IntEqual => BigInt::from_bool(a(self)?.ucmp(&b(self)?).is_eq()),
+            IntNotEqual => BigInt::from_bool(a(self)?.ucmp(&b(self)?).is_ne()),
+            IntLess => BigInt::from_bool(a(self)?.ucmp(&b(self)?).is_lt()),
+            IntLessEqual => BigInt::from_bool(a(self)?.ucmp(&b(self)?).is_le()),
+            IntSLess => BigInt::from_bool(a(self)?.scmp(&b(self)?).is_lt()),
+            IntSLessEqual => BigInt::from_bool(a(self)?.scmp(&b(self)?).is_le()),
+            IntSExt => a(self)?.sext(out_size),
+            IntAdd => a(self)? + b(self)?,
+            IntSub => a(self)? - b(self)?,
+            IntMult => a(self)? * b(self)?,
             IntDiv | IntRem | IntSDiv | IntSRem => {
                 let (a, b) = (a(self)?, b(self)?);
-                if b == 0 {
-                    bail!("{}: division by zero", op.opcode.name());
+                let (quotient, remainder) = match op.opcode {
+                    IntDiv | IntRem => a.udiv_rem(&b),
+                    _ => a.sdiv_rem(&b),
                 }
-                let (sa, sb) = (sign_extend(a, size), sign_extend(b, size));
+                .with_context(|| format!("{}: division by zero", op.opcode.name()))?;
                 match op.opcode {
-                    IntDiv => a / b,
-                    IntRem => a % b,
-                    IntSDiv => sa.wrapping_div(sb) as u64,
-                    _ => sa.wrapping_rem(sb) as u64,
+                    IntDiv | IntSDiv => quotient,
+                    _ => remainder,
                 }
             }
-            IntCarry => (a(self)? as u128 + b(self)? as u128 > mask as u128) as u64,
+            IntCarry => BigInt::from_bool(a(self)?.carry(&b(self)?)),
             IntSCarry | IntSBorrow => {
                 let (a, b) = (a(self)?, b(self)?);
-                let result = if op.opcode == IntSCarry {
-                    a.wrapping_add(b)
+                let (sa, sb) = (a.is_negative(), b.resize(size).is_negative());
+                let sr = if op.opcode == IntSCarry { a + b } else { a - b }.is_negative();
+                BigInt::from_bool(if op.opcode == IntSCarry {
+                    sa == sb && sr != sa
                 } else {
-                    a.wrapping_sub(b)
-                } & mask;
-                let sign = |value: u64| (value >> (bits - 1)) & 1;
-                let (sa, sb, sr) = (sign(a), sign(b), sign(result));
-                if op.opcode == IntSCarry {
-                    (sa == sb && sr != sa) as u64
-                } else {
-                    (sa != sb && sr != sa) as u64
-                }
+                    sa != sb && sr != sa
+                })
             }
-            Int2Comp => a(self)?.wrapping_neg(),
+            Int2Comp => -a(self)?,
             IntNegate => !a(self)?,
             IntXor => a(self)? ^ b(self)?,
             IntAnd => a(self)? & b(self)?,
             IntOr => a(self)? | b(self)?,
-            IntLeft => a(self)?
-                .checked_shl(b(self)?.try_into().unwrap_or(u32::MAX))
-                .unwrap_or(0),
-            IntRight => a(self)?
-                .checked_shr(b(self)?.try_into().unwrap_or(u32::MAX))
-                .unwrap_or(0),
-            IntSRight => {
-                let shift = b(self)?.min(63) as u32;
-                (sign_extend(a(self)?, size) >> shift) as u64
-            }
-            BoolNegate => (a(self)? == 0) as u64,
-            BoolXor => ((a(self)? != 0) ^ (b(self)? != 0)) as u64,
-            BoolAnd => ((a(self)? != 0) & (b(self)? != 0)) as u64,
-            BoolOr => ((a(self)? != 0) | (b(self)? != 0)) as u64,
+            IntLeft => a(self)? << b(self)?.to_shift(),
+            IntRight => a(self)? >> b(self)?.to_shift(),
+            IntSRight => a(self)?.sar(b(self)?.to_shift()),
+            BoolNegate => BigInt::from_bool(a(self)?.is_zero()),
+            BoolXor => BigInt::from_bool(!a(self)?.is_zero() ^ !b(self)?.is_zero()),
+            BoolAnd => BigInt::from_bool(!a(self)?.is_zero() & !b(self)?.is_zero()),
+            BoolOr => BigInt::from_bool(!a(self)?.is_zero() | !b(self)?.is_zero()),
             Piece => {
-                let low_bits = 8 * op.inputs[1].size;
-                a(self)?.checked_shl(low_bits).unwrap_or(0) | b(self)?
+                let low_bits = 8 * op.inputs[1].size as u64;
+                (a(self)?.resize(out_size) << low_bits) | b(self)?
             }
-            Subpiece => a(self)?.checked_shr(8 * b(self)? as u32).unwrap_or(0),
-            PtrAdd => a(self)?.wrapping_add(b(self)?.wrapping_mul(self.input(op, 2)?)),
-            PtrSub => a(self)?.wrapping_add(b(self)?),
+            Subpiece => a(self)? >> b(self)?.to_shift().saturating_mul(8),
+            PtrAdd => a(self)? + b(self)? * self.input(op, 2)?,
+            PtrSub => a(self)? + b(self)?,
             Insert => {
-                let (position, bits) = (self.input(op, 2)?, self.input(op, 3)?);
-                let position = position.try_into().unwrap_or(u32::MAX);
-                let field = bit_mask(bits).checked_shl(position).unwrap_or(0);
-                let value = b(self)?.checked_shl(position).unwrap_or(0);
-                (a(self)? & !field) | (value & field)
+                let (position, bits) = (self.input(op, 2)?.to_shift(), self.input(op, 3)?);
+                let field = !(BigInt::ones(size) << bits.to_shift()) << position;
+                (a(self)? & !field.clone()) | ((b(self)?.resize(size) << position) & field)
             }
             Extract => {
-                let (position, bits) = (b(self)?, self.input(op, 2)?);
-                let position = position.try_into().unwrap_or(u32::MAX);
-                a(self)?.checked_shr(position).unwrap_or(0) & bit_mask(bits)
+                let (position, bits) = (b(self)?.to_shift(), self.input(op, 2)?.to_shift());
+                (a(self)? >> position) & !(BigInt::ones(size) << bits)
             }
-            Popcount => a(self)?.count_ones() as u64,
-            Lzcount => (a(self)?.leading_zeros() - (64 - bits as u32)) as u64,
+            Popcount => BigInt::from_u64(a(self)?.popcount() as u64, out_size),
+            Lzcount => BigInt::from_u64(a(self)?.lzcount() as u64, out_size),
             Branch | CBranch | BranchInd | Call | CallInd | Return | Store => {
                 unreachable!("handled by execute_op")
             }
@@ -635,8 +598,9 @@ mod test {
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
-    /// Run `opcode` on `inputs` with the executor directly, the output is a `size` byte unique
-    fn evaluate(sleigh: &Sleigh, opcode: OpCode, size: u32, inputs: &[Varnode]) -> Result<u64> {
+    /// Run `opcode` with the executor directly. The inputs are put in uniques, the output is a
+    /// `size` byte unique.
+    fn evaluate(sleigh: &Sleigh, opcode: OpCode, size: u32, inputs: &[BigInt]) -> Result<BigInt> {
         let mut state = State::new();
         let mut user_ops = HashMap::new();
         let mut executor = PcodeExecutor {
@@ -645,44 +609,35 @@ mod test {
             user_ops: &mut user_ops,
             uniques: HashSpace::new(),
         };
-        let output = Varnode {
+        let unique = |index: usize, size: u32| Varnode {
             space: VarnodeSpace::Unique,
-            offset: 0x100,
+            offset: 0x100 * index as u64,
             size,
         };
+        let mut varnodes = vec![];
+        for (index, input) in inputs.iter().enumerate() {
+            let varnode = unique(index + 1, input.size());
+            executor.write(&varnode, input)?;
+            varnodes.push(varnode);
+        }
+        let output = unique(0, size);
         let op = PcodeOp {
             opcode,
             output: Some(output),
-            inputs: inputs.to_vec(),
+            inputs: varnodes,
         };
         executor.execute(&[op], 0)?;
         executor.read(&output)
     }
 
-    #[test]
-    fn hand_built_ops() {
-        let sleigh = load("examples/cisc.slaspec");
-        let c = Varnode::constant;
-        use OpCode::*;
-        #[rustfmt::skip]
-        let cases: &[(OpCode, u32, &[Varnode], u64)] = &[
-            (Piece, 4, &[c(0x1234, 2), c(0x5678, 2)], 0x12345678),
-            (Piece, 3, &[c(0xab, 1), c(0xcdef, 2)], 0xabcdef),
-            (Piece, 8, &[c(0x1, 4), c(0x2, 4)], 0x1_0000_0002),
-            (PtrAdd, 4, &[c(0x1000, 4), c(3, 4), c(8, 4)], 0x1018),
-            (PtrAdd, 4, &[c(0x1000, 4), c(0xffffffff, 4), c(4, 4)], 0xffc),
-            (PtrSub, 4, &[c(0x1000, 4), c(0x10, 4)], 0x1010),
-            (Insert, 4, &[c(0xffffffff, 4), c(0x5, 4), c(4, 4), c(3, 4)], 0xffffffdf),
-            (Insert, 4, &[c(0, 4), c(0xff, 4), c(28, 4), c(8, 4)], 0xf0000000),
-            (Extract, 4, &[c(0x12345678, 4), c(8, 4), c(12, 4)], 0x456),
-            (Extract, 4, &[c(0x80000000, 4), c(31, 4), c(1, 4)], 1),
-        ];
+    /// Each case is (opcode, output size, inputs, expected output)
+    fn assert_evaluates(sleigh: &Sleigh, cases: &[(OpCode, u32, Vec<BigInt>, BigInt)]) {
         let mut failures = vec![];
         for (opcode, size, inputs, expected) in cases {
-            match evaluate(&sleigh, *opcode, *size, inputs) {
+            match evaluate(sleigh, *opcode, *size, inputs) {
                 Ok(value) if value == *expected => {}
                 result => failures.push(format!(
-                    "{} {:?}: {:x?}, expected {:#x}",
+                    "{} {:?}: {:?}, expected {:?}",
                     opcode.name(),
                     inputs,
                     result,
@@ -691,8 +646,28 @@ mod test {
             }
         }
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
 
-        let err = evaluate(&sleigh, MultiEqual, 4, &[c(1, 4), c(2, 4)]).unwrap_err();
+    #[test]
+    fn hand_built_ops() {
+        let sleigh = load("examples/cisc.slaspec");
+        let n = BigInt::from_u64;
+        use OpCode::*;
+        #[rustfmt::skip]
+        assert_evaluates(&sleigh, &[
+            (Piece, 4, vec![n(0x1234, 2), n(0x5678, 2)], n(0x12345678, 4)),
+            (Piece, 3, vec![n(0xab, 1), n(0xcdef, 2)], n(0xabcdef, 3)),
+            (Piece, 8, vec![n(0x1, 4), n(0x2, 4)], n(0x1_0000_0002, 8)),
+            (PtrAdd, 4, vec![n(0x1000, 4), n(3, 4), n(8, 4)], n(0x1018, 4)),
+            (PtrAdd, 4, vec![n(0x1000, 4), n(0xffffffff, 4), n(4, 4)], n(0xffc, 4)),
+            (PtrSub, 4, vec![n(0x1000, 4), n(0x10, 4)], n(0x1010, 4)),
+            (Insert, 4, vec![n(0xffffffff, 4), n(0x5, 4), n(4, 4), n(3, 4)], n(0xffffffdf, 4)),
+            (Insert, 4, vec![n(0, 4), n(0xff, 4), n(28, 4), n(8, 4)], n(0xf0000000, 4)),
+            (Extract, 4, vec![n(0x12345678, 4), n(8, 4), n(12, 4)], n(0x456, 4)),
+            (Extract, 4, vec![n(0x80000000, 4), n(31, 4), n(1, 4)], n(1, 4)),
+        ]);
+
+        let err = evaluate(&sleigh, MultiEqual, 4, &[n(1, 4), n(2, 4)]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "MULTIEQUAL is an analysis op and cannot be emulated"
@@ -878,12 +853,12 @@ mod test {
         let output = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
         let out = output.clone();
         cpu.register_user_op("out", move |_state, args| {
-            out.borrow_mut().extend_from_slice(args);
+            out.borrow_mut().extend(args.iter().map(BigInt::to_u64));
             Ok(None)
         });
         cpu.register_user_op("in", |_state, args| {
             assert!(args.is_empty());
-            Ok(Some(0x42))
+            Ok(Some(BigInt::from_u64(0x42, 4)))
         });
         set_reg(&mut cpu, "r3", 0x1234);
 
@@ -1011,7 +986,7 @@ mod test {
         let output = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
         let out = output.clone();
         cpu.register_user_op("out", move |_state, args| {
-            out.borrow_mut().extend_from_slice(args);
+            out.borrow_mut().extend(args.iter().map(BigInt::to_u64));
             Ok(None)
         });
 
@@ -1151,6 +1126,134 @@ mod test {
     #[test]
     fn crc32_8051() {
         assert_crc32("8051", "DPTR", "R2", "R4R5R6R7");
+    }
+
+    /// Write `value` to a register of any size, in the spec's byte order
+    fn set_wide(cpu: &mut Cpu, name: &str, value: &BigInt) {
+        let reg = reg_ref(cpu, name);
+        let value = value.resize(reg.1 as u32);
+        let bytes = match cpu.endian() {
+            Endian::Big => value.to_be_bytes(),
+            Endian::Little => value.to_le_bytes(),
+        };
+        cpu.state.write_ref(reg, &bytes).unwrap();
+    }
+
+    /// Read a register of any size, in the spec's byte order
+    fn get_wide(cpu: &mut Cpu, name: &str) -> BigInt {
+        let reg = reg_ref(cpu, name);
+        let mut bytes = vec![0u8; reg.1];
+        cpu.state.read_ref(reg, &mut bytes).unwrap();
+        match cpu.endian() {
+            Endian::Big => BigInt::from_be_bytes(&bytes),
+            Endian::Little => BigInt::from_le_bytes(&bytes),
+        }
+    }
+
+    /// (asm, bytes, registers before, registers after), values are resized to the registers
+    type WideCase<'a> = (
+        &'a str,
+        Vec<u8>,
+        Vec<(&'a str, BigInt)>,
+        Vec<(&'a str, BigInt)>,
+    );
+
+    /// Like `assert_executes` for registers of any size
+    fn assert_executes_wide(sleigh: &Sleigh, tests: &[WideCase]) {
+        let mut failures = vec![];
+        for (asm, program, regs_in, regs_out) in tests.iter() {
+            let mut cpu = new_cpu(sleigh, program);
+            match cpu
+                .disassembler
+                .disassemble(BASE, &Context::new(sleigh), program)
+            {
+                Ok(instruction) if instruction.to_string() == *asm => {}
+                result => failures.push(format!(
+                    "{:?}: disassembles as {:?}",
+                    asm,
+                    result.map(|instruction| instruction.to_string())
+                )),
+            }
+            for (name, value) in regs_in.iter() {
+                set_wide(&mut cpu, name, value);
+            }
+            if let Err(err) = cpu.step() {
+                failures.push(format!("{:?}: step failed: {:#}", asm, err));
+                continue;
+            }
+            for (name, expected) in regs_out.iter() {
+                let actual = get_wide(&mut cpu, name);
+                let expected = expected.resize(actual.size());
+                if actual != expected {
+                    failures.push(format!(
+                        "{:?}: {} = {:?}, expected {:?}",
+                        asm, name, actual, expected
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn wide_registers() {
+        let sleigh = load("examples/wide.slaspec");
+        let n = |value: u64| BigInt::from_u64(value, 64);
+        let p = |bit: u64| n(1) << bit;
+        let ones = || BigInt::ones(64);
+        #[rustfmt::skip]
+        assert_executes_wide(&sleigh, &[
+            ("vadd z0, z1, z2", vec![0x01, 0x06], vec![("z1", p(448) - n(1)), ("z2", n(1))], vec![("z0", p(448))]),
+            ("vsub z0, z1, z2", vec![0x02, 0x06], vec![("z1", n(0)), ("z2", n(1))], vec![("z0", ones())]),
+            ("vmul z0, z1, z2", vec![0x03, 0x06], vec![("z1", p(256) + n(1)), ("z2", p(200))], vec![("z0", p(456) + p(200))]),
+            ("vmul z0, z1, z2", vec![0x03, 0x06], vec![("z1", p(511)), ("z2", n(2))], vec![("z0", n(0))]),
+            ("vdiv z0, z1, z2", vec![0x04, 0x06], vec![("z1", ones()), ("z2", p(256))], vec![("z0", p(256) - n(1))]),
+            ("vsdiv z0, z1, z2", vec![0x05, 0x06], vec![("z1", -p(300)), ("z2", p(100))], vec![("z0", -p(200))]),
+            ("vsrem z0, z1, z2", vec![0x06, 0x06], vec![("z1", -n(7)), ("z2", n(2))], vec![("z0", ones())]),
+            ("vxor z0, z1, z2", vec![0x07, 0x06], vec![("z1", ones()), ("z2", p(511))], vec![("z0", p(511) - n(1))]),
+            ("vnot z0, z1", vec![0x08, 0x04], vec![("z1", n(0))], vec![("z0", ones())]),
+            ("vneg z0, z1", vec![0x09, 0x04], vec![("z1", n(1))], vec![("z0", ones())]),
+            ("vshl z0, z1, r3", vec![0x0a, 0x07], vec![("z1", n(1)), ("r3", n(500))], vec![("z0", p(500))]),
+            ("vshl z0, z1, r3", vec![0x0a, 0x07], vec![("z0", n(5)), ("z1", n(1)), ("r3", n(512))], vec![("z0", n(0))]),
+            ("vshr z0, z1, r3", vec![0x0b, 0x07], vec![("z1", p(511)), ("r3", n(511))], vec![("z0", n(1))]),
+            ("vsar z0, z1, r3", vec![0x0c, 0x07], vec![("z1", p(511)), ("r3", n(500))], vec![("z0", -p(11))]),
+            ("vslt r0, z1, z2", vec![0x0d, 0x06], vec![("z1", ones()), ("z2", n(1))], vec![("r0", n(1))]),
+            ("vult r0, z1, z2", vec![0x0e, 0x06], vec![("r0", n(5)), ("z1", ones()), ("z2", n(1))], vec![("r0", n(0))]),
+            ("vcarry r0, z1, z2", vec![0x0f, 0x06], vec![("z1", ones()), ("z2", n(1))], vec![("r0", n(1))]),
+            ("vcarry r0, z1, z2", vec![0x0f, 0x06], vec![("z1", p(511)), ("z2", p(510))], vec![("r0", n(0))]),
+            ("vscarry r0, z1, z2", vec![0x10, 0x06], vec![("z1", p(511) - n(1)), ("z2", n(1))], vec![("r0", n(1))]),
+            ("vsborrow r0, z1, z2", vec![0x11, 0x06], vec![("z1", p(511)), ("z2", n(1))], vec![("r0", n(1))]),
+            ("vsborrow r0, z1, z2", vec![0x11, 0x06], vec![("r0", n(5)), ("z1", ones()), ("z2", n(1))], vec![("r0", n(0))]),
+            ("vpopcnt r0, z1", vec![0x12, 0x04], vec![("z1", ones())], vec![("r0", n(512))]),
+            ("vlzcnt r0, z1", vec![0x13, 0x04], vec![("z1", p(300))], vec![("r0", n(211))]),
+            ("vzext z0, x1", vec![0x14, 0x04], vec![("z0", ones()), ("z1", ones())], vec![("z0", p(128) - n(1))]),
+            ("vsext z0, r1", vec![0x15, 0x04], vec![("r1", n(0x80000000))], vec![("z0", -p(31))]),
+            ("vlo x0, z1", vec![0x16, 0x04], vec![("z0", ones()), ("z1", p(448) + n(0x1234))], vec![("x0", n(0x1234)), ("z0", (ones() << 128) + n(0x1234))]),
+            ("vhi x0, z1", vec![0x17, 0x04], vec![("z1", n(0xabcd) << 384)], vec![("x0", n(0xabcd))]),
+            ("vones z0", vec![0x1a, 0x00], vec![], vec![("z0", ones())]),
+            ("vdec z0", vec![0x1b, 0x00], vec![("z0", p(300))], vec![("z0", p(300) - n(1))]),
+        ]);
+    }
+
+    #[test]
+    fn wide_memory() {
+        let sleigh = load("examples/wide.slaspec");
+        #[rustfmt::skip]
+        let mut cpu = new_cpu(&sleigh, &[
+            0x19, 0x04, // vst [r0], z1
+            0x18, 0x20, // vld z2, [r0]
+        ]);
+        let bytes: Vec<u8> = (1..=64).collect();
+        let value = BigInt::from_le_bytes(&bytes);
+        set_wide(&mut cpu, "z1", &value);
+        set_wide(&mut cpu, "r0", &BigInt::from_u64(0x2000, 4));
+        cpu.step().unwrap();
+        cpu.step().unwrap();
+        assert_eq!(get_wide(&mut cpu, "z2"), value);
+        let mut memory = vec![0u8; 64];
+        let memory_ref = Ref(cpu.default_space(), 64, Address(0x2000));
+        cpu.state.read_ref(memory_ref, &mut memory).unwrap();
+        assert_eq!(memory, bytes);
     }
 
     /// A little endian 32-bit register, the context example is little endian

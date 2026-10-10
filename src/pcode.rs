@@ -1230,8 +1230,9 @@ impl<'s> Lifter<'s> {
     }
 
     fn unary(&mut self, op: &Unary, input: Varnode, size: u32) -> LiftResult<Varnode> {
-        // Constant folding keeps disassembly time values constant
-        if input.is_const() {
+        // Constant folding keeps disassembly time values constant. Constants hold 64 bits, so
+        // wider values are left to the emulator.
+        if input.is_const() && input.size <= 8 && size <= 8 {
             let value = input.offset;
             let folded = match op {
                 Unary::Zext(_) | Unary::TakeLsb(_) => Some(value),
