@@ -440,17 +440,21 @@ impl<'s> Lifter<'s> {
             .ok_or_else(|| LiftError::Invalid(format!("token field {} not decoded", id.0)))
     }
 
-    /// The register an attached token field selects
+    /// The register an attached token field or context variable selects
     fn attached(
         &self,
         scope: &Scope,
         attach_id: AttachVarnodeId,
         value: DynamicValueType,
     ) -> LiftResult<Varnode> {
-        let DynamicValueType::TokenField(token_field_id) = value else {
-            return unsupported(value);
+        let index = match value {
+            DynamicValueType::TokenField(token_field_id) => {
+                self.token_field(scope, token_field_id)?
+            }
+            DynamicValueType::Context(context_id) => {
+                scope.table.context.get(self.sleigh, context_id)
+            }
         };
-        let index = self.token_field(scope, token_field_id)?;
         let varnode_id = self
             .sleigh
             .attach_varnode(attach_id)
@@ -1001,7 +1005,11 @@ impl<'s> Lifter<'s> {
                 let range = bitrange.bits.start()..bitrange.bits.end().get();
                 self.read_bits(source, range, size())
             }
-            ExprValue::Context(_) | ExprValue::IntDynamic(_) => return unsupported(value),
+            ExprValue::Context(context) => Varnode::constant(
+                scope.table.context.get(self.sleigh, context.id) as u64,
+                bits_to_bytes(context.size.get()),
+            ),
+            ExprValue::IntDynamic(_) => return unsupported(value),
         })
     }
 
@@ -1168,13 +1176,12 @@ mod test {
     /// The disassembly and p-code text of an instruction at `address`
     fn lift_text(
         sleigh: &Sleigh,
+        context: &Context,
         address: u64,
         bytes: &[u8],
     ) -> (String, Result<Vec<String>, LiftError>) {
         let disassembler = Disassembler::new(sleigh);
-        let instruction = disassembler
-            .disassemble(address, &Context::new(sleigh), bytes)
-            .unwrap();
+        let instruction = disassembler.disassemble(address, context, bytes).unwrap();
         let pcode = instruction.pcode.clone().map(|ops| {
             ops.iter()
                 .map(|op| op.display(sleigh).to_string())
@@ -1185,9 +1192,18 @@ mod test {
 
     /// Each case is (bytes, disassembly, p-code), lifted at 0x1000
     fn assert_lifts(sleigh: &Sleigh, tests: &[(Vec<u8>, &str, &[&str])]) {
+        assert_lifts_in_context(sleigh, &Context::new(sleigh), tests)
+    }
+
+    /// Like `assert_lifts`, decoding with `context`
+    fn assert_lifts_in_context(
+        sleigh: &Sleigh,
+        context: &Context,
+        tests: &[(Vec<u8>, &str, &[&str])],
+    ) {
         let mut failures = vec![];
         for (bytes, expected_text, expected_pcode) in tests.iter() {
-            let (text, pcode) = lift_text(sleigh, 0x1000, bytes);
+            let (text, pcode) = lift_text(sleigh, context, 0x1000, bytes);
             let expected_pcode: Vec<String> =
                 expected_pcode.iter().map(|op| op.to_string()).collect();
             if text != *expected_text || pcode.as_ref() != Ok(&expected_pcode) {
@@ -1198,6 +1214,25 @@ mod test {
             }
         }
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn context_pcode() {
+        let sleigh = load("examples/context.slaspec");
+        let mut context = Context::new(&sleigh);
+        context.set(&sleigh, Context::id(&sleigh, "shift").unwrap(), 2);
+        #[rustfmt::skip]
+        assert_lifts_in_context(&sleigh, &context, &[
+            (vec![0x00, 0x00, 0x12, 0x05], "shl r1, r2, 0x2", &["r1 = INT_LEFT r2, 0x2:4"]),
+            (vec![0x07, 0x00, 0x18, 0x06], "mov r1, #0x7", &["r1 = COPY 0x7:4"]),
+            (vec![0x00, 0x00, 0x12, 0x06], "mov r1, r2", &["r1 = COPY r2"]),
+            (vec![0x00, 0x00, 0x00, 0x08], "inc r6", &["r6 = INT_ADD r6, 0x1:4"]),
+        ]);
+        context.set(&sleigh, Context::id(&sleigh, "bank").unwrap(), 1);
+        #[rustfmt::skip]
+        assert_lifts_in_context(&sleigh, &context, &[
+            (vec![0x00, 0x00, 0x00, 0x08], "inc r7", &["r7 = INT_ADD r7, 0x1:4"]),
+        ]);
     }
 
     #[test]
@@ -1277,7 +1312,7 @@ mod test {
         let sleigh = load(&path);
         std::fs::remove_file(&path).unwrap();
 
-        let (text, pcode) = lift_text(&sleigh, 0x1000, &[0x01]);
+        let (text, pcode) = lift_text(&sleigh, &Context::new(&sleigh), 0x1000, &[0x01]);
         assert_eq!(text, "dly");
         assert_eq!(
             pcode,
