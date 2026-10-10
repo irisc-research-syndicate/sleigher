@@ -117,6 +117,8 @@ pub enum OpCode {
     Subpiece,
     Popcount,
     Lzcount,
+    CPoolRef,
+    New,
 }
 
 impl OpCode {
@@ -184,6 +186,8 @@ impl OpCode {
             OpCode::Subpiece => "SUBPIECE",
             OpCode::Popcount => "POPCOUNT",
             OpCode::Lzcount => "LZCOUNT",
+            OpCode::CPoolRef => "CPOOLREF",
+            OpCode::New => "NEW",
         }
     }
 }
@@ -297,7 +301,8 @@ impl std::fmt::Display for DisplayPcodeOp<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiftError {
-    /// A construct the lifter does not handle (`newobject`, `cpool`, ...)
+    /// A construct the lifter does not handle. The lifter handles everything sleigh-rs
+    /// produces now, the variant is kept for API stability.
     Unsupported(String),
     /// The disassembled instruction is inconsistent with its constructor
     Invalid(String),
@@ -315,10 +320,6 @@ impl std::fmt::Display for LiftError {
 impl std::error::Error for LiftError {}
 
 type LiftResult<T> = Result<T, LiftError>;
-
-fn unsupported<T>(what: impl std::fmt::Debug) -> LiftResult<T> {
-    Err(LiftError::Unsupported(format!("{:?}", what)))
-}
 
 /// The bits of a `bits` wide value a partial write op selects, all of them without one
 fn assignment_bits(op: &Option<AssignmentOp>, bits: u64) -> LiftResult<std::ops::Range<u64>> {
@@ -364,6 +365,20 @@ struct Scope<'t> {
     block_labels: HashMap<BlockId, usize>,
 }
 
+impl<'t> Scope<'t> {
+    fn new(table: &'t DisassembledTable<'t>, inst_next: u64) -> Self {
+        Self {
+            table,
+            inst_next,
+            locals: HashMap::new(),
+            built: HashSet::new(),
+            exports: HashMap::new(),
+            export: None,
+            block_labels: HashMap::new(),
+        }
+    }
+}
+
 /// Lift the semantics of a disassembled instruction to p-code. `delayslot` runs the p-code of
 /// `delay_slots`, the instructions that follow, and `inst_next` is the address after them.
 pub fn lift<'s>(
@@ -371,14 +386,7 @@ pub fn lift<'s>(
     inst_next: u64,
     delay_slots: &'s [DisassembledTable<'s>],
 ) -> Result<Vec<PcodeOp>, LiftError> {
-    let mut lifter = Lifter {
-        sleigh: table.disassembler.sleigh,
-        delay_slots,
-        ops: vec![],
-        next_unique: 0,
-        labels: vec![],
-        fixups: vec![],
-    };
+    let mut lifter = Lifter::new(table.disassembler.sleigh, delay_slots);
     lifter.lift_table(table, inst_next)?;
     lifter.finish()
 }
@@ -395,6 +403,17 @@ struct Lifter<'s> {
 }
 
 impl<'s> Lifter<'s> {
+    fn new(sleigh: &'s Sleigh, delay_slots: &'s [DisassembledTable<'s>]) -> Self {
+        Self {
+            sleigh,
+            delay_slots,
+            ops: vec![],
+            next_unique: 0,
+            labels: vec![],
+            fixups: vec![],
+        }
+    }
+
     fn finish(mut self) -> LiftResult<Vec<PcodeOp>> {
         for (op_index, label) in self.fixups.iter() {
             let target = self.labels[*label]
@@ -568,15 +587,7 @@ impl<'s> Lifter<'s> {
         let Some(execution) = &table.constructor.execution else {
             return Ok(None);
         };
-        let mut scope = Scope {
-            table,
-            inst_next,
-            locals: HashMap::new(),
-            built: HashSet::new(),
-            exports: HashMap::new(),
-            export: None,
-            block_labels: HashMap::new(),
-        };
+        let mut scope = Scope::new(table, inst_next);
 
         // Subtables without an explicit `build` are built before the constructor's semantics
         let explicit_builds = execution
@@ -1052,7 +1063,22 @@ impl<'s> Lifter<'s> {
                 self.unary(&unary.op, input, size)
             }
             Expr::Value(element @ (ExprElement::New(_) | ExprElement::CPool(_))) => {
-                unsupported(element)
+                let (opcode, params) = match element {
+                    ExprElement::New(new) => (
+                        OpCode::New,
+                        std::iter::once(&*new.first)
+                            .chain(new.second.as_deref())
+                            .collect::<Vec<_>>(),
+                    ),
+                    ExprElement::CPool(cpool) => (OpCode::CPoolRef, cpool.params.iter().collect()),
+                    _ => unreachable!(),
+                };
+                let inputs = params
+                    .into_iter()
+                    .map(|param| self.expr(scope, param, None))
+                    .collect::<LiftResult<Vec<_>>>()?;
+                let size = size_hint.unwrap_or(self.sleigh.addr_bytes().get() as u32);
+                Ok(self.op(opcode, size, inputs))
             }
             Expr::Op(binary) => {
                 let size = bits_to_bytes(binary.len_bits.get());
@@ -1476,6 +1502,65 @@ mod test {
             (vec![0x0d, 0x01], "adds r0, 0x8", &["r0 = INT_ADD r0, 0x8:4"]),
             (vec![0x0d, 0x02], "adds r0, -0x1", &["r0 = INT_ADD r0, 0xffffffff:4"]),
         ]);
+    }
+
+    #[test]
+    fn new_and_cpool_pcode() {
+        use sleigh_rs::execution::{ExprCPool, ExprNew};
+        // sleigh-rs cannot size `newobject` and `cpool` yet and panics on specs using them, so
+        // build them by hand from the operands of `r0 = r0 + sel`
+        let sleigh = load("examples/pcode.slaspec");
+        let disassembler = Disassembler::new(&sleigh);
+        let instruction = disassembler
+            .disassemble(0x1000, &Context::new(&sleigh), &[0x0d, 0x01])
+            .unwrap();
+        let execution = instruction.table.constructor.execution.as_ref().unwrap();
+        let Statement::Assignment(assignment) =
+            &execution.block(execution.entry_block).statements[0]
+        else {
+            panic!("adds is not an assignment");
+        };
+        let Expr::Op(binary) = &assignment.right else {
+            panic!("adds does not add");
+        };
+        let Expr::Value(ExprElement::Value { location, .. }) = &*binary.left else {
+            panic!("adds does not read r0");
+        };
+        let exprs = [
+            Expr::Value(ExprElement::New(ExprNew {
+                location: location.clone(),
+                first: binary.left.clone(),
+                second: None,
+            })),
+            Expr::Value(ExprElement::New(ExprNew {
+                location: location.clone(),
+                first: binary.left.clone(),
+                second: Some(binary.right.clone()),
+            })),
+            Expr::Value(ExprElement::CPool(ExprCPool {
+                location: location.clone(),
+                params: vec![(*binary.left).clone(), (*binary.right).clone()].into(),
+            })),
+        ];
+
+        let mut lifter = Lifter::new(&sleigh, &[]);
+        let mut scope = Scope::new(&instruction.table, instruction.table.inst_next);
+        for expr in exprs.iter() {
+            lifter.expr(&mut scope, expr, Some(4)).unwrap();
+        }
+        let pcode: Vec<String> = lifter
+            .ops
+            .iter()
+            .map(|op| op.display(&sleigh).to_string())
+            .collect();
+        assert_eq!(
+            pcode,
+            [
+                "$U0:4 = NEW r0",
+                "$U8:4 = NEW r0, 0x8:4",
+                "$U10:4 = CPOOLREF r0, 0x8:4"
+            ]
+        );
     }
 
     #[test]
