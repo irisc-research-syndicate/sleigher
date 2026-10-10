@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -115,8 +116,10 @@ pub struct ContextCommit {
 pub struct ContextFlow {
     /// The context the next instruction starts from, before the commits to its address.
     /// Unlike Ghidra's context, which is kept by address, it follows the instructions in the
-    /// order they are visited.
+    /// order they are visited, unless context was flowed to the address with `flow_to`.
     pub next: Context,
+    /// The context kept for addresses `flow_to` reached first
+    flowed: HashMap<u64, Context>,
     commits: HashMap<u64, HashMap<ContextId, i64>>,
 }
 
@@ -124,28 +127,47 @@ impl ContextFlow {
     pub fn new(context: Context) -> Self {
         Self {
             next: context,
+            flowed: HashMap::new(),
             commits: HashMap::new(),
         }
     }
 
     /// The context to decode the instruction at `address` with
     pub fn at(&self, sleigh: &Sleigh, address: u64) -> Context {
-        let mut context = self.next.clone();
+        let mut context = self.flowed.get(&address).unwrap_or(&self.next).clone();
         for (&id, &value) in self.commits.get(&address).into_iter().flatten() {
             context.set(sleigh, id, value);
         }
         context
     }
 
-    /// Move on from an instruction decoded with `context` that made `commits`. Its own
-    /// context changes do not flow on, only what it commits.
-    pub fn advance(&mut self, sleigh: &Sleigh, mut context: Context, commits: &[ContextCommit]) {
+    /// Keep `next` for `address`, as Ghidra keeps context by address, unless some context
+    /// already flowed there. Called after `advance`, for each address the instruction flows
+    /// to. Returns whether it flowed.
+    pub fn flow_to(&mut self, address: u64) -> bool {
+        match self.flowed.entry(address) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(self.next.clone());
+                true
+            }
+        }
+    }
+
+    /// Record what `globalset`s commit
+    pub fn commit(&mut self, commits: &[ContextCommit]) {
         for commit in commits {
             self.commits
                 .entry(commit.address)
                 .or_default()
                 .insert(commit.context, commit.value);
         }
+    }
+
+    /// Move on from an instruction decoded with `context` that made `commits`. Its own
+    /// context changes do not flow on, only what it commits.
+    pub fn advance(&mut self, sleigh: &Sleigh, mut context: Context, commits: &[ContextCommit]) {
+        self.commit(commits);
         context.clear_noflow(sleigh);
         self.next = context;
     }
@@ -265,5 +287,30 @@ mod test {
                 bad
             );
         }
+    }
+
+    #[test]
+    fn flow_to() {
+        let sleigh = load();
+        let mode = id(&sleigh, "mode");
+        let shift = id(&sleigh, "shift");
+        let mut flow = ContextFlow::new(Context::new(&sleigh));
+        let first = flow.at(&sleigh, 0x0);
+        let commits = [ContextCommit {
+            address: 0x8,
+            context: shift,
+            value: 1,
+        }];
+        flow.advance(&sleigh, first, &commits);
+
+        // An address keeps the first context that flowed to it, commits apply on top
+        assert!(flow.flow_to(0x8));
+        flow.next.set(&sleigh, mode, 1);
+        assert!(!flow.flow_to(0x8));
+        let kept = flow.at(&sleigh, 0x8);
+        assert_eq!(kept.get(&sleigh, mode), 0);
+        assert_eq!(kept.get(&sleigh, shift), 1);
+        // Elsewhere the context follows the visit order
+        assert_eq!(flow.at(&sleigh, 0xc).get(&sleigh, mode), 1);
     }
 }
