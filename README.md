@@ -25,6 +25,21 @@ Each address is decoded once, so a commit to an address decoded earlier is not s
 Delay slots follow Ghidra: an instruction's p-code includes that of the instructions in its delay slot at its `delayslot`, and `inst_next` in its p-code is the address after them.
 
 
+Testing against Ghidra's slaspecs
+=================================
+`tests/ghidra.rs` checks a small corpus of known-good and known-bad instructions against the real slaspecs for
+x86, x86-64, ARM, AArch64, MIPS, RISC-V and PowerPC. It needs a Ghidra source tree and is ignored by default:
+
+```
+git clone --depth 1 --filter=blob:none --sparse https://github.com/NationalSecurityAgency/ghidra.git
+git -C ghidra sparse-checkout set --no-cone '/Ghidra/Processors/*/data/languages/'
+GHIDRA_SRC=$PWD/ghidra cargo test --release --test ghidra -- --ignored --nocapture
+```
+
+`GHIDRA_SPEC=<substring>` restricts the run to matching specs. Each spec runs in its own process, so a crash is
+reported against the check that caused it.
+
+
 Future work
 ===========
 - Instruction lifter to a simpler IR than raw sleigh execution semantics
