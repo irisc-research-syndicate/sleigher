@@ -846,6 +846,57 @@ mod test {
         assert_eq!(steps, 2 + 4 * 4 + 1);
     }
 
+    #[test]
+    fn i8051_data_and_arithmetic() {
+        let sleigh = load("examples/8051.slaspec");
+        // R0-R7 and the SFRs live in data spaces, so direct addresses alias them.
+        // PSW: CY = 0x80, OV = 0x04
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("mov A, #0x42", vec![0x74, 0x42], &[], &[], &[("ACC", 0x42)], &[]),
+            ("mov ACC, R3", vec![0x8b, 0xe0], &[("R3", 7)], &[], &[("ACC", 7)], &[]),
+            ("mov 0x5, R3", vec![0x8b, 0x05], &[("R3", 7)], &[], &[("R5", 7)], &[]),
+            ("mov @R0, A", vec![0xf6], &[("R0", 3), ("ACC", 9)], &[], &[("R3", 9)], &[]),
+            ("mov 0x4, 0x2", vec![0x85, 0x02, 0x04], &[("R2", 0x55)], &[], &[("R4", 0x55)], &[]),
+            ("mov DPTR, #0x1234", vec![0x90, 0x12, 0x34], &[], &[], &[("DPH", 0x12), ("DPL", 0x34)], &[]),
+            ("inc DPTR", vec![0xa3], &[("DPTR", 0x12ff)], &[], &[("DPH", 0x13), ("DPL", 0)], &[]),
+            ("xch A, R7", vec![0xcf], &[("ACC", 1), ("R7", 2)], &[], &[("ACC", 2), ("R7", 1)], &[]),
+            ("add A, R1", vec![0x29], &[("ACC", 0xf0), ("R1", 0x20)], &[], &[("ACC", 0x10), ("PSW", 0x80)], &[]),
+            ("add A, #0x40", vec![0x24, 0x40], &[("ACC", 0x40)], &[], &[("ACC", 0x80), ("PSW", 0x04)], &[]),
+            ("addc A, #0x1", vec![0x34, 0x01], &[("ACC", 0xff), ("PSW", 0x80)], &[], &[("ACC", 0x01), ("PSW", 0x80)], &[]),
+            ("subb A, R0", vec![0x98], &[("ACC", 1), ("R0", 1), ("PSW", 0x80)], &[], &[("ACC", 0xff), ("PSW", 0x80)], &[]),
+            ("mul AB", vec![0xa4], &[("ACC", 0x40), ("B", 0x10)], &[], &[("ACC", 0), ("B", 4), ("PSW", 0x04)], &[]),
+            ("div AB", vec![0x84], &[("ACC", 17), ("B", 5)], &[], &[("ACC", 3), ("B", 2), ("PSW", 0)], &[]),
+            ("div AB", vec![0x84], &[("ACC", 17), ("B", 0)], &[], &[("ACC", 17), ("PSW", 0x04)], &[]),
+            ("rrc A", vec![0x13], &[("ACC", 0x03)], &[], &[("ACC", 0x01), ("PSW", 0x80)], &[]),
+            ("rlc A", vec![0x33], &[("ACC", 0x80), ("PSW", 0x80)], &[], &[("ACC", 0x01), ("PSW", 0x80)], &[]),
+            ("swap A", vec![0xc4], &[("ACC", 0x12)], &[], &[("ACC", 0x21)], &[]),
+            ("cpl C", vec![0xb3], &[("PSW", 0x04)], &[], &[("PSW", 0x84)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn i8051_branches_and_stack() {
+        let sleigh = load("examples/8051.slaspec");
+        // SP points into R0-R7 so the pushed bytes can be checked by name
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("djnz R2, 0x1000", vec![0xda, 0xfe], &[("R2", 2)], &[], &[("R2", 1), ("pc", 0x1000)], &[]),
+            ("djnz R2, 0x1000", vec![0xda, 0xfe], &[("R2", 1)], &[], &[("R2", 0)], &[]),
+            ("cjne A, #0x5, 0x1010", vec![0xb4, 0x05, 0x0d], &[("ACC", 3)], &[], &[("PSW", 0x80), ("pc", 0x1010)], &[]),
+            ("cjne A, #0x5, 0x1010", vec![0xb4, 0x05, 0x0d], &[("ACC", 5)], &[], &[("PSW", 0)], &[]),
+            ("jc 0x1010", vec![0x40, 0x0e], &[("PSW", 0x80)], &[], &[("pc", 0x1010)], &[]),
+            ("jnz 0x1010", vec![0x70, 0x0e], &[("ACC", 0)], &[], &[], &[]),
+            ("ajmp 0x17ff", vec![0xe1, 0xff], &[], &[], &[("pc", 0x17ff)], &[]),
+            ("ljmp 0x2345", vec![0x02, 0x23, 0x45], &[], &[], &[("pc", 0x2345)], &[]),
+            ("acall 0x1234", vec![0x51, 0x34], &[("SP", 5)], &[], &[("SP", 7), ("R6", 0x02), ("R7", 0x10), ("pc", 0x1234)], &[]),
+            ("lcall 0x2345", vec![0x12, 0x23, 0x45], &[("SP", 5)], &[], &[("SP", 7), ("R6", 0x03), ("R7", 0x10), ("pc", 0x2345)], &[]),
+            ("ret", vec![0x22], &[("SP", 7), ("R6", 0x34), ("R7", 0x12)], &[], &[("SP", 5), ("pc", 0x1234)], &[]),
+            ("push B", vec![0xc0, 0xf0], &[("SP", 1), ("B", 0x99)], &[], &[("SP", 2), ("R2", 0x99)], &[]),
+            ("pop DPL", vec![0xd0, 0x82], &[("SP", 3), ("R3", 0x77)], &[], &[("SP", 2), ("DPL", 0x77)], &[]),
+        ]);
+    }
+
     /// Assemble `examples/crc32/<arch>.s`, run it on several inputs and compare the result with
     /// crc32fast. The program gets the data address in `data_reg` and its length in `len_reg`,
     /// leaves the crc in `crc_reg` and finishes at its `end` label.
@@ -912,5 +963,10 @@ mod test {
     #[test]
     fn crc32_belt() {
         assert_crc32("belt", "b0", "b1", "b0");
+    }
+
+    #[test]
+    fn crc32_8051() {
+        assert_crc32("8051", "DPTR", "R2", "R4R5R6R7");
     }
 }

@@ -1,0 +1,284 @@
+# A subset of the Intel 8051 (MCS-51) with its real encodings.
+#
+# Harvard architecture with several address spaces:
+#   CODE    16-bit program memory (MOVC reads it)
+#   INTMEM  8-bit internal RAM, R0-R7 (register bank 0) live at 0x00-0x07
+#   SFR     8-bit special function registers (ACC, B, PSW, SP, DPL, DPH)
+#   EXTMEM  16-bit external RAM (MOVX)
+#
+# Registers are varnodes in INTMEM/SFR, so a direct address like 0x04 or
+# 0xe0 aliases R4 or the accumulator. Little endian, so DPTR aliases DPL/DPH.
+# Not modelled: register bank switching (PSW.RS), bit addressing, AC and P
+# flags, interrupts.
+#
+#   [opcode] [operand] [operand]
+
+define endian=little;
+define alignment=1;
+
+define space CODE type=ram_space size=2 default;
+define space INTMEM type=ram_space size=1;
+define space SFR type=ram_space size=1;
+define space EXTMEM type=ram_space size=2;
+define space register type=register_space size=1;
+
+define INTMEM offset=0x00 size=1 [ R0 R1 R2 R3 R4 R5 R6 R7 ];
+# R4 is the least significant byte, as used by the crc32 example
+define INTMEM offset=0x04 size=4 [ R4R5R6R7 ];
+
+define SFR offset=0x81 size=1 [ SP DPL DPH ];
+define SFR offset=0x82 size=2 [ DPTR ];
+define SFR offset=0xd0 size=1 [ PSW ];
+define SFR offset=0xe0 size=1 [ ACC ];
+define SFR offset=0xf0 size=1 [ B ];
+
+define bitrange CY=PSW[7,1] OV=PSW[2,1];
+
+define token opbyte(8)
+    op=(0, 7)
+    op_rn=(3, 7)
+    rn=(0, 2)
+    op_ri=(1, 7)
+    ri=(0, 0)
+    op_abs=(0, 4)
+    page=(5, 7)
+;
+
+define token dirbyte(8)
+    direct=(0, 7)
+;
+
+define token dirbyte2(8)
+    direct2=(0, 7)
+;
+
+define token immbyte(8)
+    imm8=(0, 7)
+;
+
+define token relbyte(8)
+    rel=(0, 7) signed
+;
+
+define token hibyte(8)
+    addr_hi=(0, 7)
+;
+
+define token lobyte(8)
+    addr_lo=(0, 7)
+;
+
+define token imm16hi(8)
+    imm_hi=(0, 7)
+;
+
+define token imm16lo(8)
+    imm_lo=(0, 7)
+;
+
+attach variables [ rn ] [ R0 R1 R2 R3 R4 R5 R6 R7 ];
+attach variables [ ri ] [ R0 R1 ];
+
+# Direct addresses: the lower half is internal RAM, the upper half SFRs.
+# Well known SFRs are shown by name, the accumulator as ACC to keep it apart
+# from the shorter encodings that name A.
+Direct: "ACC" is direct=0xe0 { export ACC; }
+Direct: "B"   is direct=0xf0 { export B; }
+Direct: "PSW" is direct=0xd0 { export PSW; }
+Direct: "SP"  is direct=0x81 { export SP; }
+Direct: "DPL" is direct=0x82 { export DPL; }
+Direct: "DPH" is direct=0x83 { export DPH; }
+Direct: direct is direct < 0x80 & direct { export *[INTMEM]:1 direct; }
+Direct: direct is direct >= 0x80 & direct { export *[SFR]:1 direct; }
+
+# Second direct operand of `mov dst, src`, no names for brevity
+Direct2: direct2 is direct2 < 0x80 & direct2 { export *[INTMEM]:1 direct2; }
+Direct2: direct2 is direct2 >= 0x80 & direct2 { export *[SFR]:1 direct2; }
+
+Indirect: "@"^ri is ri { export *[INTMEM]:1 ri; }
+
+Imm8: "#"^imm8 is imm8 { export *[const]:1 imm8; }
+Imm16: "#"^value is imm_hi; imm_lo [ value = (imm_hi << 8) | imm_lo; ] { export *[const]:2 value; }
+
+Rel: target is rel [ target = inst_next + rel; ] { export *:1 target; }
+Addr16: target is addr_hi; addr_lo [ target = (addr_hi << 8) | addr_lo; ] { export *:1 target; }
+# 11-bit address within the current 2k page, the top three bits are in the opcode
+Addr11: target is page; addr_lo [ target = (inst_next & 0xf800) | (page << 8) | addr_lo; ] { export *:1 target; }
+
+macro push(value) {
+    SP = SP + 1;
+    *[INTMEM]:1 SP = value;
+}
+
+macro pop(value) {
+    value = *[INTMEM]:1 SP;
+    SP = SP - 1;
+}
+
+macro addflags(a, b) {
+    CY = carry(a, b);
+    OV = scarry(a, b);
+}
+
+:nop is op=0x00 { }
+
+# Jumps and calls
+:ajmp Addr11  is op_abs=0x01 & Addr11 { goto Addr11; }
+:acall Addr11 is op_abs=0x11 & Addr11 {
+    local ret:2 = inst_next;
+    push(ret:1);
+    push(ret(1));
+    call Addr11;
+}
+:ljmp Addr16  is op=0x02; Addr16 { goto Addr16; }
+:lcall Addr16 is op=0x12; Addr16 {
+    local ret:2 = inst_next;
+    push(ret:1);
+    push(ret(1));
+    call Addr16;
+}
+:ret is op=0x22 {
+    local hi:1;
+    local lo:1;
+    pop(hi);
+    pop(lo);
+    local target:2 = (zext(hi) << 8) | zext(lo);
+    return [target];
+}
+:sjmp Rel is op=0x80; Rel { goto Rel; }
+:jmp "@A+DPTR" is op=0x73 {
+    local target:2 = zext(ACC) + DPTR;
+    goto [target];
+}
+
+# Conditional branches
+:jc Rel  is op=0x40; Rel { if (CY) goto Rel; }
+:jnc Rel is op=0x50; Rel { if (!CY) goto Rel; }
+:jz Rel  is op=0x60; Rel { if (ACC == 0) goto Rel; }
+:jnz Rel is op=0x70; Rel { if (ACC != 0) goto Rel; }
+:djnz rn, Rel is op_rn=0x1b & rn; Rel {
+    rn = rn - 1;
+    if (rn != 0) goto Rel;
+}
+:djnz Direct, Rel is op=0xd5; Direct; Rel {
+    Direct = Direct - 1;
+    if (Direct != 0) goto Rel;
+}
+:cjne "A", Imm8, Rel is op=0xb4; Imm8; Rel {
+    CY = ACC < Imm8;
+    if (ACC != Imm8) goto Rel;
+}
+:cjne rn, Imm8, Rel is op_rn=0x17 & rn; Imm8; Rel {
+    CY = rn < Imm8;
+    if (rn != Imm8) goto Rel;
+}
+
+# Data transfer
+:mov "A", Imm8     is op=0x74; Imm8 { ACC = Imm8; }
+:mov "A", rn       is op_rn=0x1d & rn { ACC = rn; }
+:mov "A", Direct   is op=0xe5; Direct { ACC = Direct; }
+:mov "A", Indirect is op_ri=0x73 & Indirect { ACC = Indirect; }
+:mov rn, "A"       is op_rn=0x1f & rn { rn = ACC; }
+:mov rn, Imm8      is op_rn=0x0f & rn; Imm8 { rn = Imm8; }
+:mov rn, Direct    is op_rn=0x15 & rn; Direct { rn = Direct; }
+:mov Direct, "A"   is op=0xf5; Direct { Direct = ACC; }
+:mov Direct, rn    is op_rn=0x11 & rn; Direct { Direct = rn; }
+:mov Direct, Imm8  is op=0x75; Direct; Imm8 { Direct = Imm8; }
+# The source comes first in the encoding
+:mov Direct2, Direct is op=0x85; Direct; Direct2 { Direct2 = Direct; }
+:mov Indirect, "A" is op_ri=0x7b & Indirect { Indirect = ACC; }
+:mov "DPTR", Imm16 is op=0x90; Imm16 { DPTR = Imm16; }
+
+:movc "A", "@A+DPTR" is op=0x93 {
+    local addr:2 = zext(ACC) + DPTR;
+    ACC = *[CODE]:1 addr;
+}
+:movx "A", "@DPTR" is op=0xe0 { ACC = *[EXTMEM]:1 DPTR; }
+:movx "@DPTR", "A" is op=0xf0 { *[EXTMEM]:1 DPTR = ACC; }
+
+:push Direct is op=0xc0; Direct { push(Direct); }
+:pop Direct  is op=0xd0; Direct { pop(Direct); }
+:xch "A", rn is op_rn=0x19 & rn {
+    local tmp:1 = ACC;
+    ACC = rn;
+    rn = tmp;
+}
+
+# Arithmetic
+:add "A", Imm8   is op=0x24; Imm8 { addflags(ACC, Imm8); ACC = ACC + Imm8; }
+:add "A", rn     is op_rn=0x05 & rn { addflags(ACC, rn); ACC = ACC + rn; }
+:add "A", Direct is op=0x25; Direct { addflags(ACC, Direct); ACC = ACC + Direct; }
+:addc "A", Imm8  is op=0x34; Imm8 {
+    local sum:2 = zext(ACC) + zext(Imm8) + zext(CY);
+    ACC = sum:1;
+    CY = sum(1) != 0;
+}
+:addc "A", rn is op_rn=0x07 & rn {
+    local sum:2 = zext(ACC) + zext(rn) + zext(CY);
+    ACC = sum:1;
+    CY = sum(1) != 0;
+}
+:subb "A", Imm8 is op=0x94; Imm8 {
+    local diff:2 = zext(ACC) - zext(Imm8) - zext(CY);
+    ACC = diff:1;
+    CY = diff(1) != 0;
+}
+:subb "A", rn is op_rn=0x13 & rn {
+    local diff:2 = zext(ACC) - zext(rn) - zext(CY);
+    ACC = diff:1;
+    CY = diff(1) != 0;
+}
+:inc "A"      is op=0x04 { ACC = ACC + 1; }
+:inc rn       is op_rn=0x01 & rn { rn = rn + 1; }
+:inc Direct   is op=0x05; Direct { Direct = Direct + 1; }
+:inc Indirect is op_ri=0x03 & Indirect { Indirect = Indirect + 1; }
+:inc "DPTR"   is op=0xa3 { DPTR = DPTR + 1; }
+:dec "A"      is op=0x14 { ACC = ACC - 1; }
+:dec rn       is op_rn=0x03 & rn { rn = rn - 1; }
+:mul "AB" is op=0xa4 {
+    local product:2 = zext(ACC) * zext(B);
+    ACC = product:1;
+    B = product(1);
+    CY = 0;
+    OV = B != 0;
+}
+:div "AB" is op=0x84 {
+    CY = 0;
+    OV = B == 0;
+    if (OV) goto inst_next;
+    local quotient:1 = ACC / B;
+    B = ACC % B;
+    ACC = quotient;
+}
+
+# Logic
+:anl "A", Imm8   is op=0x54; Imm8 { ACC = ACC & Imm8; }
+:anl "A", rn     is op_rn=0x0b & rn { ACC = ACC & rn; }
+:anl "A", Direct is op=0x55; Direct { ACC = ACC & Direct; }
+:orl "A", Imm8   is op=0x44; Imm8 { ACC = ACC | Imm8; }
+:orl "A", rn     is op_rn=0x09 & rn { ACC = ACC | rn; }
+:xrl "A", Imm8   is op=0x64; Imm8 { ACC = ACC ^ Imm8; }
+:xrl "A", rn     is op_rn=0x0d & rn { ACC = ACC ^ rn; }
+:xrl "A", Direct is op=0x65; Direct { ACC = ACC ^ Direct; }
+:xrl Direct, "A" is op=0x62; Direct { Direct = Direct ^ ACC; }
+:xrl Direct, Imm8 is op=0x63; Direct; Imm8 { Direct = Direct ^ Imm8; }
+:clr "A"  is op=0xe4 { ACC = 0; }
+:cpl "A"  is op=0xf4 { ACC = ~ACC; }
+:clr "C"  is op=0xc3 { CY = 0; }
+:setb "C" is op=0xd3 { CY = 1; }
+:cpl "C"  is op=0xb3 { CY = !CY; }
+
+# Rotates
+:rl "A"  is op=0x23 { ACC = (ACC << 1) | (ACC >> 7); }
+:rr "A"  is op=0x03 { ACC = (ACC >> 1) | (ACC << 7); }
+:rlc "A" is op=0x33 {
+    local out:1 = ACC >> 7;
+    ACC = (ACC << 1) | CY;
+    CY = out;
+}
+:rrc "A" is op=0x13 {
+    local out:1 = ACC & 1;
+    ACC = (ACC >> 1) | (CY << 7);
+    CY = out;
+}
+:swap "A" is op=0xc4 { ACC = (ACC << 4) | (ACC >> 4); }

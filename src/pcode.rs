@@ -761,6 +761,23 @@ impl<'s> Lifter<'s> {
         })
     }
 
+    /// Bits `range` of `input`, as a value of `size` bytes
+    fn read_bits(&mut self, input: Varnode, range: std::ops::Range<u64>, size: u32) -> Varnode {
+        let len = range.end - range.start;
+        let mask = if len >= 64 { u64::MAX } else { (1 << len) - 1 };
+        let shifted = self.op(
+            OpCode::IntRight,
+            input.size,
+            vec![input, Varnode::constant(range.start, 4)],
+        );
+        let masked = self.op(
+            OpCode::IntAnd,
+            input.size,
+            vec![shifted, Varnode::constant(mask, input.size)],
+        );
+        self.resize(masked, size)
+    }
+
     /// Write bits `range` of `target` with the low bits of `value`
     fn write_bits(
         &mut self,
@@ -977,9 +994,13 @@ impl<'s> Lifter<'s> {
                 Varnode::constant(value as u64, bits_to_bytes(var.size.get()))
             }
             ExprValue::ExeVar(variable_id) => self.local(scope, *variable_id),
-            ExprValue::Context(_) | ExprValue::Bitrange(_) | ExprValue::IntDynamic(_) => {
-                return unsupported(value)
+            ExprValue::Bitrange(bitrange) => {
+                let bitrange = self.sleigh.bitrange(bitrange.id);
+                let source = self.register(bitrange.varnode);
+                let range = bitrange.bits.start()..bitrange.bits.end().get();
+                self.read_bits(source, range, size())
             }
+            ExprValue::Context(_) | ExprValue::IntDynamic(_) => return unsupported(value),
         })
     }
 
@@ -1030,21 +1051,7 @@ impl<'s> Lifter<'s> {
                 size,
                 vec![input, Varnode::constant(*trunk, 4)],
             ),
-            Unary::BitRange { range, .. } => {
-                let len = range.end - range.start;
-                let mask = if len >= 64 { u64::MAX } else { (1 << len) - 1 };
-                let shifted = self.op(
-                    OpCode::IntRight,
-                    input.size,
-                    vec![input, Varnode::constant(range.start, 4)],
-                );
-                let masked = self.op(
-                    OpCode::IntAnd,
-                    input.size,
-                    vec![shifted, Varnode::constant(mask, input.size)],
-                );
-                self.resize(masked, size)
-            }
+            Unary::BitRange { range, .. } => self.read_bits(input, range.clone(), size),
             Unary::Negation => {
                 let input = self.resize(input, 1);
                 self.op(OpCode::BoolNegate, 1, vec![input])
