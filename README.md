@@ -17,6 +17,8 @@ The 3 tools should be considered example code for using the library as well as b
 Context variables are supported, and each tool takes initial values with `--context name=value`.
 Unlike Ghidra, which keeps the context by address, the context flows from instruction to instruction in the order they are visited: execution order in the emulator, line order in the assembler and a linear sweep in the disassembler.
 
+Delay slots follow Ghidra: an instruction's p-code includes that of the instructions in its delay slot at its `delayslot`, and `inst_next` in its p-code is the address after them.
+
 
 Future work
 ===========

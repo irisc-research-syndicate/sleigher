@@ -40,8 +40,7 @@ fn main() -> Result<()> {
     let mut cursor = &code[..];
 
     loop {
-        let context = flow.at(&sleigh, pc);
-        let Ok(instruction) = disassembler.disassemble(pc, &context, cursor) else {
+        let Ok(instruction) = disassembler.disassemble_in_flow(pc, &mut flow, cursor) else {
             break;
         };
         println!("{:#010x}: {}", pc, instruction);
@@ -55,9 +54,13 @@ fn main() -> Result<()> {
                 Err(err) => println!("            <{}>", err),
             }
         }
-        pc += instruction.len as u64;
-        cursor = &cursor[instruction.len..];
-        flow.advance(&sleigh, context, &instruction.commits);
+        // Delay slot instructions are marked as in Ghidra, their p-code is in the branch's
+        for slot in instruction.delay_slots.iter() {
+            println!("{:#010x}: _{}", slot.inst_start, slot);
+        }
+        let len = (instruction.fallthrough() - pc) as usize;
+        pc += len as u64;
+        cursor = &cursor[len..];
     }
 
     Ok(())

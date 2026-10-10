@@ -1,0 +1,78 @@
+# A MIPS-like toy with delay slots, big endian, fixed 32-bit instructions.
+#
+# A branch runs the instruction after it, its delay slot, before it takes
+# effect. Branch targets are relative to the delay slot, the branch's own
+# inst_next when disassembling, while inst_next in the semantics is the address
+# after the delay slot, so jal links past it.
+#
+#   inslot  noflow: set by the branches for their delay slot, read by `slot`.
+
+define endian=big;
+define alignment=4;
+
+define space ram type=ram_space size=4 default;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [ r0 r1 r2 r3 r4 r5 r6 ra ];
+define register offset=0x100 size=4 contextreg;
+
+define context contextreg
+    inslot=(0, 0) noflow
+;
+
+define token instr(32)
+    op=(26, 31)
+    rs=(21, 23)
+    rt=(16, 18)
+    rd=(11, 13)
+    simm16=(0, 15) signed
+    target26=(0, 25)
+;
+
+attach variables [ rs rt rd ] [ r0 r1 r2 r3 r4 r5 r6 ra ];
+
+REL16: target is simm16 [ target = inst_next + simm16 * 4; ] { export *:4 target; }
+ABS26: target is target26 [ target = target26 * 4; ] { export *:4 target; }
+
+:nop is op=0 { }
+:slot rt, inslot is op=1 & rt & inslot { rt = inslot; }
+:addi rt, rs, simm16 is op=8 & rt & rs & simm16 { rt = rs + simm16; }
+:add rd, rs, rt is op=9 & rd & rs & rt { rd = rs + rt; }
+:max rd, rs, rt is op=10 & rd & rs & rt {
+    rd = rs;
+    if (rs s>= rt) goto <done>;
+    rd = rt;
+    <done>
+}
+
+# The delay slot may change the registers, so they are read before it
+:beq rs, rt, REL16 is op=4 & rs & rt & REL16 [ inslot=1; globalset(inst_next, inslot); ] {
+    flag:1 = rs == rt;
+    delayslot(1);
+    if (flag) goto REL16;
+}
+:bne rs, rt, REL16 is op=5 & rs & rt & REL16 [ inslot=1; globalset(inst_next, inslot); ] {
+    flag:1 = rs != rt;
+    delayslot(1);
+    if (flag) goto REL16;
+}
+# Branch likely: the delay slot only runs when the branch is taken
+:beql rs, rt, REL16 is op=20 & rs & rt & REL16 [ inslot=1; globalset(inst_next, inslot); ] {
+    if (!(rs == rt)) goto inst_next;
+    delayslot(1);
+    goto REL16;
+}
+:j ABS26 is op=2 & ABS26 [ inslot=1; globalset(inst_next, inslot); ] {
+    delayslot(1);
+    goto ABS26;
+}
+:jal ABS26 is op=3 & ABS26 [ inslot=1; globalset(inst_next, inslot); ] {
+    ra = inst_next;
+    delayslot(1);
+    call ABS26;
+}
+:jr rs is op=6 & rs [ inslot=1; globalset(inst_next, inslot); ] {
+    dest:4 = rs;
+    delayslot(1);
+    return [dest];
+}

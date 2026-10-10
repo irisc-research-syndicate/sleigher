@@ -6,12 +6,13 @@ use sleigh_rs::disassembly::{
     AddrScope, Assertation, Expr, ExprElement, Op, OpUnary, ReadScope, VariableId, WriteScope,
 };
 use sleigh_rs::display::DisplayElement;
+use sleigh_rs::execution::Statement;
 use sleigh_rs::meaning::Meaning;
 use sleigh_rs::pattern::{BitConstraint, CmpOp, Verification};
 use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{ContextId, Endian, Number, PrintBase, Sleigh, TableId, TokenFieldId};
 
-use crate::context::{Context, ContextCommit};
+use crate::context::{Context, ContextCommit, ContextFlow};
 use crate::pcode::{LiftError, PcodeOp};
 use crate::value::sign_extend;
 
@@ -39,24 +40,75 @@ impl<'sleigh> Disassembler<'sleigh> {
         context: &Context,
         bytes: &[u8],
     ) -> Result<DisassembledInstruction<'sleigh>> {
-        let mut context = context.clone();
-        let table = self.disassemble_table(
-            inst_start,
-            self.table(self.instruction_table()),
-            &mut context,
-            bytes,
-        )?;
-        let pcode = crate::pcode::lift(&table);
+        self.disassemble_in_flow(inst_start, &mut ContextFlow::new(context.clone()), bytes)
+    }
+
+    /// Like `disassemble`, with the context `flow` has for `inst_start`. The instructions
+    /// filling a delay slot are decoded from the bytes that follow, with the context flowing
+    /// to them, and `flow` moves on past them.
+    pub fn disassemble_in_flow(
+        &'sleigh self,
+        inst_start: u64,
+        flow: &mut ContextFlow,
+        bytes: &[u8],
+    ) -> Result<DisassembledInstruction<'sleigh>> {
+        let (table, commits) = self.decode(inst_start, flow, bytes)?;
+        let delay_slot_len = table.delay_slot_len();
+        let mut delay_slots = vec![];
+        let mut fallthrough = table.inst_next;
+        let mut delay_slot_error = None;
+        while fallthrough < table.inst_next + delay_slot_len {
+            let offset = (fallthrough - inst_start) as usize;
+            match self.decode(fallthrough, flow, &bytes[offset..]) {
+                Ok((slot, _)) if slot.len > 0 => {
+                    fallthrough = slot.inst_next;
+                    delay_slots.push(slot);
+                }
+                result => {
+                    let err = result.map_or_else(|err| err.to_string(), |_| "empty".to_string());
+                    delay_slot_error = Some(LiftError::Invalid(format!(
+                        "delay slot at {:#x}: {}",
+                        fallthrough, err
+                    )));
+                    break;
+                }
+            }
+        }
+
+        let pcode = match delay_slot_error {
+            Some(err) => Err(err),
+            None => crate::pcode::lift(&table, fallthrough, &delay_slots),
+        };
         if let Err(err) = &pcode {
             log::debug!("Could not lift {}: {}", table, err);
         }
-        let mut commits = vec![];
-        table.commits(&mut commits);
         Ok(DisassembledInstruction {
             table,
             pcode,
             commits,
+            delay_slots,
         })
+    }
+
+    /// One instruction, without its delay slot, with the context `flow` has for `inst_start`;
+    /// `flow` moves on past it
+    fn decode(
+        &'sleigh self,
+        inst_start: u64,
+        flow: &mut ContextFlow,
+        bytes: &[u8],
+    ) -> Result<(DisassembledTable<'sleigh>, Vec<ContextCommit>)> {
+        let context = flow.at(self, inst_start);
+        let table = self.disassemble_table(
+            inst_start,
+            self.table(self.instruction_table()),
+            &mut context.clone(),
+            bytes,
+        )?;
+        let mut commits = vec![];
+        table.commits(&mut commits);
+        flow.advance(self, context, &commits);
+        Ok((table, commits))
     }
 
     pub fn disassemble_table(
@@ -73,6 +125,16 @@ impl<'sleigh> Disassembler<'sleigh> {
         disassembled.resolve(inst_start + disassembled.len as u64, context);
         disassembled.set_context(context);
         Ok(disassembled)
+    }
+
+    /// The most bytes any delay slot in the spec needs
+    pub fn max_delay_slot_len(&self) -> u64 {
+        self.tables()
+            .iter()
+            .flat_map(|table| table.constructors())
+            .map(delay_slot_len)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn extract_token_field(&self, token_field_id: TokenFieldId, bytes: &[u8]) -> i64 {
@@ -122,6 +184,18 @@ pub struct DisassembledInstruction<'sleigh> {
     pub pcode: Result<Vec<PcodeOp>, LiftError>,
     /// Context the instruction sets for other addresses
     pub commits: Vec<ContextCommit>,
+    /// The instructions filling the delay slot, whose p-code is part of this instruction's
+    pub delay_slots: Vec<DisassembledTable<'sleigh>>,
+}
+
+impl DisassembledInstruction<'_> {
+    /// Where execution continues when the instruction does not branch: past its delay slot.
+    /// This is `inst_next` in its p-code, while its disassembly sees its own end.
+    pub fn fallthrough(&self) -> u64 {
+        self.delay_slots
+            .last()
+            .map_or(self.inst_next, |slot| slot.inst_next)
+    }
 }
 
 impl<'sleigh> std::ops::Deref for DisassembledInstruction<'sleigh> {
@@ -392,6 +466,15 @@ impl<'sleigh> DisassembledTable<'sleigh> {
         }
     }
 
+    /// The bytes the delay slot of this table and its subtables needs, 0 without one. Ghidra
+    /// takes the last constructor with a delay slot it resolves; specs have at most one.
+    pub fn delay_slot_len(&self) -> u64 {
+        self.tables
+            .values()
+            .map(|subtable| subtable.delay_slot_len())
+            .fold(delay_slot_len(self.constructor), u64::max)
+    }
+
     /// The `globalset`s of this table and its subtables
     fn commits(&self, commits: &mut Vec<ContextCommit>) {
         commits.extend(
@@ -583,6 +666,21 @@ impl<'sleigh> DisassembledTable<'sleigh> {
             }
         }
     }
+}
+
+/// The bytes a constructor's `delayslot` needs, 0 without one
+pub fn delay_slot_len(constructor: &Constructor) -> u64 {
+    constructor
+        .execution
+        .iter()
+        .flat_map(|execution| execution.blocks())
+        .flat_map(|block| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::Delayslot(len) => Some(*len),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn compare(op: CmpOp, l: i64, r: i64) -> bool {

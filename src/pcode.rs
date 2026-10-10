@@ -296,7 +296,7 @@ impl std::fmt::Display for DisplayPcodeOp<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiftError {
-    /// A construct the lifter does not handle (delay slots, context, ...)
+    /// A construct the lifter does not handle (`newobject`, `cpool`, ...)
     Unsupported(String),
     /// The disassembled instruction is inconsistent with its constructor
     Invalid(String),
@@ -337,6 +337,8 @@ enum Handle {
 /// Lifting state of one constructor
 struct Scope<'t> {
     table: &'t DisassembledTable<'t>,
+    /// `inst_next` in the semantics, past the delay slot of the instruction
+    inst_next: u64,
     locals: HashMap<VariableId, Varnode>,
     built: HashSet<TableId>,
     exports: HashMap<TableId, Handle>,
@@ -344,21 +346,28 @@ struct Scope<'t> {
     block_labels: HashMap<BlockId, usize>,
 }
 
-/// Lift the semantics of a disassembled instruction to p-code
-pub fn lift(table: &DisassembledTable) -> Result<Vec<PcodeOp>, LiftError> {
+/// Lift the semantics of a disassembled instruction to p-code. `delayslot` runs the p-code of
+/// `delay_slots`, the instructions that follow, and `inst_next` is the address after them.
+pub fn lift<'s>(
+    table: &'s DisassembledTable<'s>,
+    inst_next: u64,
+    delay_slots: &'s [DisassembledTable<'s>],
+) -> Result<Vec<PcodeOp>, LiftError> {
     let mut lifter = Lifter {
         sleigh: table.disassembler.sleigh,
+        delay_slots,
         ops: vec![],
         next_unique: 0,
         labels: vec![],
         fixups: vec![],
     };
-    lifter.lift_table(table)?;
+    lifter.lift_table(table, inst_next)?;
     lifter.finish()
 }
 
 struct Lifter<'s> {
     sleigh: &'s Sleigh,
+    delay_slots: &'s [DisassembledTable<'s>],
     ops: Vec<PcodeOp>,
     next_unique: u64,
     /// Op index of each label, once placed
@@ -500,12 +509,17 @@ impl<'s> Lifter<'s> {
         })
     }
 
-    fn lift_table(&mut self, table: &DisassembledTable) -> LiftResult<Option<Handle>> {
+    fn lift_table(
+        &mut self,
+        table: &DisassembledTable,
+        inst_next: u64,
+    ) -> LiftResult<Option<Handle>> {
         let Some(execution) = &table.constructor.execution else {
             return Ok(None);
         };
         let mut scope = Scope {
             table,
+            inst_next,
             locals: HashMap::new(),
             built: HashSet::new(),
             exports: HashMap::new(),
@@ -578,7 +592,7 @@ impl<'s> Lifter<'s> {
                 table_id.0
             ))
         })?;
-        if let Some(handle) = self.lift_table(table)? {
+        if let Some(handle) = self.lift_table(table, scope.inst_next)? {
             scope.exports.insert(table_id, handle);
         }
         Ok(())
@@ -606,7 +620,7 @@ impl<'s> Lifter<'s> {
 
     fn statement(&mut self, scope: &mut Scope, statement: &Statement) -> LiftResult<()> {
         match statement {
-            Statement::Delayslot(_) => unsupported("delay slot"),
+            Statement::Delayslot(_) => self.delay_slot(),
             Statement::Export(export) => {
                 scope.export = Some(self.export(scope, export)?);
                 Ok(())
@@ -634,6 +648,22 @@ impl<'s> Lifter<'s> {
             }
             Statement::Assignment(assignment) => self.assignment(scope, assignment),
         }
+    }
+
+    /// The p-code of the delay slot instructions, each with its own `inst_next`. They have no
+    /// delay slots of their own.
+    fn delay_slot(&mut self) -> LiftResult<()> {
+        let delay_slots = std::mem::take(&mut self.delay_slots);
+        if delay_slots.is_empty() {
+            return Err(LiftError::Invalid(
+                "no instructions for the delay slot".to_string(),
+            ));
+        }
+        for slot in delay_slots.iter() {
+            self.lift_table(slot, slot.inst_next)?;
+        }
+        self.delay_slots = delay_slots;
+        Ok(())
     }
 
     fn local(&mut self, scope: &mut Scope, variable_id: VariableId) -> Varnode {
@@ -939,7 +969,7 @@ impl<'s> Lifter<'s> {
                     ReferencedValue::InstStart(_) => {
                         Varnode::constant(scope.table.inst_start, size)
                     }
-                    ReferencedValue::InstNext(_) => Varnode::constant(scope.table.inst_next, size),
+                    ReferencedValue::InstNext(_) => Varnode::constant(scope.inst_next, size),
                     ReferencedValue::Table(table) => match self.table_export(scope, table.id)? {
                         Handle::Pointer { addr, .. } => self.resize(addr, size),
                         Handle::Direct(varnode) if !varnode.is_const() => {
@@ -983,7 +1013,7 @@ impl<'s> Lifter<'s> {
                 bits_to_bytes(field.size.get()),
             ),
             ExprValue::InstStart(_) => Varnode::constant(scope.table.inst_start, size()),
-            ExprValue::InstNext(_) => Varnode::constant(scope.table.inst_next, size()),
+            ExprValue::InstNext(_) => Varnode::constant(scope.inst_next, size()),
             ExprValue::Varnode(varnode_id) => self.register(*varnode_id),
             ExprValue::VarnodeDynamic(dynamic) => {
                 self.attached(scope, dynamic.attach_id, dynamic.attach_value)?
@@ -1292,7 +1322,50 @@ mod test {
     }
 
     #[test]
-    fn unsupported_still_disassembles() {
+    fn delay_slot_pcode() {
+        let sleigh = load("examples/delay.slaspec");
+        // The delay slot's p-code runs at delayslot, inst_next is past it and the branch's
+        // commit reaches it
+        #[rustfmt::skip]
+        assert_lifts(&sleigh, &[
+            (vec![0x10, 0x22, 0x00, 0x03, 0x20, 0x63, 0x00, 0x01], "beq r1, r2, 0x1010", &["$U0:1 = INT_EQUAL r1, r2", "r3 = INT_ADD r3, 0x1:4", "CBRANCH ram[0x1010]:4, $U0:1"]),
+            (vec![0x0c, 0x00, 0x08, 0x00, 0x04, 0x03, 0x00, 0x00], "jal 0x2000", &["ra = COPY 0x1008:4", "r3 = COPY 0x1:4", "CALL ram[0x2000]:4"]),
+            (vec![0x18, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], "jr ra", &["$U0:4 = COPY ra", "RETURN $U0:4"]),
+            (vec![0x04, 0x03, 0x00, 0x00], "slot r3, 0x0", &["r3 = COPY 0x0:4"]),
+            // Branch likely skips the delay slot by branching to inst_next
+            (vec![0x50, 0x22, 0x00, 0x03, 0x20, 0x63, 0x00, 0x01], "beql r1, r2, 0x1010", &["$U0:1 = INT_EQUAL r1, r2", "$U8:1 = BOOL_NEGATE $U0:1", "CBRANCH ram[0x1008]:4, $U8:1", "r3 = INT_ADD r3, 0x1:4", "BRANCH ram[0x1010]:4"]),
+            // A jump inside the delay slot stays relative to its own ops
+            (vec![0x10, 0x00, 0x00, 0x03, 0x28, 0x22, 0x18, 0x00], "beq r0, r0, 0x1010", &["$U0:1 = INT_EQUAL r0, r0", "r3 = COPY r1", "$U10:1 = INT_SLESSEQUAL r2, r1", "CBRANCH +2, $U10:1", "r3 = COPY r2", "CBRANCH ram[0x1010]:4, $U0:1"]),
+        ]);
+    }
+
+    #[test]
+    fn delay_slot_instructions() {
+        let sleigh = load("examples/delay.slaspec");
+        let disassembler = Disassembler::new(&sleigh);
+        let context = Context::new(&sleigh);
+        let jal = [0x0c, 0x00, 0x08, 0x00, 0x04, 0x03, 0x00, 0x00];
+        let instruction = disassembler.disassemble(0x1000, &context, &jal).unwrap();
+        assert_eq!(instruction.inst_next, 0x1004);
+        assert_eq!(instruction.fallthrough(), 0x1008);
+        let slots: Vec<String> = instruction
+            .delay_slots
+            .iter()
+            .map(|slot| slot.to_string())
+            .collect();
+        assert_eq!(slots, vec!["slot r3, 0x1"]);
+
+        // Without the bytes after it, or with a branch in its delay slot, a branch still
+        // disassembles
+        for bytes in [&jal[..4], &[0x0c, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x08, 0x00]] {
+            let (text, pcode) = lift_text(&sleigh, &context, 0x1000, bytes);
+            assert_eq!(text, "jal 0x2000");
+            assert!(matches!(pcode, Err(LiftError::Invalid(_))), "{:?}", pcode);
+        }
+    }
+
+    #[test]
+    fn empty_delay_slot() {
         let path =
             std::env::temp_dir().join(format!("sleigher-delayslot-{}.slaspec", std::process::id()));
         std::fs::write(
@@ -1303,20 +1376,27 @@ mod test {
             define space ram type=ram_space size=4 default;
             define space register type=register_space size=4;
             define register offset=0x00 size=4 [ r0 ];
+            define register offset=0x100 size=4 contextreg;
+            define context contextreg inslot=(0, 0) noflow;
             define token opbyte(8) opcode=(0, 7);
-            :nop is opcode=0x00 { }
-            :dly is opcode=0x01 { delayslot(1); }
+            :zl is inslot=1 { r0 = 1; }
+            :dly is inslot=0 & opcode=0x01 [ inslot=1; globalset(inst_next, inslot); ] {
+                delayslot(1);
+            }
         ",
         )
         .unwrap();
         let sleigh = load(&path);
         std::fs::remove_file(&path).unwrap();
 
-        let (text, pcode) = lift_text(&sleigh, &Context::new(&sleigh), 0x1000, &[0x01]);
+        // An instruction without bytes never fills the delay slot
+        let (text, pcode) = lift_text(&sleigh, &Context::new(&sleigh), 0x1000, &[0x01, 0x00, 0x00]);
         assert_eq!(text, "dly");
         assert_eq!(
             pcode,
-            Err(LiftError::Unsupported("\"delay slot\"".to_string()))
+            Err(LiftError::Invalid(
+                "delay slot at 0x1001: empty".to_string()
+            ))
         );
     }
 }

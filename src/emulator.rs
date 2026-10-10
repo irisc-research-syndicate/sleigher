@@ -21,7 +21,8 @@ pub struct Cpu<'sleigh> {
     pub sleigh: &'sleigh Sleigh,
     pub disassembler: Disassembler<'sleigh>,
     pub state: State,
-    pub max_instruction_len: usize,
+    /// Bytes fetched per step: the longest instruction and its delay slot
+    pub fetch_len: usize,
     pub context: ContextFlow,
     user_ops: HashMap<String, UserOp>,
 }
@@ -41,11 +42,18 @@ impl<'sleigh> Cpu<'sleigh> {
             .pattern_len
             .max()
             .map_or(FALLBACK_INSTRUCTION_LEN, |len| len as usize);
+        let disassembler = Disassembler::new(sleigh);
+        // Delay slot instructions start within the delay slot, so the last one ends at most
+        // max_instruction_len past it
+        let fetch_len = match disassembler.max_delay_slot_len() as usize {
+            0 => max_instruction_len,
+            len => 2 * max_instruction_len + len - 1,
+        };
         Self {
             sleigh,
-            disassembler: Disassembler::new(sleigh),
+            disassembler,
             state,
-            max_instruction_len,
+            fetch_len,
             context: ContextFlow::new(Context::new(sleigh)),
             user_ops: HashMap::new(),
         }
@@ -61,18 +69,34 @@ impl<'sleigh> Cpu<'sleigh> {
     }
 
     pub fn step(&mut self) -> Result<()> {
-        let mut instruction_bytes = vec![0u8; self.max_instruction_len];
+        let mut instruction_bytes = vec![0u8; self.fetch_len];
         self.fetch_instruction(&mut instruction_bytes)?;
 
-        let context = self.context.at(self.sleigh, self.state.pc);
-        let instruction =
-            self.disassembler
-                .disassemble(self.state.pc, &context, &instruction_bytes)?;
+        // The context only moves on once the instruction executed. Commits a failed step
+        // made stay, but they are what decoding the same bytes commits again.
+        let next = self.context.next.clone();
+        let result = self.execute_instruction(&instruction_bytes);
+        if result.is_err() {
+            self.context.next = next;
+        }
+        result
+    }
+
+    /// Decode the instruction at pc from `instruction_bytes` and run it
+    fn execute_instruction(&mut self, instruction_bytes: &[u8]) -> Result<()> {
+        let instruction = self.disassembler.disassemble_in_flow(
+            self.state.pc,
+            &mut self.context,
+            instruction_bytes,
+        )?;
         log::debug!(
             "Executing {:#010x}: {}",
             instruction.inst_start,
             instruction
         );
+        for slot in instruction.delay_slots.iter() {
+            log::debug!("  delay slot {:#010x}: {}", slot.inst_start, slot);
+        }
         let ops = instruction
             .pcode
             .as_ref()
@@ -85,12 +109,9 @@ impl<'sleigh> Cpu<'sleigh> {
             uniques: HashSpace::new(),
         };
         let pc = executor
-            .execute(ops, instruction.inst_next)
+            .execute(ops, instruction.fallthrough())
             .with_context(|| format!("{:#010x}: {}", instruction.inst_start, instruction))?;
         self.state.pc = pc;
-
-        self.context
-            .advance(self.sleigh, context, &instruction.commits);
         Ok(())
     }
 
@@ -1033,5 +1054,79 @@ mod test {
         cpu.step().unwrap();
         cpu.step().unwrap();
         assert_eq!(get_reg_le(&mut cpu, "r1"), 4);
+    }
+
+    #[test]
+    fn delay_slot_branches() {
+        let sleigh = load("examples/delay.slaspec");
+        // The delay slot runs before the branch takes effect, but after its operands are read
+        #[rustfmt::skip]
+        assert_executes(&sleigh, &[
+            ("beq r1, r2, 0x1010", vec![0x10, 0x22, 0x00, 0x03, 0x20, 0x63, 0x00, 0x01], &[("r1", 5), ("r2", 5), ("r3", 1)], &[], &[("r3", 2), ("pc", 0x1010)], &[]),
+            ("beq r1, r2, 0x1010", vec![0x10, 0x22, 0x00, 0x03, 0x20, 0x63, 0x00, 0x01], &[("r1", 1), ("r2", 2), ("r3", 1)], &[], &[("r3", 2)], &[]),
+            ("beq r1, r2, 0x1010", vec![0x10, 0x22, 0x00, 0x03, 0x20, 0x21, 0x00, 0x01], &[("r1", 5), ("r2", 5)], &[], &[("r1", 6), ("pc", 0x1010)], &[]),
+            ("bne r1, r0, 0x1000", vec![0x14, 0x20, 0xff, 0xff, 0x20, 0x21, 0xff, 0xff], &[("r1", 1)], &[], &[("r1", 0), ("pc", 0x1000)], &[]),
+            ("j 0x2000", vec![0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00], &[], &[], &[("pc", 0x2000)], &[]),
+            ("jal 0x2000", vec![0x0c, 0x00, 0x08, 0x00, 0x04, 0x03, 0x00, 0x00], &[], &[], &[("ra", 0x1008), ("r3", 1), ("pc", 0x2000)], &[]),
+            ("jr ra", vec![0x18, 0xe0, 0x00, 0x00, 0x20, 0xe7, 0x00, 0x04], &[("ra", 0x3000)], &[], &[("ra", 0x3004), ("pc", 0x3000)], &[]),
+            ("beql r1, r2, 0x1010", vec![0x50, 0x22, 0x00, 0x03, 0x20, 0x63, 0x00, 0x01], &[("r1", 5), ("r2", 5), ("r3", 1)], &[], &[("r3", 2), ("pc", 0x1010)], &[]),
+            ("beql r1, r2, 0x1010", vec![0x50, 0x22, 0x00, 0x03, 0x20, 0x63, 0x00, 0x01], &[("r1", 1), ("r2", 2), ("r3", 1)], &[], &[("r3", 1)], &[]),
+            ("beq r0, r0, 0x1010", vec![0x10, 0x00, 0x00, 0x03, 0x28, 0x22, 0x18, 0x00], &[("r1", 3), ("r2", 7)], &[], &[("r3", 7), ("pc", 0x1010)], &[]),
+            ("beq r0, r0, 0x1010", vec![0x10, 0x00, 0x00, 0x03, 0x28, 0x22, 0x18, 0x00], &[("r1", 7), ("r2", 3)], &[], &[("r3", 7), ("pc", 0x1010)], &[]),
+        ]);
+    }
+
+    #[test]
+    fn delay_slot_runs_once() {
+        let sleigh = load("examples/delay.slaspec");
+        #[rustfmt::skip]
+        let mut cpu = new_cpu(&sleigh, &[
+            0x10, 0x00, 0x00, 0x02, // 0x1000: beq r0, r0, 0x100c
+            0x04, 0x03, 0x00, 0x00, // 0x1004: slot r3, 0x1
+            0x04, 0x05, 0x00, 0x00, // 0x1008: slot r5, 0x0
+            0x04, 0x04, 0x00, 0x00, // 0x100c: slot r4, 0x0
+        ]);
+        set_reg(&mut cpu, "r3", 0x99);
+        set_reg(&mut cpu, "r4", 0x99);
+        set_reg(&mut cpu, "r5", 0x99);
+        cpu.step().unwrap();
+        assert_eq!(cpu.state.pc, 0x100c);
+        assert_eq!(get_reg(&mut cpu, "r3"), 1);
+        // The commit to the delay slot does not reach the branch target
+        cpu.step().unwrap();
+        assert_eq!(cpu.state.pc, 0x1010);
+        assert_eq!(get_reg(&mut cpu, "r4"), 0);
+        assert_eq!(get_reg(&mut cpu, "r5"), 0x99);
+    }
+
+    #[test]
+    fn delay_slot_sum_loop() {
+        let source = "
+                    addi r1, r0, 0x4    // n
+                    addi r2, r0, 0x0    // acc
+            loop:   add r2, r2, r1
+                    bne r1, r0, loop
+                    addi r1, r1, -0x1   // delay slot, also on the way out
+            end:
+        ";
+        let assembler = crate::assembler::InstructionAssembler::new(load("examples/delay.slaspec"));
+        let program = assembler.assemble_program(source, BASE).unwrap();
+
+        let sleigh = load("examples/delay.slaspec");
+        let mut cpu = new_cpu(&sleigh, &program.bytes);
+        let mut steps = 0;
+        while cpu.state.pc != program.labels["end"] {
+            assert!(
+                steps < 100,
+                "loop did not terminate, pc = {:#x}",
+                cpu.state.pc
+            );
+            cpu.step().unwrap();
+            steps += 1;
+        }
+        assert_eq!(get_reg(&mut cpu, "r2"), 4 + 3 + 2 + 1);
+        assert_eq!(get_reg(&mut cpu, "r1"), 0xffffffff);
+        // Each bne step runs its delay slot, which is never stepped on its own
+        assert_eq!(steps, 2 + 5 * 2);
     }
 }

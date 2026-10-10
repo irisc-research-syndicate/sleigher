@@ -128,9 +128,12 @@ struct Args {
     #[arg(short = 'r', long = "reg")]
     registers: Vec<RegAssignment>,
 
+    /// Log registers on reaching an address, as address:name:reg,reg,...; an instruction in
+    /// a delay slot runs with its branch, so its address is never reached
     #[arg(short = 'b', long = "breakpoint")]
     breakpoints: Vec<Breakpoint>,
 
+    /// Stop after this many instructions, a branch and its delay slot counting as one
     #[arg(short='s', long="steps", value_parser=parse_int)]
     steps: Option<u64>,
 
