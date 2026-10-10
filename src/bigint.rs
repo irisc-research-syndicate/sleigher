@@ -36,6 +36,11 @@ impl BigInt {
         result.masked()
     }
 
+    /// `value` truncated to `size` bytes
+    pub fn from_u128(value: u128, size: u32) -> Self {
+        Self::from_u64(value as u64, size) | (Self::from_u64((value >> 64) as u64, size) << 64)
+    }
+
     /// A one byte boolean
     pub fn from_bool(value: bool) -> Self {
         Self::from_u64(value as u64, 1)
@@ -79,6 +84,11 @@ impl BigInt {
     /// The low 64 bits
     pub fn to_u64(&self) -> u64 {
         self.limbs[0]
+    }
+
+    /// The low 128 bits
+    pub fn to_u128(&self) -> u128 {
+        self.limbs[0] as u128 | (self.limbs.get(1).copied().unwrap_or(0) as u128) << 64
     }
 
     /// The value, if it fits in 64 bits

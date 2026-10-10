@@ -7,7 +7,7 @@ use sleigh_rs::{Endian, Sleigh, SpaceId, UserFunctionId};
 use crate::bigint::BigInt;
 use crate::context::{Context, ContextFlow};
 use crate::disassembler::Disassembler;
-use crate::float;
+use crate::float::{self, Rounding};
 use crate::pcode::{BranchTarget, DisplayVarnode, OpCode, PcodeOp, Varnode, VarnodeSpace};
 use crate::space::{HashSpace, MemoryRegion};
 use crate::value::{Address, Ref};
@@ -445,14 +445,12 @@ impl PcodeExecutor<'_> {
             FloatNeg => a(self)? ^ sign_bit(),
             FloatAbs => a(self)? & !sign_bit(),
             FloatSqrt => float::from_f64(fa(self)?.sqrt(), size)?,
-            FloatCeil => float::from_f64(fa(self)?.ceil(), size)?,
-            FloatFloor => float::from_f64(fa(self)?.floor(), size)?,
-            // Halfway cases round away from zero, like round() in FloatFormat::opRound of
-            // Ghidra's decompiler (float.cc); Ghidra's Java emulator uses floor(x + 0.5)
-            FloatRound => float::from_f64(fa(self)?.round(), size)?,
+            FloatCeil => float::round_to_whole(&a(self)?, Rounding::Ceil)?,
+            FloatFloor => float::round_to_whole(&a(self)?, Rounding::Floor)?,
+            FloatRound => float::round_to_whole(&a(self)?, Rounding::Round)?,
             FloatInt2Float => float::from_int(&a(self)?, out_size)?,
-            FloatFloat2Float => float::from_f64(fa(self)?, out_size)?,
-            FloatTrunc => float::to_int(fa(self)?, out_size),
+            FloatFloat2Float => float::convert(&a(self)?, out_size)?,
+            FloatTrunc => float::to_int(&a(self)?, out_size)?,
             Popcount => BigInt::from_u64(a(self)?.popcount() as u64, out_size),
             Lzcount => BigInt::from_u64(a(self)?.lzcount() as u64, out_size),
             Branch | CBranch | BranchInd | Call | CallInd | Return | Store => {
@@ -1361,6 +1359,34 @@ mod test {
         let three = BigInt::from_u64(0, 3);
         let err = evaluate(&sleigh, OpCode::FloatAdd, 3, &[three.clone(), three]).unwrap_err();
         assert_eq!(err.to_string(), "no 3 byte float format");
+    }
+
+    #[test]
+    fn float_extended_and_half() {
+        let sleigh = load("examples/float.slaspec");
+        let n = |value: u64| BigInt::from_u64(value, 16);
+        let d = |value: f64| BigInt::from_u64(value.to_bits(), 8);
+        let t = |value: f64| float::from_f64(value, 10).unwrap();
+        let bits = |sign_exponent: u64, mantissa: u64| {
+            BigInt::from_u128(((sign_exponent as u128) << 64) | mantissa as u128, 10)
+        };
+        // Beyond double precision
+        let big = (1u64 << 62) + 1;
+        #[rustfmt::skip]
+        assert_executes_wide(&sleigh, &[
+            ("fadd.t t0, t1, t2", vec![0x30, 0x06], vec![("t1", t(1.5)), ("t2", t(2.25))], vec![("t0", bits(0x4000, 0xf000_0000_0000_0000))]),
+            ("fsqrt.t t0, t1", vec![0x31, 0x04], vec![("t1", t(2.0))], vec![("t0", t(std::f64::consts::SQRT_2))]),
+            ("fneg.t t0, t1", vec![0x32, 0x04], vec![("t1", t(1.0))], vec![("t0", bits(0xbfff, 1 << 63))]),
+            ("fround.t t0, t1", vec![0x33, 0x04], vec![("t1", bits(0x3fff + 62, (big << 1) | 1))], vec![("t0", bits(0x3fff + 62, (big + 1) << 1))]),
+            ("flt.t r0, t1, t2", vec![0x34, 0x06], vec![("t1", t(1.0)), ("t2", t(2.0))], vec![("r0", n(1))]),
+            ("fcvt.t.d t0, d1", vec![0x35, 0x04], vec![("d1", d(0.1))], vec![("t0", bits(0x3ffb, 0xcccc_cccc_cccc_d000))]),
+            ("fcvt.d.t d0, t1", vec![0x36, 0x04], vec![("t1", bits(0x3fff, (1 << 63) | (1 << 10) | 1))], vec![("d0", d(1.0 + f64::EPSILON))]),
+            ("fcvt.t.q t0, q1", vec![0x37, 0x04], vec![("q1", n(big))], vec![("t0", bits(0x3fff + 62, big << 1))]),
+            ("fcvt.q.t q0, t1", vec![0x38, 0x04], vec![("t1", bits(0x3fff + 62, big << 1))], vec![("q0", n(big))]),
+            ("fcvt.q.t q0, t1", vec![0x38, 0x04], vec![("t1", bits(0xbfff, 0xc000_0000_0000_0000))], vec![("q0", n(u64::MAX))]),
+            ("fadd.h h0, h1, h2", vec![0x39, 0x06], vec![("h1", n(0x3c00)), ("h2", n(0x3c00))], vec![("h0", n(0x4000))]),
+            ("fcvt.h.d h0, d1", vec![0x3a, 0x04], vec![("d1", d(-0.5))], vec![("h0", n(0xb800))]),
+        ]);
     }
 
     /// A little endian 32-bit register, the context example is little endian

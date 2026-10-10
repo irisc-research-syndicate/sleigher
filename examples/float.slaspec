@@ -1,5 +1,6 @@
-# Floating point, little endian: single (s), double (d) precision registers
-# and 32 (r), 64 (q) and 128-bit (o) integer registers for conversions.
+# Floating point, little endian: half (h), single (s), double (d) and x87
+# extended (t) precision registers and 32 (r), 64 (q) and 128-bit (o) integer
+# registers for conversions.
 #
 #   [op] [a b c]    a=(4,5) b=(2,3) c=(0,1) pick a register
 
@@ -14,6 +15,8 @@ define register offset=0x020 size=8 [ d0 d1 d2 d3 ];
 define register offset=0x040 size=4 [ r0 r1 r2 r3 ];
 define register offset=0x060 size=8 [ q0 q1 q2 q3 ];
 define register offset=0x080 size=16 [ o0 o1 o2 o3 ];
+define register offset=0x0c0 size=10 [ t0 t1 t2 t3 ];
+define register offset=0x0f0 size=2 [ h0 h1 h2 h3 ];
 
 define token opbyte(8)
     op=(0, 7)
@@ -25,6 +28,8 @@ define token operands(8)
     ra=(4, 5) rb=(2, 3)
     qa=(4, 5) qb=(2, 3)
     oa=(4, 5) ob=(2, 3)
+    ta=(4, 5) tb=(2, 3) tc=(0, 1)
+    ha=(4, 5) hb=(2, 3) hc=(0, 1)
 ;
 
 attach variables [ sa sb sc ] [ s0 s1 s2 s3 ];
@@ -32,6 +37,8 @@ attach variables [ da db dc ] [ d0 d1 d2 d3 ];
 attach variables [ ra rb ] [ r0 r1 r2 r3 ];
 attach variables [ qa qb ] [ q0 q1 q2 q3 ];
 attach variables [ oa ob ] [ o0 o1 o2 o3 ];
+attach variables [ ta tb tc ] [ t0 t1 t2 t3 ];
+attach variables [ ha hb hc ] [ h0 h1 h2 h3 ];
 
 :fadd.d da, db, dc is op=0x01; da & db & dc { da = db f+ dc; }
 :fsub.d da, db, dc is op=0x02; da & db & dc { da = db f- dc; }
@@ -66,3 +73,15 @@ attach variables [ oa ob ] [ o0 o1 o2 o3 ];
 :fcvt.q.d qa, db is op=0x27; qa & db { qa = trunc(db); }
 :fcvt.o.d oa, db is op=0x28; oa & db { oa = trunc(db); }
 :fcvt.r.s ra, sb is op=0x29; ra & sb { ra = trunc(sb); }
+
+:fadd.t ta, tb, tc is op=0x30; ta & tb & tc { ta = tb f+ tc; }
+:fsqrt.t ta, tb is op=0x31; ta & tb { ta = sqrt(tb); }
+:fneg.t ta, tb is op=0x32; ta & tb { ta = f- tb; }
+:fround.t ta, tb is op=0x33; ta & tb { ta = round(tb); }
+:flt.t ra, tb, tc is op=0x34; ra & tb & tc { ra = zext(tb f< tc); }
+:fcvt.t.d ta, db is op=0x35; ta & db { ta = float2float(db); }
+:fcvt.d.t da, tb is op=0x36; da & tb { da = float2float(tb); }
+:fcvt.t.q ta, qb is op=0x37; ta & qb { ta = int2float(qb); }
+:fcvt.q.t qa, tb is op=0x38; qa & tb { qa = trunc(tb); }
+:fadd.h ha, hb, hc is op=0x39; ha & hb & hc { ha = hb f+ hc; }
+:fcvt.h.d ha, db is op=0x3a; ha & db { ha = float2float(db); }
