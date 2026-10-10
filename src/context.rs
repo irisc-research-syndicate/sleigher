@@ -51,6 +51,15 @@ impl Context {
         }
     }
 
+    /// Reset the variables that do not flow on to the next instruction
+    pub fn clear_noflow(&mut self, sleigh: &Sleigh) {
+        for (i, context) in sleigh.contexts().iter().enumerate() {
+            if context.noflow {
+                self.set(sleigh, ContextId(i), 0);
+            }
+        }
+    }
+
     /// Whether the context satisfies the context bits of a constructor variant
     pub fn matches(&self, constraints: &[BitConstraint]) -> bool {
         debug_assert_eq!(constraints.len(), self.bits.len());

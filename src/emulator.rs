@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context as _, Result};
 
-use sleigh_rs::{Endian, Sleigh, SpaceId, UserFunctionId};
+use sleigh_rs::{ContextId, Endian, Sleigh, SpaceId, UserFunctionId};
 
 use crate::context::Context;
 use crate::disassembler::Disassembler;
@@ -22,6 +22,11 @@ pub struct Cpu<'sleigh> {
     pub disassembler: Disassembler<'sleigh>,
     pub state: State,
     pub max_instruction_len: usize,
+    /// The context the next instruction is decoded with, before `globalset`s for its address.
+    /// Unlike Ghidra's context, which is kept by address, it flows in execution order.
+    pub context: Context,
+    /// The values `globalset`s have set so far, by address
+    commits: HashMap<u64, HashMap<ContextId, i64>>,
     user_ops: HashMap<String, UserOp>,
 }
 
@@ -45,6 +50,8 @@ impl<'sleigh> Cpu<'sleigh> {
             disassembler: Disassembler::new(sleigh),
             state,
             max_instruction_len,
+            context: Context::new(sleigh),
+            commits: HashMap::new(),
             user_ops: HashMap::new(),
         }
     }
@@ -62,11 +69,13 @@ impl<'sleigh> Cpu<'sleigh> {
         let mut instruction_bytes = vec![0u8; self.max_instruction_len];
         self.fetch_instruction(&mut instruction_bytes)?;
 
-        let instruction = self.disassembler.disassemble(
-            self.state.pc,
-            &Context::new(self.sleigh),
-            &instruction_bytes,
-        )?;
+        let mut context = self.context.clone();
+        for (&id, &value) in self.commits.get(&self.state.pc).into_iter().flatten() {
+            context.set(self.sleigh, id, value);
+        }
+        let instruction =
+            self.disassembler
+                .disassemble(self.state.pc, &context, &instruction_bytes)?;
         log::debug!(
             "Executing {:#010x}: {}",
             instruction.inst_start,
@@ -87,6 +96,15 @@ impl<'sleigh> Cpu<'sleigh> {
             .execute(ops, instruction.inst_next)
             .with_context(|| format!("{:#010x}: {}", instruction.inst_start, instruction))?;
         self.state.pc = pc;
+
+        for commit in &instruction.commits {
+            self.commits
+                .entry(commit.address)
+                .or_default()
+                .insert(commit.context, commit.value);
+        }
+        context.clear_noflow(self.sleigh);
+        self.context = context;
         Ok(())
     }
 
@@ -973,5 +991,59 @@ mod test {
     #[test]
     fn crc32_8051() {
         assert_crc32("8051", "DPTR", "R2", "R4R5R6R7");
+    }
+
+    /// A little endian 32-bit register, the context example is little endian
+    fn get_reg_le(cpu: &mut Cpu, name: &str) -> u32 {
+        let mut bytes = [0u8; 4];
+        cpu.state.read_ref(reg_ref(cpu, name), &mut bytes).unwrap();
+        u32::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn context_flow() {
+        let sleigh = load("examples/context.slaspec");
+        let id = |name| Context::id(&sleigh, name).unwrap();
+        #[rustfmt::skip]
+        let program = [
+            0x05, 0x00, 0x11, 0x01, // add r1, r1, 0x5
+            0x00, 0x00, 0x00, 0x02, // mode1
+            0x02, 0x00, 0x11, 0x01, // sub r1, r1, 0x2
+            0x02, 0x00, 0x00, 0x04, // pfx 0x2
+            0x00, 0x00, 0x11, 0x05, // shl r1, r1, 0x2
+            0x00, 0x00, 0x11, 0x05, // shl r1, r1, 0x0
+        ];
+        let mut cpu = new_cpu(&sleigh, &program);
+        let mut r1 = vec![];
+        for _ in 0..6 {
+            cpu.step().unwrap();
+            r1.push(get_reg_le(&mut cpu, "r1"));
+        }
+        // mode flows on after mode1, shift only reaches the instruction after pfx
+        assert_eq!(r1, vec![5, 5, 3, 3, 12, 12]);
+        assert_eq!(cpu.context.get(&sleigh, id("mode")), 1);
+        assert_eq!(cpu.context.get(&sleigh, id("shift")), 0);
+    }
+
+    #[test]
+    fn context_initial() {
+        let sleigh = load("examples/context.slaspec");
+        // add r1, r1, 0x5 decodes as sub in mode 1
+        let mut cpu = new_cpu(&sleigh, &[0x05, 0x00, 0x11, 0x01]);
+        cpu.context
+            .set(&sleigh, Context::id(&sleigh, "mode").unwrap(), 1);
+        cpu.step().unwrap();
+        assert_eq!(get_reg_le(&mut cpu, "r1"), 5u32.wrapping_neg());
+
+        // A noflow value set up front reaches only the first instruction
+        let mut cpu = new_cpu(&sleigh, &[0x00, 0x00, 0x11, 0x05, 0x00, 0x00, 0x11, 0x05]);
+        cpu.context
+            .set(&sleigh, Context::id(&sleigh, "shift").unwrap(), 2);
+        cpu.state
+            .write_ref(reg_ref(&cpu, "r1"), &1u32.to_le_bytes())
+            .unwrap();
+        cpu.step().unwrap();
+        cpu.step().unwrap();
+        assert_eq!(get_reg_le(&mut cpu, "r1"), 4);
     }
 }
