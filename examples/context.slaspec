@@ -7,6 +7,9 @@
 #   width  set by `mov` for its operand subtable, which decodes a register
 #          (width=0) or an immediate (width=1).
 #   bank   selects the register `inc` works on through an attach.
+#
+# `jm1` jumps and switches mode to 1 at its destination with a globalset to
+# that address.
 
 define endian=little;
 define alignment=4;
@@ -52,3 +55,7 @@ SRC: "#"^imm16 is width=1 & imm16 { export *[const]:4 imm16; }
 :mov rd, SRC is op=6 & rd & imm_flag & SRC [ width=imm_flag; ] { rd = SRC; }
 
 :inc bank is op=8 & bank { bank = bank + 1; }
+
+Dest: imm16 is imm16 { export *:4 imm16; }
+:jmp Dest is op=9 & Dest { goto Dest; }
+:jm1 Dest is op=10 & Dest & imm16 [ target = imm16; mode=1; globalset(target, mode); ] { goto Dest; }

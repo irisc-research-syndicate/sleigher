@@ -16,6 +16,10 @@ The 3 tools should be considered example code for using the library as well as b
 
 Context variables are supported, and each tool takes initial values with `--context name=value`.
 Unlike Ghidra, which keeps the context by address, the context flows from instruction to instruction in the order they are visited: execution order in the emulator, line order in the assembler and a linear sweep in the disassembler.
+In the emulator this matches Ghidra's, which carries the context along execution too.
+
+`sleigh-disasm --flow` follows control flow from the start address instead, keeping the context by address as Ghidra's disassembler does: an address is decoded with the context that flowed to it first plus what `globalset`s committed to it, so a `globalset` to a branch destination is seen even where a linear sweep would have passed it already.
+Each address is decoded once, so a commit to an address decoded earlier is not seen there, nor further along its flow.
 
 Delay slots follow Ghidra: an instruction's p-code includes that of the instructions in its delay slot at its `delayslot`, and `inst_next` in its p-code is the address after them.
 

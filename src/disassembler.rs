@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{bail, Result};
 
@@ -13,7 +13,7 @@ use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{ContextId, Endian, Number, PrintBase, Sleigh, Span, TableId, TokenFieldId};
 
 use crate::context::{Context, ContextCommit, ContextFlow};
-use crate::pcode::{LiftError, PcodeOp};
+use crate::pcode::{BranchTarget, LiftError, OpCode, PcodeOp, VarnodeSpace};
 use crate::value::sign_extend;
 
 #[derive(Debug, Clone)]
@@ -118,6 +118,59 @@ impl<'sleigh> Disassembler<'sleigh> {
         Ok((table, commits))
     }
 
+    /// Disassemble the code in `bytes`, loaded at `base`, by following control flow from
+    /// `entry` and keeping the context by address, as Ghidra does: each address is decoded
+    /// with the context that flowed to it first and what `globalset`s committed to it, so a
+    /// commit to a branch destination is seen wherever the destination is in the code.
+    ///
+    /// Each address is decoded once. A commit to an address that was already decoded is not
+    /// seen there, nor at the addresses its context flowed on to. Word-addressed code spaces
+    /// are not supported.
+    pub fn disassemble_flow(
+        &'sleigh self,
+        base: u64,
+        bytes: &[u8],
+        entry: u64,
+        context: &Context,
+    ) -> Result<BTreeMap<u64, DisassembledInstruction<'sleigh>>> {
+        let wordsize = self.space(self.default_space()).wordsize.get();
+        if wordsize != 1 {
+            bail!(
+                "word-addressed code (wordsize {}) is not supported",
+                wordsize
+            );
+        }
+        let mut flow = ContextFlow::new(context.clone());
+        flow.flow_to(entry);
+        let mut instructions = BTreeMap::new();
+        let mut pending = vec![entry];
+        while let Some(address) = pending.pop() {
+            let Some(code) = address
+                .checked_sub(base)
+                .and_then(|offset| bytes.get(offset as usize..))
+            else {
+                log::debug!("{:#x}: outside the code", address);
+                continue;
+            };
+            let instruction = match self.disassemble_in_flow(address, &mut flow, code) {
+                Ok(instruction) => instruction,
+                Err(err) => {
+                    log::debug!("{:#x}: {}", address, err);
+                    continue;
+                }
+            };
+            // Pushed last, the fall-through is followed first
+            for target in instruction.flows().into_iter().rev() {
+                if flow.flow_to(target) {
+                    pending.push(target);
+                }
+            }
+            let first = instructions.insert(address, instruction).is_none();
+            debug_assert!(first, "{:#x} decoded twice", address);
+        }
+        Ok(instructions)
+    }
+
     pub fn disassemble_table(
         &'sleigh self,
         inst_start: u64,
@@ -202,6 +255,54 @@ impl DisassembledInstruction<'_> {
         self.delay_slots
             .last()
             .map_or(self.inst_next, |slot| slot.inst_next)
+    }
+
+    /// Where control can go after the instruction: `fallthrough` first if it can fall
+    /// through, then the destinations of its direct branches and calls in the default space.
+    /// Without p-code it is taken to fall through.
+    pub fn flows(&self) -> Vec<u64> {
+        let Ok(ops) = &self.pcode else {
+            return vec![self.fallthrough()];
+        };
+        let mut targets = vec![];
+        // Follow the branches between the ops to see if a path reaches the end
+        let mut reached = vec![false; ops.len() + 1];
+        let mut pending = vec![0];
+        while let Some(index) = pending.pop() {
+            if index > ops.len() || std::mem::replace(&mut reached[index], true) {
+                continue;
+            }
+            let Some(op) = ops.get(index) else {
+                continue;
+            };
+            match op.branch_target() {
+                Some(BranchTarget::Relative(offset)) => {
+                    pending.extend(index.checked_add_signed(offset as isize));
+                }
+                Some(BranchTarget::Address(space, address))
+                    if space == VarnodeSpace::Space(self.default_space()) =>
+                {
+                    targets.push(address);
+                }
+                _ => {}
+            }
+            if !matches!(
+                op.opcode,
+                OpCode::Branch | OpCode::BranchInd | OpCode::Return
+            ) {
+                pending.push(index + 1);
+            }
+        }
+        let mut flows = match reached[ops.len()] {
+            true => vec![self.fallthrough()],
+            false => vec![],
+        };
+        for target in targets {
+            if !flows.contains(&target) {
+                flows.push(target);
+            }
+        }
+        flows
     }
 }
 
@@ -1054,5 +1155,143 @@ mod test {
         let mov = decode(&[0x07, 0x00, 0x18, 0x06]);
         assert_eq!(mov.context.get(&sleigh, id("width")), 1);
         assert_eq!(mov.context.get(&sleigh, id("mode")), 0);
+    }
+
+    /// `jm1` at the end commits mode=1 to its destination, which a linear sweep has passed
+    #[test]
+    fn test_context_flow() {
+        let sleigh = load("examples/context.slaspec");
+        let disasm = Disassembler::new(&sleigh);
+        #[rustfmt::skip]
+        let code = [
+            0x0c, 0x01, 0x00, 0x09, // 0x100: jmp 0x10c
+            0x05, 0x00, 0x12, 0x01, // 0x104: add/sub r1, r2, 0x5
+            0x05, 0x00, 0x12, 0x01, // 0x108: add/sub r1, r2, 0x5
+            0x04, 0x01, 0x00, 0x0a, // 0x10c: jm1 0x104
+            0x05, 0x00, 0x12, 0x01, // 0x110: not reached
+        ];
+        let context = Context::new(&sleigh);
+        assert_eq!(
+            disasm
+                .disassemble(0x104, &context, &code[4..])
+                .unwrap()
+                .to_string(),
+            "add r1, r2, 0x5"
+        );
+
+        let instructions = disasm
+            .disassemble_flow(0x100, &code, 0x100, &context)
+            .unwrap();
+        let listing = instructions
+            .iter()
+            .map(|(address, instruction)| (*address, instruction.to_string()))
+            .collect::<Vec<_>>();
+        #[rustfmt::skip]
+        assert_eq!(listing, vec![
+            (0x100, "jmp 0x10c".to_string()),
+            (0x104, "sub r1, r2, 0x5".to_string()),
+            (0x108, "sub r1, r2, 0x5".to_string()),
+            (0x10c, "jm1 0x104".to_string()),
+        ]);
+    }
+
+    /// A little endian instruction of the flow example
+    fn flow_instruction(op: u8, imm16: u16) -> [u8; 4] {
+        (((op as u32) << 24) | imm16 as u32).to_le_bytes()
+    }
+
+    #[test]
+    fn test_flows() {
+        let sleigh = load("examples/flow.slaspec");
+        let disasm = Disassembler::new(&sleigh);
+        let decode = |op, imm16| {
+            disasm
+                .disassemble(0x100, &Context::new(&sleigh), &flow_instruction(op, imm16))
+                .unwrap()
+        };
+        #[rustfmt::skip]
+        let tests: &[(u8, &str, &[u64])] = &[
+            (0, "nop", &[0x104]),
+            (1, "jmp 0x200", &[0x200]),
+            (2, "call 0x200", &[0x104, 0x200]),
+            (3, "ret", &[]),
+            (4, "jr", &[]),
+            (5, "callr", &[0x104]),
+            // Other spaces are not code
+            (6, "jio 0x200", &[]),
+            (7, "jz 0x200", &[0x104, 0x200]),
+            (8, "retz", &[0x104]),
+            (9, "callz 0x200", &[0x104, 0x200]),
+            (10, "loop", &[]),
+            (11, "skipz", &[0x104]),
+        ];
+        for (op, text, flows) in tests {
+            let instruction = decode(*op, 0x200);
+            assert_eq!(instruction.to_string(), *text);
+            assert_eq!(instruction.flows(), *flows, "{}", text);
+        }
+
+        // Without p-code it falls through
+        let bad = disasm
+            .disassemble(0x100, &Context::new(&sleigh), &0x0c010000u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(bad.to_string(), "bad");
+        assert!(bad.pcode.is_err());
+        assert_eq!(bad.flows(), vec![0x104]);
+    }
+
+    #[test]
+    fn test_disassemble_flow() {
+        let sleigh = load("examples/flow.slaspec");
+        let disasm = Disassembler::new(&sleigh);
+        let code = [
+            flow_instruction(2, 0x10c), // 0x100: call 0x10c
+            flow_instruction(1, 0x999), // 0x104: jmp 0x999, outside the code
+            flow_instruction(0, 0),     // 0x108: nop, not reached
+            flow_instruction(7, 0x100), // 0x10c: jz 0x100, back to the entry
+        ]
+        .concat();
+        let instructions = disasm
+            .disassemble_flow(0x100, &code, 0x100, &Context::new(&sleigh))
+            .unwrap();
+        assert_eq!(
+            instructions.keys().copied().collect::<Vec<_>>(),
+            vec![0x100, 0x104, 0x10c]
+        );
+    }
+
+    /// Delay slots are decoded with their branch, which falls through past them
+    #[test]
+    fn test_disassemble_flow_delay_slots() {
+        let sleigh = load("examples/delay.slaspec");
+        let disasm = Disassembler::new(&sleigh);
+        let code = [
+            0x08000004u32, // 0x00: j 0x10
+            0x04010000,    // 0x04: _slot r1, 0x1
+            0x00000000,    // 0x08: nop, not reached
+            0x10000001,    // 0x0c: beq r0, r0, 0x14
+            0x18e00000,    // 0x10: jr ra
+            0x00000000,    // 0x14: _nop
+        ]
+        .map(u32::to_be_bytes)
+        .concat();
+        let instructions = disasm
+            .disassemble_flow(0x0, &code, 0x0, &Context::new(&sleigh))
+            .unwrap();
+        assert_eq!(
+            instructions.keys().copied().collect::<Vec<_>>(),
+            vec![0x0, 0x10]
+        );
+        assert_eq!(
+            instructions[&0x0].delay_slots[0].to_string(),
+            "slot r1, 0x1"
+        );
+
+        let beq = disasm
+            .disassemble(0xc, &Context::new(&sleigh), &code[0xc..])
+            .unwrap();
+        assert_eq!(beq.to_string(), "beq r0, r0, 0x14");
+        // Taken or not, it goes past its delay slot
+        assert_eq!(beq.flows(), vec![0x14]);
     }
 }

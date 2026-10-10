@@ -1,0 +1,38 @@
+# Control flow kinds, little endian, fixed 32-bit instructions: where each
+# instruction can go next, as read from its p-code.
+
+define endian=little;
+define alignment=4;
+
+define space ram type=ram_space size=4 default;
+define space io type=ram_space size=4;
+define space register type=register_space size=4;
+
+define register offset=0x00 size=4 [ r0 r1 lr ];
+
+define token instr(32)
+    op=(24, 31)
+    rsel=(16, 16)
+    imm16=(0, 15)
+;
+
+attach variables [ rsel ] [ r0 _ ];
+
+Dest: imm16 is imm16 { export *:4 imm16; }
+IoDest: imm16 is imm16 { export *[io]:4 imm16; }
+
+:nop is op=0 { }
+:jmp Dest is op=1 & Dest { goto Dest; }
+:call Dest is op=2 & Dest { call Dest; }
+:ret is op=3 { return [lr]; }
+:jr is op=4 { goto [r0]; }
+:callr is op=5 { call [r0]; }
+:jio IoDest is op=6 & IoDest { goto IoDest; }
+:jz Dest is op=7 & Dest { if (r0 == 0) goto Dest; }
+# Branches between the ops of the instruction
+:retz is op=8 { if (r0 != 0) goto <skip>; return [lr]; <skip> }
+:callz Dest is op=9 & Dest { if (r0 != 0) goto <skip>; call Dest; <skip> }
+:loop is op=10 { <top> r0 = r0 - 1; if (r0 != 0) goto <top>; goto [lr]; }
+:skipz is op=11 { if (r0 == 0) goto inst_next; }
+# Not lifted with rsel=1, which has no register
+:bad is op=12 & rsel { rsel = 0; }
