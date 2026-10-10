@@ -1,10 +1,12 @@
 # Semantics constructs the p-code lifter handles specially, little endian.
 #
-#   [opcode] [operand byte] [imm8]?
+#   [opcode] [operand byte] or [opcode] [imm16]
 #
-# operand byte: reg=(0,1)
-#   0x01..0x02 partial writes to a bitrange
-#   0x03..0x06 partial writes to memory a subtable exports, 0x06 out of its bounds
+#   0x01..0x02 partial writes to a bitrange, operand byte: reg=(0,1)
+#   0x03..0x06 partial writes to memory a subtable exports, same operand,
+#              0x06 out of its bounds
+#   0x07..0x0c references, operand byte: imm8=(0,7), sel=(0,1), simm8=(0,7)
+#              or name=(0,1), or a 16-bit immediate
 
 define endian=little;
 define alignment=1;
@@ -25,9 +27,24 @@ define token regbyte(8)
     reg=(0, 1)
 ;
 
+define token immbyte(8)
+    imm8=(0, 7)
+    sel=(0, 1)
+    simm8=(0, 7) signed
+    name=(0, 1)
+;
+
+define token immword(16)
+    imm16=(0, 15)
+;
+
 attach variables [ reg ] [ r0 r1 r2 r3 ];
+attach values [ sel ] [ 4 8 -1 16 ];
+attach names [ name ] [ a b c d ];
 
 MEM: [reg] is reg { export *[ram]:4 reg; }
+IMM: "#"^imm8 is imm8 { export *[const]:4 imm8; }
+IMM16: "#"^imm16 is imm16 { export *[const]:2 imm16; }
 
 :sethi reg is opcode=0x01; reg { hi:1 = reg; }
 :setbits reg is opcode=0x02; reg { hi[4,4] = reg; }
@@ -35,3 +52,11 @@ MEM: [reg] is reg { export *[ram]:4 reg; }
 :stbits MEM, r0 is opcode=0x04; MEM & r0 { MEM[4,8] = r0; }
 :stmid MEM, r0 is opcode=0x05; MEM & r0 { MEM[8,16] = r0; }
 :stbad MEM, r0 is opcode=0x06; MEM & r0 { MEM[30,8] = r0; }
+
+# The address of a field or subtable that is not a register is its value
+:lea r0, imm8 is opcode=0x07; imm8 & r0 { r0 = &imm8; }
+:leas r0, sel is opcode=0x08; sel & r0 { r0 = &:4 sel; }
+:leai r0, IMM is opcode=0x09; IMM & r0 { r0 = &IMM; }
+:leass r0, simm8 is opcode=0x0a; simm8 & r0 { r0 = &simm8; }
+:lean r0, name is opcode=0x0b; name & r0 { r0 = &name; }
+:leab r0, IMM16 is opcode=0x0c & r0; IMM16 { r0 = zext(&:1 IMM16); }

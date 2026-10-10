@@ -7,8 +7,9 @@ use sleigh_rs::execution::{
     BranchCall, CpuBranch, DynamicValueType, Export, Expr, ExprElement, ExprValue, ReferencedValue,
     Statement, Unary, UserCall, VariableId,
 };
+use sleigh_rs::token::TokenFieldAttach;
 use sleigh_rs::{
-    AttachVarnodeId, Endian, Number, Sleigh, SpaceId, TableId, TokenFieldId, VarnodeId,
+    AttachNumberId, AttachVarnodeId, Endian, Sleigh, SpaceId, TableId, TokenFieldId, VarnodeId,
 };
 
 use crate::disassembler::DisassembledTable;
@@ -466,6 +467,18 @@ impl<'s> Lifter<'s> {
             .ok_or_else(|| LiftError::Invalid(format!("token field {} not decoded", id.0)))
     }
 
+    /// The value of a token field or context variable that indexes an attach
+    fn attach_index(&self, scope: &Scope, value: DynamicValueType) -> LiftResult<i64> {
+        Ok(match value {
+            DynamicValueType::TokenField(token_field_id) => {
+                self.token_field(scope, token_field_id)?
+            }
+            DynamicValueType::Context(context_id) => {
+                scope.table.context.get(self.sleigh, context_id)
+            }
+        })
+    }
+
     /// The register an attached token field or context variable selects
     fn attached(
         &self,
@@ -473,20 +486,29 @@ impl<'s> Lifter<'s> {
         attach_id: AttachVarnodeId,
         value: DynamicValueType,
     ) -> LiftResult<Varnode> {
-        let index = match value {
-            DynamicValueType::TokenField(token_field_id) => {
-                self.token_field(scope, token_field_id)?
-            }
-            DynamicValueType::Context(context_id) => {
-                scope.table.context.get(self.sleigh, context_id)
-            }
-        };
+        let index = self.attach_index(scope, value)?;
         let varnode_id = self
             .sleigh
             .attach_varnode(attach_id)
             .find_value(index as usize)
             .ok_or_else(|| LiftError::Invalid(format!("no register attached to {}", index)))?;
         Ok(self.register(varnode_id))
+    }
+
+    /// The number an attached token field selects
+    fn attached_number(
+        &self,
+        scope: &Scope,
+        attach_id: AttachNumberId,
+        value: DynamicValueType,
+    ) -> LiftResult<u64> {
+        let index = self.attach_index(scope, value)?;
+        let number = self
+            .sleigh
+            .attach_number(attach_id)
+            .find_value(index as usize)
+            .ok_or_else(|| LiftError::Invalid(format!("no number attached to {}", index)))?;
+        Ok(number.signed_super() as u64)
     }
 
     /// `varnode` as `size` bytes: constants are resized directly, others zero extended or
@@ -989,19 +1011,23 @@ impl<'s> Lifter<'s> {
             Expr::Value(ExprElement::Reference(reference)) => {
                 let size = bits_to_bytes(reference.len_bits.get());
                 let address = match &reference.value {
+                    // As in Ghidra, the offset of the varnode the field stands for: the
+                    // address of an attached register, an attached number, or else the
+                    // field's value
                     ReferencedValue::TokenField(field) => {
-                        let token_field = self.sleigh.token_field(field.id);
-                        let sleigh_rs::token::TokenFieldAttach::Varnode(attach_id) =
-                            token_field.attach
-                        else {
-                            return unsupported(reference);
+                        let value = DynamicValueType::TokenField(field.id);
+                        let offset = match self.sleigh.token_field(field.id).attach {
+                            TokenFieldAttach::Varnode(attach_id) => {
+                                self.attached(scope, attach_id, value)?.offset
+                            }
+                            TokenFieldAttach::Number(_, attach_id) => {
+                                self.attached_number(scope, attach_id, value)?
+                            }
+                            TokenFieldAttach::NoAttach(_) | TokenFieldAttach::Literal(_) => {
+                                self.token_field(scope, field.id)? as u64
+                            }
                         };
-                        let register = self.attached(
-                            scope,
-                            attach_id,
-                            DynamicValueType::TokenField(field.id),
-                        )?;
-                        Varnode::constant(register.offset, size)
+                        Varnode::constant(offset, size)
                     }
                     ReferencedValue::InstStart(_) => {
                         Varnode::constant(scope.table.inst_start, size)
@@ -1009,13 +1035,16 @@ impl<'s> Lifter<'s> {
                     ReferencedValue::InstNext(_) => Varnode::constant(scope.inst_next, size),
                     ReferencedValue::Table(table) => match self.table_export(scope, table.id)? {
                         Handle::Pointer { addr, .. } => self.resize(addr, size),
-                        Handle::Direct(varnode) if !varnode.is_const() => {
-                            Varnode::constant(varnode.offset, size)
-                        }
-                        Handle::Direct(_) => return unsupported(reference),
+                        // A constant's offset is its value
+                        Handle::Direct(varnode) => Varnode::constant(varnode.offset, size),
                     },
                 };
-                Ok(address)
+                // The offset is truncated to the size of the reference
+                if address.is_const() {
+                    Ok(Varnode::constant(address.offset & size_mask(size), size))
+                } else {
+                    Ok(address)
+                }
             }
             Expr::Value(ExprElement::Op(unary)) => {
                 let size = self.execution_len_bytes(scope, expr);
@@ -1038,13 +1067,10 @@ impl<'s> Lifter<'s> {
         let execution = scope.table.constructor.execution.as_ref().unwrap();
         let size = || bits_to_bytes(value.len_bits(self.sleigh, execution).get());
         Ok(match value {
-            ExprValue::Int(number) => {
-                let value = match number.number {
-                    Number::Positive(value) => value,
-                    Number::Negative(value) => (value as i64).wrapping_neg() as u64,
-                };
-                Varnode::constant(value, bits_to_bytes(number.size.get()))
-            }
+            ExprValue::Int(number) => Varnode::constant(
+                number.number.signed_super() as u64,
+                bits_to_bytes(number.size.get()),
+            ),
             ExprValue::TokenField(field) => Varnode::constant(
                 self.token_field(scope, field.id)? as u64,
                 bits_to_bytes(field.size.get()),
@@ -1422,6 +1448,20 @@ mod test {
         let (text, pcode) = lift_text(&sleigh, &Context::new(&sleigh), 0x1000, &[0x06, 0x01]);
         assert_eq!(text, "stbad [r1], r0");
         assert!(matches!(pcode, Err(LiftError::Invalid(_))), "{:?}", pcode);
+    }
+
+    #[test]
+    fn references_pcode() {
+        let sleigh = load("examples/pcode.slaspec");
+        #[rustfmt::skip]
+        assert_lifts(&sleigh, &[
+            (vec![0x07, 0x2a], "lea r0, 0x2a", &["r0 = COPY 0x2a:4"]),
+            (vec![0x08, 0x02], "leas r0, -0x1", &["r0 = COPY 0xffffffff:4"]),
+            (vec![0x09, 0x2a], "leai r0, #0x2a", &["r0 = COPY 0x2a:4"]),
+            (vec![0x0a, 0xfe], "leass r0, -0x2", &["r0 = COPY 0xfffffffe:4"]),
+            (vec![0x0b, 0x02], "lean r0, c", &["r0 = COPY 0x2:4"]),
+            (vec![0x0c, 0x34, 0x12], "leab r0, #0x1234", &["r0 = COPY 0x34:4"]),
+        ]);
     }
 
     #[test]
