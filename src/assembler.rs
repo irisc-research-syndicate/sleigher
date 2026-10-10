@@ -11,7 +11,7 @@ use sleigh_rs::disassembly::{
 };
 use sleigh_rs::display::DisplayElement;
 use sleigh_rs::meaning::{AttachNumber, AttachVarnode, Meaning};
-use sleigh_rs::pattern::{Block, CmpOp, Verification};
+use sleigh_rs::pattern::{Block, CmpOp, ConstraintValue, Verification};
 use sleigh_rs::table::{Constructor, Table};
 use sleigh_rs::{ContextId, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
@@ -706,18 +706,14 @@ impl<'asm> Variables<'asm> {
                 context: context_id,
                 op,
                 value,
-            } => {
-                let value_bv = self.build_expr_bv(value.expr(), 64);
-                compare(*op, &context[context_id.0], &value_bv)
-            }
+            } => self.verify_check(*op, &context[context_id.0], value),
             Verification::TableBuild {
                 produced_table: _,
                 verification: _,
             } => Bool::from_bool(&self.asm.ctx, true),
             Verification::TokenFieldCheck { field, op, value } => {
                 let field_bv = self.token_field(*field, Some(64));
-                let value_bv = self.build_expr_bv(value.expr(), 64);
-                compare(*op, &field_bv, &value_bv)
+                self.verify_check(*op, &field_bv, value)
             }
             // A parenthesised pattern, verified like a block of the constructor's pattern
             Verification::SubPattern {
@@ -732,6 +728,13 @@ impl<'asm> Variables<'asm> {
         }
     }
 
+    /// `l op value`, which only passes where the value is defined, so that a division by zero
+    /// in one OR branch does not rule out the others
+    fn verify_check(&mut self, op: CmpOp, l: &BV<'asm>, value: &ConstraintValue) -> Bool<'asm> {
+        let (value_bv, defined) = self.build_defined_expr_bv(value.expr(), 64);
+        Bool::and(&self.asm.ctx, &[&defined, &compare(op, l, &value_bv)])
+    }
+
     /// Add disassembly action assignments as constraints
     pub fn assert_all(&mut self, assertions: &[Assertation]) {
         for assertion in assertions {
@@ -740,7 +743,8 @@ impl<'asm> Variables<'asm> {
                 // from the disassembled bytes
                 Assertation::GlobalSet(_) => {}
                 Assertation::Assignment(assignment) => {
-                    let value = self.build_expr_bv(&assignment.right, 64);
+                    let (value, defined) = self.build_defined_expr_bv(&assignment.right, 64);
+                    self.eq(defined);
                     match assignment.left {
                         WriteScope::Context(context_id) => self.set_context(context_id, value),
                         WriteScope::Local(variable_id) => {
@@ -753,13 +757,23 @@ impl<'asm> Variables<'asm> {
         }
     }
 
-    pub fn build_expr_bv(&mut self, expr: &Expr, sz: u32) -> BV<'asm> {
+    /// An expression and the condition for it to be defined: no division by zero, which the
+    /// disassembler fails on
+    fn build_defined_expr_bv(&mut self, expr: &Expr, sz: u32) -> (BV<'asm>, Bool<'asm>) {
+        let mut defined = vec![];
+        let expr_bv = self.expr_bv(expr, sz, &mut defined);
+        let defined = Bool::and(&self.asm.ctx, &defined.iter().collect::<Vec<_>>());
+        (expr_bv, defined)
+    }
+
+    /// Arithmetic wraps and shift amounts are taken modulo 64, as in the disassembler
+    fn expr_bv(&mut self, expr: &Expr, sz: u32, defined: &mut Vec<Bool<'asm>>) -> BV<'asm> {
         let expr_bv = match expr {
             Expr::Value(expr_element) => match expr_element {
                 ExprElement::Value { value, location: _ } => match value {
                     ReadScope::Integer(number) => match number {
                         Number::Positive(x) => self.build_u64_const(*x, sz),
-                        Number::Negative(x) => self.build_i64_const(-(*x as i64), sz),
+                        Number::Negative(x) => self.build_i64_const((*x as i64).wrapping_neg(), sz),
                     },
                     ReadScope::Context(context_id) => self.context[context_id.0].clone(),
                     ReadScope::TokenField(token_field_id) => {
@@ -770,7 +784,7 @@ impl<'asm> Variables<'asm> {
                     ReadScope::Local(variable_id) => self.variable(*variable_id),
                 },
                 ExprElement::Op(_span, op_unary, expr) => {
-                    let expr_bv = self.build_expr_bv(expr, 64);
+                    let expr_bv = self.expr_bv(expr, 64, defined);
                     match op_unary {
                         OpUnary::Negation => expr_bv.bvnot(),
                         OpUnary::Negative => expr_bv.bvneg(),
@@ -778,18 +792,22 @@ impl<'asm> Variables<'asm> {
                 }
             },
             Expr::Op(_span, op, expr, expr1) => {
-                let expr_r = self.build_expr_bv(expr, sz);
-                let expr_l = self.build_expr_bv(expr1, sz);
+                let expr_r = self.expr_bv(expr, sz, defined);
+                let expr_l = self.expr_bv(expr1, sz, defined);
+                let shift = || expr_l.clone() & self.build_u64_const(63, sz);
                 match op {
                     Op::Add => expr_r + expr_l,
                     Op::Sub => expr_r - expr_l,
                     Op::Mul => expr_r * expr_l,
-                    Op::Div => expr_r.bvsdiv(&expr_l),
+                    Op::Div => {
+                        defined.push(expr_l._eq(&self.build_u64_const(0, sz)).not());
+                        expr_r.bvsdiv(&expr_l)
+                    }
                     Op::And => expr_r & expr_l,
                     Op::Or => expr_r | expr_l,
                     Op::Xor => expr_r ^ expr_l,
-                    Op::Asr => expr_r.bvashr(&expr_l),
-                    Op::Lsl => expr_r << expr_l,
+                    Op::Asr => expr_r.bvashr(&shift()),
+                    Op::Lsl => expr_r << shift(),
                 }
             }
         };
@@ -1911,6 +1929,54 @@ mod test {
             0xe3, 0x0c, 0x00, 0xfe, // beq r0, r0, 0x1000
             0x37, 0x11, 0x10, 0xff, // movb r2, 0xff00
         ]);
+    }
+
+    #[test]
+    fn solver_undefined_expressions() {
+        let asm = load("examples/solver.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("div r1, 0x80", vec![0xdb, 0x00, 0x00, 0x02]),
+            // The branch dividing by zero is out, without ruling out the other one
+            ("divc r1", vec![0xdb, 0x20, 0x00, 0x01]),
+        ]);
+        // bvsdiv by zero would give -1
+        assert_rejects(&asm, &["div r1, -0x1"]);
+        // Shift amounts are modulo 64 and the product wraps, as in the disassembler
+        #[rustfmt::skip]
+        let tests = [
+            ("bit r1, 0x8", 0x41, true),
+            ("bit r1, 0x8", 0x02, false),
+            ("bit r1, 0x0", 0x3f, true),
+            ("bit r1, 0x0", 0x40, false),
+        ];
+        for (input, imm8, expected) in tests {
+            assert_eq!(
+                encodes_with(&asm, input, "imm8", imm8),
+                expected,
+                "{input} {imm8:#x}"
+            );
+        }
+    }
+
+    /// Whether the encoding of `input` can have the token field `name` set to `value`
+    fn encodes_with(asm: &InstructionAssembler, input: &str, name: &str, value: u64) -> bool {
+        let mut constraints = asm.assemble_instruction(input).unwrap();
+        let (field, _) = asm
+            .token_fields()
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name() == name)
+            .unwrap();
+        let field_bv = constraints
+            .fields
+            .iter()
+            .find(|((_, id), _)| id.0 == field)
+            .map(|(_, bv)| bv.clone())
+            .unwrap();
+        let value_bv = BV::from_u64(&asm.ctx, value, field_bv.get_size());
+        constraints.eq(field_bv._eq(&value_bv));
+        constraints.check()
     }
 
     #[test]

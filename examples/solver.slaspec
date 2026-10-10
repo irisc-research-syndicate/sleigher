@@ -9,6 +9,9 @@
 #   ldx  rd, disp(rs1)      disp = d8 * 4 + 8, only aligned values encode
 #   lds  rd, disp(rs1)      disp = d8 * 6 / 3, divided signed
 #   movb rd, val            val is imm8 shifted up by a whole number of bytes
+#   div  rd, val            val = 0x100 / imm8, undefined for imm8 0
+#   divc rd                 an OR branch dividing by zero never holds
+#   bit  rd, val            val = (1 << imm8) * 4, shifting modulo 64 and wrapping
 
 define endian=little;
 define alignment=4;
@@ -81,4 +84,15 @@ BRANCH: target is b12 & b11 & b10_5 & b4_1
 
 :movb rd, val is op=0x37 & funct3=1 & rd & bpos & imm8
     [ val = imm8 << (bpos * 8); ]
+    { rd = val; }
+
+:div rd, val is op=0x5b & funct3=0 & rd & imm8
+    [ val = 0x100 / imm8; ]
+    { rd = val; }
+
+:divc rd is ((op=0x5b & funct3=1 & imm8=4/0) | (op=0x5b & funct3=2 & imm8=1)) & rd
+    { rd = 0; }
+
+:bit rd, val is op=0x5b & funct3=3 & rd & imm8
+    [ val = (1 << imm8) * 4; ]
     { rd = val; }

@@ -129,7 +129,7 @@ impl<'sleigh> Disassembler<'sleigh> {
             DisassembledTable::disassemble(self, inst_start, table, context, bytes)?;
         // inst_next is the address of the next instruction, which is only known
         // once the whole instruction (including all subtables) has been matched.
-        disassembled.resolve(inst_start + disassembled.len as u64, context);
+        disassembled.resolve(inst_start + disassembled.len as u64, context)?;
         disassembled.set_context(context);
         Ok(disassembled)
     }
@@ -363,11 +363,14 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                         .insert(produced_token_field.field, token_field_value);
                 }
 
-                disasm_table.apply_assertions(
+                if let Err(err) = disasm_table.apply_assertions(
                     block.pre_disassembler(),
                     &mut matched_context,
                     bytes,
-                );
+                ) {
+                    log::trace!("{}, continuing to next matcher", err);
+                    continue 'match_loop;
+                }
 
                 for produced_table in block.tables() {
                     let subtable = disassembler.table(produced_table.table);
@@ -406,11 +409,14 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     );
                     continue 'match_loop;
                 }
-                disasm_table.apply_assertions(
+                if let Err(err) = disasm_table.apply_assertions(
                     block.post_disassembler(),
                     &mut matched_context,
                     bytes,
-                );
+                ) {
+                    log::trace!("{}, continuing to next matcher", err);
+                    continue 'match_loop;
+                }
                 disasm_table.bytes.extend_from_slice(&bytes[..block_len]);
                 disasm_table.len += block_len;
                 bytes = &bytes[block_len..];
@@ -480,7 +486,10 @@ impl<'sleigh> DisassembledTable<'sleigh> {
         context: &Context,
         bytes: &[u8],
     ) -> bool {
-        let check_value = self.evaluate_expr(check.expr(), context, bytes);
+        let Some(check_value) = self.evaluate_expr(check.expr(), context, bytes) else {
+            log::trace!("{}: division by zero checking {}", self.table.name(), name);
+            return false;
+        };
         let passed = compare(op, value, check_value);
         if !passed {
             log::trace!(
@@ -497,18 +506,19 @@ impl<'sleigh> DisassembledTable<'sleigh> {
 
     /// Run the actions that need `inst_next`, once the whole instruction is matched. Unlike
     /// Ghidra, subtables run theirs before the parent; only context written by both differs.
-    fn resolve(&mut self, inst_next: u64, context: &mut Context) {
+    fn resolve(&mut self, inst_next: u64, context: &mut Context) -> Result<()> {
         self.inst_next = inst_next;
         for subtable in self.tables.values_mut() {
-            subtable.resolve(inst_next, context);
+            subtable.resolve(inst_next, context)?;
         }
         let bytes = std::mem::take(&mut self.bytes);
-        self.apply_assertions(
+        let result = self.apply_assertions(
             self.constructor.pattern.disassembly_pos_match(),
             context,
             &bytes,
         );
         self.bytes = bytes;
+        result
     }
 
     fn set_context(&mut self, context: &Context) {
@@ -543,12 +553,13 @@ impl<'sleigh> DisassembledTable<'sleigh> {
         }
     }
 
+    /// Fails when an assignment divides by zero
     fn apply_assertions(
         &mut self,
         assertions: &[Assertation],
         context: &mut Context,
         bytes: &[u8],
-    ) {
+    ) -> Result<()> {
         for assertion in assertions {
             match assertion {
                 Assertation::GlobalSet(global_set) => {
@@ -568,7 +579,9 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     self.globalsets.push((address, global_set.context));
                 }
                 Assertation::Assignment(assignment) => {
-                    let value = self.evaluate_expr(&assignment.right, context, bytes);
+                    let Some(value) = self.evaluate_expr(&assignment.right, context, bytes) else {
+                        bail!("{}: division by zero in an assignment", self.table.name());
+                    };
                     match assignment.left {
                         WriteScope::Context(context_id) => context.set(self, context_id, value),
                         WriteScope::Local(variable_id) => {
@@ -578,15 +591,18 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn evaluate_expr(&self, expr: &Expr, context: &Context, bytes: &[u8]) -> i64 {
-        match expr {
+    /// The value of a pattern expression, wrapping like Ghidra's 64-bit arithmetic, `None` when
+    /// it divides by zero
+    pub fn evaluate_expr(&self, expr: &Expr, context: &Context, bytes: &[u8]) -> Option<i64> {
+        let value = match expr {
             Expr::Value(expr_element) => match expr_element {
                 ExprElement::Value { value, location: _ } => match *value {
                     ReadScope::Integer(number) => match number {
                         sleigh_rs::Number::Positive(x) => x as i64,
-                        sleigh_rs::Number::Negative(x) => -(x as i64),
+                        sleigh_rs::Number::Negative(x) => (x as i64).wrapping_neg(),
                     },
                     ReadScope::Context(context_id) => context.get(self, context_id),
                     ReadScope::TokenField(token_field_id) => self
@@ -601,29 +617,32 @@ impl<'sleigh> DisassembledTable<'sleigh> {
                     ReadScope::Local(variable_id) => *self.variables.get(&variable_id).unwrap(),
                 },
                 ExprElement::Op(_, op_unary, expr) => {
-                    let expr = self.evaluate_expr(expr, context, bytes);
+                    let expr = self.evaluate_expr(expr, context, bytes)?;
                     match op_unary {
                         OpUnary::Negation => !expr,
-                        OpUnary::Negative => -expr,
+                        OpUnary::Negative => expr.wrapping_neg(),
                     }
                 }
             },
             Expr::Op(_span, op, expr, expr1) => {
-                let l = self.evaluate_expr(expr, context, bytes);
-                let r = self.evaluate_expr(expr1, context, bytes);
+                let l = self.evaluate_expr(expr, context, bytes)?;
+                let r = self.evaluate_expr(expr1, context, bytes)?;
+                // Shift amounts are taken modulo 64, as Java does
                 match op {
-                    Op::Add => l + r,
-                    Op::Sub => l - r,
-                    Op::Mul => l * r,
-                    Op::Div => l / r,
+                    Op::Add => l.wrapping_add(r),
+                    Op::Sub => l.wrapping_sub(r),
+                    Op::Mul => l.wrapping_mul(r),
+                    Op::Div if r == 0 => return None,
+                    Op::Div => l.wrapping_div(r),
                     Op::And => l & r,
                     Op::Or => l | r,
                     Op::Xor => l ^ r,
-                    Op::Asr => l >> r,
-                    Op::Lsl => l << r,
+                    Op::Asr => l.wrapping_shr(r as u32),
+                    Op::Lsl => l.wrapping_shl(r as u32),
                 }
             }
-        }
+        };
+        Some(value)
     }
 }
 
@@ -979,6 +998,31 @@ mod test {
         for (context, bytes) in rejected {
             assert!(
                 disasm.disassemble(0, &context, &bytes).is_err(),
+                "{:02x?}",
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn test_solver_undefined_expressions() {
+        let path = "examples/solver.slaspec";
+        #[rustfmt::skip]
+        run_tests(path, &[
+            ("div r1, 0x80", vec![0xdb, 0x00, 0x00, 0x02]),
+            ("divc r1", vec![0xdb, 0x20, 0x00, 0x01]),
+            // Shifts are modulo 64 and the product wraps
+            ("bit r1, 0x8", vec![0xdb, 0x30, 0x00, 0x41]),
+            ("bit r1, 0x0", vec![0xdb, 0x30, 0x00, 0x3f]),
+        ]);
+        // Dividing by zero, in an action and in a check, fails instead of panicking
+        let sleigh = load(path);
+        let disasm = Disassembler::new(&sleigh);
+        for bytes in [[0xdb, 0x00, 0x00, 0x00], [0xdb, 0x10, 0x00, 0x04]] {
+            assert!(
+                disasm
+                    .disassemble(0, &Context::new(&sleigh), &bytes)
+                    .is_err(),
                 "{:02x?}",
                 bytes
             );
