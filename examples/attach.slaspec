@@ -3,9 +3,10 @@
 # - signed values (shl) and a value used by more than one index (lds), printed in hex and
 #   parsed in either base
 # - a context variable with attached names (ld)
+# and a register named in the display (mov)
 #
 #   [op:4] [cond:4] [imm8:8]               b.<cond> imm8
-#   [op:4] [reg:2] [amt:3] [scale:3] [..]  shl/lds/ld
+#   [op:4] [reg:2] [amt:3] [scale:3] [..]  shl/lds/ld/mov
 
 define endian=big;
 define alignment=1;
@@ -13,7 +14,7 @@ define alignment=1;
 define space ram type=ram_space size=4 default;
 define space register type=register_space size=4;
 
-define register offset=0x00 size=4 [ r0 r1 r2 r3 ];
+define register offset=0x00 size=4 [ r0 r1 r2 r3 acc ];
 define register offset=0x100 size=4 contextreg;
 
 define context contextreg
@@ -43,3 +44,5 @@ attach names [ size ] [ "b" "h" "w" "d" ];
 :shl reg, amt is op=2 & reg & amt { }
 :lds reg, scale is op=3 & reg & scale { }
 :ld.^size reg is op=6 & reg { }
+:mov acc, reg is op=4 & reg { acc = reg; }
+:mov reg, acc is op=5 & reg { reg = acc; }

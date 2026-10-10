@@ -1083,7 +1083,14 @@ impl InstructionAssembler {
         s: &'a str,
     ) -> Parses<'a, Variables<'asm>> {
         match elem {
-            DisplayElement::Varnode(_varnode_id) => todo!(),
+            DisplayElement::Varnode(varnode_id) => {
+                let name = self.varnode(*varnode_id).name();
+                log::trace!("VARNODE: {:?} {:?}", name, s);
+                parse_literal(name, s)
+                    .map(|s| (s, variables))
+                    .into_iter()
+                    .collect()
+            }
             DisplayElement::Context(context_id) => {
                 let context = self.context(*context_id);
                 log::trace!("CONTEXT: {:?} {:?}", context.name(), s);
@@ -2049,6 +2056,26 @@ mod test {
             "lds r0, 0x3",
             "lds r0, -0x1",
         ]);
+    }
+
+    #[test]
+    fn varnode_display() {
+        let asm = load("examples/attach.slaspec");
+        #[rustfmt::skip]
+        assert_encodes(&asm, &[
+            ("mov acc, r1", vec![0x44, 0x00]),
+            ("mov r2, acc", vec![0x58, 0x00]),
+        ]);
+        #[rustfmt::skip]
+        assert_rejects(&asm, &[
+            "mov r0, r1",
+            "mov acc, acc",
+            "mov ac, r1",
+        ]);
+        assert_eq!(
+            disassemble(&asm, &[0x44, 0x00]).as_deref(),
+            Some("mov acc, r1")
+        );
     }
 
     #[test]
