@@ -1,0 +1,40 @@
+name: Ghidra corpus
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  corpus:
+    name: tests against Ghidra's slaspecs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Ghidra commit the corpus cases were checked against; only the slaspecs are needed
+      - uses: actions/checkout@v4
+        with:
+          repository: NationalSecurityAgency/ghidra
+          ref: 918d44ebc2962a53d23eeee52b8f44c7816e7815
+          path: ghidra
+          filter: blob:none
+          sparse-checkout: /Ghidra/Processors/*/data/languages/
+          sparse-checkout-cone-mode: false
+
+      # z3-sys needs the z3 headers and libclang for bindgen
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libz3-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Corpus
+        run: cargo test --release --test ghidra -- --ignored
+        env:
+          GHIDRA_SRC: ${{ github.workspace }}/ghidra

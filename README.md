@@ -41,6 +41,8 @@ filters select specs or checks (`-- --ignored riscv`). Each test runs in its own
 longer than `GHIDRA_TIMEOUT` seconds (default 60) or using more than `GHIDRA_MEMORY_MB` of address space (default 1024)
 fails only that test.
 
+The `Ghidra corpus` workflow runs it in CI against the Ghidra commit the cases were checked with.
+
 
 Future work
 ===========
