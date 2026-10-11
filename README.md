@@ -33,11 +33,13 @@ x86, x86-64, ARM, AArch64, MIPS, RISC-V and PowerPC. It needs a Ghidra source tr
 ```
 git clone --depth 1 --filter=blob:none --sparse https://github.com/NationalSecurityAgency/ghidra.git
 git -C ghidra sparse-checkout set --no-cone '/Ghidra/Processors/*/data/languages/'
-GHIDRA_SRC=$PWD/ghidra cargo test --release --test ghidra -- --ignored --nocapture
+GHIDRA_SRC=$PWD/ghidra cargo test --release --test ghidra -- --ignored
 ```
 
-`GHIDRA_SPEC=<substring>` restricts the run to matching specs. Each spec runs in its own process, so a crash is
-reported against the check that caused it.
+Every check is its own test, e.g. `x86_64::ret::asm` or `riscv_lp64d::bad_bytes_ffffffff`, so the usual test
+filters select specs or checks (`-- --ignored riscv`). Each test runs in its own process, so a crash, a check running
+longer than `GHIDRA_TIMEOUT` seconds (default 60) or using more than `GHIDRA_MEMORY_MB` of address space (default 1024)
+fails only that test.
 
 
 Future work
