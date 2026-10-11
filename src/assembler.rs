@@ -12,7 +12,7 @@ use sleigh_rs::disassembly::{
 use sleigh_rs::display::DisplayElement;
 use sleigh_rs::meaning::{AttachNumber, AttachVarnode, Meaning};
 use sleigh_rs::pattern::{Block, CmpOp, ConstraintValue, Verification};
-use sleigh_rs::table::{Constructor, Table};
+use sleigh_rs::table::Constructor;
 use sleigh_rs::{ContextId, Endian, Number, Sleigh, TableId, TokenFieldId, TokenId};
 use z3::ast::{Ast, Bool, BV};
 
@@ -178,6 +178,10 @@ pub struct Instance<'asm> {
 pub type TokenKey = (usize, usize, TokenId);
 
 static NEXT_INSTANCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Most pure recursive constructors in front of an instruction, e.g. x86 prefixes, which can
+/// not be more than the longest x86 instruction
+const MAX_PURE_RECURSION: usize = 15;
 
 /// Whether a verification checks a field of `token`, also inside sub-patterns
 fn checks_token(sleigh: &Sleigh, verification: &Verification, token: TokenId) -> bool {
@@ -420,6 +424,38 @@ impl<'asm> Constraints<'asm> {
             value.zero_ext(64 - bits)
         };
         self.context[id.0] = value;
+    }
+
+    /// The context, simplified so that equal concrete contexts have equal keys. Symbolic parts,
+    /// e.g. REX bits copied from a token, keep their names but not the numbers that make each
+    /// fresh constant unique, so contexts that only differ in which token they came from are
+    /// equal, as Ghidra's context patterns leave such bits undefined.
+    fn context_key(&self) -> Vec<String> {
+        self.context
+            .iter()
+            .map(|value| {
+                let value = value.simplify().to_string();
+                let mut key = String::with_capacity(value.len());
+                let mut chars = value.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '!' && chars.peek().is_some_and(char::is_ascii_digit) {
+                        while chars.next_if(char::is_ascii_digit).is_some() {}
+                    } else {
+                        key.push(c);
+                    }
+                }
+                key
+            })
+            .collect()
+    }
+
+    /// The same constraints with every context variable unknown
+    fn with_free_context(mut self) -> Self {
+        for (id, value) in self.context.iter_mut().enumerate() {
+            let name = self.asm.context(ContextId(id)).name();
+            *value = BV::fresh_const(&self.asm.ctx, name, 64);
+        }
+        self
     }
 
     /// Take over the constraints of a subtable parsed from a clone of `self`
@@ -1116,36 +1152,135 @@ impl InstructionAssembler {
         context: &Context,
         labels: &'asm Labels,
     ) -> Parses<'a, Constraints<'asm>> {
-        let constraints = Constraints::new(self, inst_start, context, labels);
-        self.assemble_table(self.table(self.instruction_table()), constraints, s, None)
-            .into_iter()
-            .filter_map(|(rest, mut candidate)| {
-                candidate.finalize();
-                candidate.check().then_some((rest, candidate))
-            })
-            .collect()
+        let root = self.instruction_table();
+        let start = Constraints::new(self, inst_start, context, labels);
+        // Like Ghidra, pure recursive constructors such as `:^instruction is prefix; instruction`
+        // are not parsed, they display nothing. Instead each level adds one of them in front of
+        // the instruction, breadth first over the contexts they lead to, so the first level that
+        // parses all of `s` has the fewest of them.
+        let mut seen = HashSet::from([start.context_key()]);
+        // The prefixes only change the context, so if no context at all parses `s` none help
+        let any_context = start.clone().with_free_context();
+        let mut prefixes = vec![(start, None)];
+        let mut candidates = vec![];
+        for level in 0..=MAX_PURE_RECURSION {
+            for (constraints, parent) in &prefixes {
+                for (rest, mut candidate) in self.assemble_table(root, constraints, s, *parent) {
+                    candidate.finalize();
+                    if candidate.check() {
+                        candidates.push((rest, candidate));
+                    }
+                }
+            }
+            if candidates
+                .iter()
+                .any(|(rest, _)| rest.trim_end().is_empty())
+            {
+                break;
+            }
+            if level == 0
+                && !self
+                    .assemble_table(root, &any_context, s, None)
+                    .iter()
+                    .any(|(rest, _)| rest.trim_end().is_empty())
+            {
+                break;
+            }
+            prefixes = prefixes
+                .iter()
+                .flat_map(|(constraints, parent)| {
+                    self.pure_recursive(root)
+                        .map(|constructor| self.apply_prefix(constructor, constraints, *parent))
+                })
+                .filter(|(constraints, _)| {
+                    constraints.check() && seen.insert(constraints.context_key())
+                })
+                .collect();
+            log::debug!(
+                "{} new contexts behind pure recursive constructors",
+                prefixes.len()
+            );
+            if prefixes.is_empty() {
+                break;
+            }
+        }
+        candidates
+    }
+
+    /// Whether the constructor of `table_id` displays nothing but its own table, as `^instruction`
+    fn is_pure_recursive(&self, table_id: TableId, constructor: &Constructor) -> bool {
+        let mut elements = constructor
+            .display
+            .elements()
+            .filter(|elem| !matches!(elem, DisplayElement::Space));
+        constructor.display.mneumonic.is_none()
+            && matches!(elements.next(), Some(DisplayElement::Table(id)) if *id == table_id)
+            && elements.next().is_none()
+    }
+
+    fn pure_recursive(&self, table_id: TableId) -> impl Iterator<Item = &Constructor> {
+        self.table(table_id)
+            .constructors()
+            .iter()
+            .filter(move |constructor| self.is_pure_recursive(table_id, constructor))
+    }
+
+    /// The constraints with the pure recursive `constructor` matched below `parent`, and the
+    /// parent for the table it recurses into
+    fn apply_prefix<'asm>(
+        &'asm self,
+        constructor: &'asm Constructor,
+        constraints: &Constraints<'asm>,
+        parent: Option<(usize, usize)>,
+    ) -> (Constraints<'asm>, Option<(usize, usize)>) {
+        let variables = self.match_pattern(constructor, constraints.clone(), parent);
+        let table_block = variables.table_block(self.instruction_table());
+        let parent = Some((variables.instance, table_block));
+        (variables.constraints, parent)
+    }
+
+    /// Match the pattern of `constructor` below `parent`, with its context changes
+    fn match_pattern<'asm>(
+        &'asm self,
+        constructor: &'asm Constructor,
+        constraints: Constraints<'asm>,
+        parent: Option<(usize, usize)>,
+    ) -> Variables<'asm> {
+        let mut variables = Variables::new(constraints, constructor, parent);
+        // The constructor's own context changes come after its pattern is matched
+        let context = variables.context.clone();
+
+        for block in constructor.pattern.blocks() {
+            let verified = variables.verify_block(block, &context);
+            variables.eq(verified);
+            variables.assert_all(block.pre_disassembler());
+            variables.assert_all(block.post_disassembler());
+        }
+        // Post-disassembler and post-match assertions are the ones that need inst_next; as
+        // constraints the order they are evaluated in does not matter
+        variables.assert_all(constructor.pattern.disassembly_pos_match());
+        variables
     }
 
     pub fn assemble_table<'a, 'asm>(
         &'asm self,
-        table: &'asm Table,
-        constraints: Constraints<'asm>,
+        table_id: TableId,
+        constraints: &Constraints<'asm>,
         s: &'a str,
         parent: Option<(usize, usize)>,
     ) -> Parses<'a, Constraints<'asm>> {
-        table
+        self.table(table_id)
             .constructors()
             .iter()
-            .flat_map(|constructor| {
-                self.assemble_constructor(constructor, constraints.clone(), s, parent)
-            })
+            .filter(|constructor| !self.is_pure_recursive(table_id, constructor))
+            .flat_map(|constructor| self.assemble_constructor(constructor, constraints, s, parent))
             .collect()
     }
 
     pub fn assemble_constructor<'a, 'asm>(
         &'asm self,
         constructor: &'asm Constructor,
-        constraints: Constraints<'asm>,
+        constraints: &Constraints<'asm>,
         s: &'a str,
         parent: Option<(usize, usize)>,
     ) -> Parses<'a, Constraints<'asm>> {
@@ -1160,19 +1295,7 @@ impl InstructionAssembler {
             None => s,
         };
 
-        let mut variables = Variables::new(constraints, constructor, parent);
-        // The constructor's own context changes come after its pattern is matched
-        let context = variables.context.clone();
-
-        for block in constructor.pattern.blocks() {
-            let verified = variables.verify_block(block, &context);
-            variables.eq(verified);
-            variables.assert_all(block.pre_disassembler());
-            variables.assert_all(block.post_disassembler());
-        }
-        // Post-disassembler and post-match assertions are the ones that need inst_next; as
-        // constraints the order they are evaluated in does not matter
-        variables.assert_all(constructor.pattern.disassembly_pos_match());
+        let variables = self.match_pattern(constructor, constraints.clone(), parent);
 
         let mut states = vec![(s, variables)];
         for elem in constructor.display.elements() {
@@ -1253,7 +1376,7 @@ impl InstructionAssembler {
                 let table = self.table(*table_id);
                 log::trace!("TABLE: {:?}/{:?} {:?}", table.name(), table_id, s);
                 let parent = Some((variables.instance, variables.table_block(*table_id)));
-                self.assemble_table(table, variables.constraints.clone(), s, parent)
+                self.assemble_table(*table_id, &variables.constraints, s, parent)
                     .into_iter()
                     .map(|(s, table_constraints)| {
                         let mut variables = variables.clone();
