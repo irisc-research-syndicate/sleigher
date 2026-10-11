@@ -449,11 +449,12 @@ impl<'asm> Constraints<'asm> {
             .collect()
     }
 
-    /// The same constraints with every context variable unknown
-    fn with_free_context(mut self) -> Self {
-        for (id, value) in self.context.iter_mut().enumerate() {
-            let name = self.asm.context(ContextId(id)).name();
-            *value = BV::fresh_const(&self.asm.ctx, name, 64);
+    /// The same constraints with every context variable a pure recursive constructor writes
+    /// unknown, the contexts any number of them in front of the instruction can lead to
+    fn with_free_prefix_context(mut self) -> Self {
+        for &id in &self.asm.prefix_context {
+            let name = self.asm.context(id).name();
+            self.context[id.0] = BV::fresh_const(&self.asm.ctx, name, 64);
         }
         self
     }
@@ -875,6 +876,23 @@ pub struct InstructionAssembler {
     ctx: z3::Context,
     /// Whether any constructor has a `globalset`, so program assembly has to follow commits
     has_globalset: bool,
+    /// The context variables pure recursive constructors of the instruction table write
+    prefix_context: Vec<ContextId>,
+}
+
+/// The disassembly actions of `constructor`
+fn assertions(constructor: &Constructor) -> impl Iterator<Item = &Assertation> {
+    let pattern = &constructor.pattern;
+    pattern
+        .blocks()
+        .iter()
+        .flat_map(|block| {
+            block
+                .pre_disassembler()
+                .iter()
+                .chain(block.post_disassembler())
+        })
+        .chain(pattern.disassembly_pos_match())
 }
 
 impl Deref for InstructionAssembler {
@@ -892,25 +910,29 @@ impl InstructionAssembler {
             .tables()
             .iter()
             .flat_map(|table| table.constructors().iter())
-            .flat_map(|constructor| {
-                let pattern = &constructor.pattern;
-                pattern
-                    .blocks()
-                    .iter()
-                    .flat_map(|block| {
-                        block
-                            .pre_disassembler()
-                            .iter()
-                            .chain(block.post_disassembler())
-                    })
-                    .chain(pattern.disassembly_pos_match())
-            })
+            .flat_map(assertions)
             .any(|assertion| matches!(assertion, Assertation::GlobalSet(_)));
-        Self {
+        let mut asm = Self {
             sleigh,
             ctx: z3::Context::new(&z3::Config::new()),
             has_globalset,
-        }
+            prefix_context: vec![],
+        };
+        let mut prefix_context: Vec<_> = asm
+            .pure_recursive(asm.instruction_table())
+            .flat_map(assertions)
+            .filter_map(|assertion| match assertion {
+                Assertation::Assignment(assignment) => match assignment.left {
+                    WriteScope::Context(id) => Some(id),
+                    WriteScope::Local(_) => None,
+                },
+                Assertation::GlobalSet(_) => None,
+            })
+            .collect();
+        prefix_context.sort();
+        prefix_context.dedup();
+        asm.prefix_context = prefix_context;
+        asm
     }
 
     /// Assemble one instruction at address 0 in the zero context, see `assemble_instruction_at`
@@ -1159,8 +1181,9 @@ impl InstructionAssembler {
         // the instruction, breadth first over the contexts they lead to, so the first level that
         // parses all of `s` has the fewest of them.
         let mut seen = HashSet::from([start.context_key()]);
-        // The prefixes only change the context, so if no context at all parses `s` none help
-        let any_context = start.clone().with_free_context();
+        // The prefixes only change the context variables they write, so if no value of those
+        // parses `s` none help, e.g. `PUSH EAX` in x86-64's long mode, which no prefix leaves
+        let any_context = start.clone().with_free_prefix_context();
         let mut prefixes = vec![(start, None)];
         let mut candidates = vec![];
         for level in 0..=MAX_PURE_RECURSION {
@@ -1181,8 +1204,11 @@ impl InstructionAssembler {
             if level == 0
                 && !self
                     .assemble_table(root, &any_context, s, None)
-                    .iter()
-                    .any(|(rest, _)| rest.trim_end().is_empty())
+                    .into_iter()
+                    .any(|(rest, mut candidate)| {
+                        candidate.finalize();
+                        rest.trim_end().is_empty() && candidate.check()
+                    })
             {
                 break;
             }
